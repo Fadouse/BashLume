@@ -57,7 +57,11 @@ impl CompletionProvider for RuleProvider {
         let (programs, pending) = cache.rule_programs(command);
         let mut status = ProviderStatus {
             pending,
-            ..ProviderStatus::default()
+            path_completion: if pending && programs.is_none() {
+                PathCompletion::Suppress
+            } else {
+                PathCompletion::Inherit
+            },
         };
         let Some(programs) = programs else {
             return status;
