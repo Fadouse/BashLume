@@ -279,17 +279,6 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
         let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
         return Some((MatchClass::Prefix, 4_000_000 - length_penalty));
     }
-    if candidate
-        .get(..query.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
-    {
-        let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
-        return Some((
-            MatchClass::CaseInsensitivePrefix,
-            3_000_000 - length_penalty,
-        ));
-    }
-
     if query.is_ascii() && candidate.is_ascii() {
         let query_bytes = query.as_bytes();
         let candidate_bytes = candidate.as_bytes();
@@ -314,6 +303,16 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
         return fuzzy_score_ascii(query_bytes, candidate_bytes)
             .map(|score| (MatchClass::Fuzzy, 1_000_000 + score));
     } else {
+        if candidate
+            .get(..query.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+        {
+            let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
+            return Some((
+                MatchClass::CaseInsensitivePrefix,
+                3_000_000 - length_penalty,
+            ));
+        }
         let query_lower = query.to_lowercase();
         let candidate_lower = candidate.to_lowercase();
         if let Some(position) = candidate_lower.find(&query_lower) {
@@ -328,14 +327,15 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
 }
 
 fn fuzzy_score_ascii(query: &[u8], candidate: &[u8]) -> Option<i64> {
-    let mut wanted = query.iter().map(u8::to_ascii_lowercase);
-    let mut current = wanted.next()?;
+    let (&first, _) = query.split_first()?;
+    let mut query_index = 1_usize;
+    let mut current = first.to_ascii_lowercase();
     let mut matched = 0_i64;
     let mut gap_penalty = 0_i64;
     let mut consecutive = 0_i64;
     let mut previous_match = None;
-    for (index, character) in candidate.iter().map(u8::to_ascii_lowercase).enumerate() {
-        if character != current {
+    for (index, &character) in candidate.iter().enumerate() {
+        if character.to_ascii_lowercase() != current {
             continue;
         }
         matched += 1;
@@ -347,14 +347,13 @@ fn fuzzy_score_ascii(query: &[u8], candidate: &[u8]) -> Option<i64> {
             gap_penalty += index as i64;
         }
         previous_match = Some(index);
-        match wanted.next() {
-            Some(next) => current = next,
-            None => {
-                return Some(
-                    matched * 100 + consecutive * 25 - gap_penalty * 10 - candidate.len() as i64,
-                );
-            }
+        if query_index == query.len() {
+            return Some(
+                matched * 100 + consecutive * 25 - gap_penalty * 10 - candidate.len() as i64,
+            );
         }
+        current = query[query_index].to_ascii_lowercase();
+        query_index += 1;
     }
     None
 }
