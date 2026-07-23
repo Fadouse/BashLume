@@ -33,9 +33,10 @@ BashLume saves and wraps `rl_redisplay_function`. Each redraw follows this order
 1. Call Readline's original redisplay function.
 2. Read the immutable `rl_line_buffer`, `rl_point`, prompt, and state.
 3. Incrementally parse and classify the line.
-4. Save the terminal cursor.
-5. Move to the start of Readline's input, clear the old overlay, and paint styled text, ghost text, and optional menu.
-6. Restore Readline's cursor exactly.
+4. Move to the start of Readline's input, clear the old overlay, and paint styled text, ghost text, and the optional menu.
+5. Track the exact number of painted rows and return to Readline's cursor with relative cursor movement.
+
+The renderer intentionally does not use the terminal's save/restore-cursor slot. When a menu reaches the bottom edge, the terminal scrolls; saved absolute cursor positions then become stale and cause repeated menus. Relative movement follows the scrolled input line and remains correct in Kitty, tmux, screen, and ordinary ANSI terminals.
 
 Readline remains authoritative for cursor movement, undo, kill/yank, history search, bracketed paste, macros, terminal preparation, signals, and Emacs/Vi mode.
 
@@ -74,10 +75,11 @@ A `pthread_atfork` child hook marks the inherited plugin inactive. A forked chil
 
 1. A tolerant shell lexer derives the word range, quote mode, and whether the cursor is in command position.
 2. Providers emit logical, unquoted candidates.
-3. The matcher assigns strict score bands: exact, prefix, case-insensitive prefix, substring, then fuzzy subsequence.
+3. The matcher assigns strict score bands: exact, prefix, case-insensitive prefix, substring, then fuzzy subsequence. Exact and case-sensitive prefix matches share one retained result set, so an exact `who` does not hide `whoami`; exact still sorts first.
 4. Context and history add lower-order ranking bonuses.
 5. The sink deduplicates and retains a bounded top set.
 6. The insertion layer applies minimal Bash-safe quoting while preserving the user's quote style.
+7. The menu lays candidates out in Readline-style top-to-bottom columns, colors filesystem types and extensions from `LS_COLORS`, and pages within a bounded physical row count.
 
 `CompletionProvider` is a compile-time Rust trait. There is intentionally no unstable Rust dynamic ABI and no subprocess protocol in the first release.
 
@@ -98,7 +100,7 @@ Tree-sitter Bash provides incremental, error-tolerant concrete syntax trees. Bas
 - asynchronously known `PATH` commands
 - definite non-empty Tree-sitter error nodes
 
-The renderer defaults to `errors` mode, which applies only definite error spans and leaves valid syntax in the terminal's normal color. `full` mode exposes every semantic category. Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
+The renderer defaults to `errors` mode, which applies only definite error spans, adds a visible error marker, and leaves valid syntax in the terminal's normal color. `full` mode exposes every semantic category. Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
 
 Input larger than 256 KiB safely falls back to unstyled rendering to bound paste-time work.
 

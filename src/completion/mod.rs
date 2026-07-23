@@ -14,7 +14,6 @@ use crate::shell::{self, ShellSnapshot};
 pub struct CompletionResult {
     pub candidates: Vec<Candidate>,
     pub pending: bool,
-    pub truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -57,16 +56,13 @@ impl CompletionEngine {
         self.cache.poll();
         let mut sink = CandidateSink::new(max_candidates);
         let mut pending = false;
-        let mut truncated = false;
         for provider in &mut self.providers {
             let status = provider.complete(context, shell, &mut self.cache, &mut sink);
             pending |= status.pending;
-            truncated |= status.truncated;
         }
         CompletionResult {
             candidates: sink.finish(),
             pending,
-            truncated,
         }
     }
 

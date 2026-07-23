@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 — 2026-07-23
+
+- Add an explicit marker for definite syntax errors while valid input remains uncolored.
+- Keep exact and longer prefix candidates together, so completing `who` also lists `whoami`.
+- Replace type-label rows with Readline-style colored columns that follow `LS_COLORS`.
+- Return from completion overlays with relative cursor movement, preventing repeated/corrupted menus when the terminal scrolls at its bottom edge.
+- Add PTY and tmux bottom-edge regressions.
+
 ## 0.1.1 — 2026-07-23
 
 - Make errors-only highlighting the default; valid Bash input now keeps the terminal's normal color.

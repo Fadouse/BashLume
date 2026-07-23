@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::completion::context::CompletionContext;
 use crate::completion::matcher::Candidate;
 use crate::completion::{CompletionEngine, GhostSuggestion, longest_common_display_prefix};
-use crate::config::{Config, DiagnosticsMode};
+use crate::config::{Config, DiagnosticsMode, HighlightMode};
 use crate::ffi::{self, ReadlineCommand, RedisplayFunction};
 use crate::render::{MenuView, RenderModel, Renderer};
 use crate::shell::{KnownCommand, ShellSnapshot};
@@ -44,7 +44,6 @@ struct MenuState {
     candidates: Vec<Candidate>,
     selected: usize,
     pending: bool,
-    truncated: bool,
 }
 
 struct PluginState {
@@ -134,7 +133,6 @@ impl PluginState {
                     candidates: result.candidates,
                     selected,
                     pending: result.pending,
-                    truncated: result.truncated,
                 });
             }
         }
@@ -169,6 +167,10 @@ impl PluginState {
             }
         });
 
+        let has_syntax_error = highlighted.diagnostic.is_some();
+        if has_syntax_error {
+            self.last_ghost = None;
+        }
         let diagnostic = match (self.config.diagnostics, highlighted.diagnostic.as_ref()) {
             (DiagnosticsMode::Inline, Some(diagnostic)) => {
                 let due = highlighted
@@ -192,13 +194,15 @@ impl PluginState {
             candidates: &menu.candidates,
             selected: menu.selected.min(menu.candidates.len().saturating_sub(1)),
             pending: menu.pending,
-            truncated: menu.truncated,
         });
         let model = RenderModel {
             line: &line,
             point,
             styles: &highlighted.styles,
             ghost: self.last_ghost.as_ref().map(|ghost| ghost.suffix.as_str()),
+            error_marker: has_syntax_error
+                && self.config.diagnostics == DiagnosticsMode::Marker
+                && self.config.highlight != HighlightMode::Off,
             menu,
             diagnostic,
         };
@@ -268,7 +272,19 @@ impl PluginState {
                 candidates: result.candidates,
                 selected: 0,
                 pending: result.pending,
-                truncated: result.truncated,
+            });
+            return 0;
+        }
+
+        if result.pending {
+            // A result is not unique until every relevant asynchronous scan
+            // has completed. Committing it now can append a space before a
+            // longer prefix candidate arrives from another PATH directory.
+            self.menu = Some(MenuState {
+                line,
+                candidates: result.candidates,
+                selected: 0,
+                pending: true,
             });
             return 0;
         }
@@ -309,7 +325,6 @@ impl PluginState {
             candidates: result.candidates,
             selected: 0,
             pending: result.pending,
-            truncated: result.truncated,
         });
         0
     }
@@ -491,8 +506,9 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
     match command {
         "status" => {
             println!(
-                "bashlume: {} (providers: {}; cache: {} entries, {} KiB)",
+                "bashlume: {} (version: {}; providers: {}; cache: {} entries, {} KiB)",
                 if state.enabled { "enabled" } else { "disabled" },
+                env!("CARGO_PKG_VERSION"),
                 state.completion.provider_names(),
                 state.completion.cache_entries(),
                 state.completion.cache_bytes() / 1024,

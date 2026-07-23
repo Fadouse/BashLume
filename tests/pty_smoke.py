@@ -119,6 +119,30 @@ def main() -> int:
         )
         session.send(b"\x15", 0.2)
 
+        syntax_error = session.send(b"echo )", 0.3)
+        require(
+            b"\x1b[4;38;5;203m" in syntax_error and "✗".encode() in syntax_error,
+            "definite syntax error was not highlighted and marked",
+            session.output,
+        )
+        session.send(b"\x15", 0.2)
+
+        command_menu = session.send(b"who", 0.2) + session.send(b"\t", 0.5)
+        if b"whoami" not in command_menu:
+            command_menu += session.send(b"\t", 0.4)
+        require(
+            b"whoami" in command_menu,
+            "exact command suppressed its longer prefix matches",
+            session.output,
+        )
+        require(
+            b";32m" in command_menu,
+            "command completions did not use executable colors",
+            session.output,
+        )
+        session.send(b"\x15", 0.2)
+        session.send(b"\x07", 0.2)
+
         session.send(
             b"(read -e value; printf 'SUBSHELL:<%s>\\n' \"$value\")\n",
             0.2,
@@ -164,9 +188,14 @@ def main() -> int:
             session.send(f"cd {root}\n".encode(), 0.4)
             session.send(b"printf '<%s>\\n' al", 0.2)
             menu = session.send(b"\t", 0.5)
-            if b"[file]" not in menu:
+            if b"alpha-file" not in menu:
                 menu += session.send(b"\t", 0.4)
-            require(b"[file]" in menu, "ranked Tab menu was not displayed", session.output)
+            require(
+                b"alpha-file" in menu and b"alpine-file" in menu,
+                "columnar Tab menu was not displayed",
+                session.output,
+            )
+            require(b"[file]" not in menu, "menu still used type-label rows", session.output)
             session.send(b"\x1b[C", 0.1)
             completed = session.send(b"\n", 0.4)
             require(

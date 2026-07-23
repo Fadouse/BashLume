@@ -8,7 +8,6 @@ use crate::shell::ShellSnapshot;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProviderStatus {
     pub pending: bool,
-    pub truncated: bool,
 }
 
 /// Compile-time extension point for command-aware completers.
@@ -63,7 +62,6 @@ impl CompletionProvider for GenericProvider {
         if !context.command_position || explicit_path {
             let path_status = path_candidates(context, shell, cache, sink);
             status.pending |= path_status.pending;
-            status.truncated |= path_status.truncated;
         }
 
         status
@@ -209,11 +207,8 @@ fn path_candidates(
         return ProviderStatus::default();
     };
     let key = cache.request_directory(directory, &leaf);
-    let Some((entries, truncated, refreshing)) = cache.directory_entries(&key) else {
-        return ProviderStatus {
-            pending: true,
-            truncated: false,
-        };
+    let Some((entries, _truncated, refreshing)) = cache.directory_entries(&key) else {
+        return ProviderStatus { pending: true };
     };
 
     for entry in entries {
@@ -224,11 +219,13 @@ fn path_candidates(
             continue;
         }
         let mut value = format!("{typed_parent}{}", entry.name);
-        let (kind, append_space) = if entry.kind == EntryKind::Directory {
-            value.push('/');
-            (CandidateKind::Directory, false)
-        } else {
-            (CandidateKind::File, true)
+        let (kind, append_space) = match entry.kind {
+            EntryKind::Directory => {
+                value.push('/');
+                (CandidateKind::Directory, false)
+            }
+            EntryKind::Executable => (CandidateKind::Executable, true),
+            EntryKind::File => (CandidateKind::File, true),
         };
         if let Some(candidate) =
             Candidate::new(&leaf, entry.name.clone(), value, kind, append_space, 0)
@@ -239,7 +236,6 @@ fn path_candidates(
 
     ProviderStatus {
         pending: refreshing,
-        truncated,
     }
 }
 

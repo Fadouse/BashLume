@@ -7,7 +7,7 @@ Copyright © 2026 **Fadouse**. Distributed under the MIT License.
 ## Features
 
 - Incremental Bash parsing through Tree-sitter Bash
-- Errors-only highlighting by default; optional full semantic colors for commands, builtins, keywords, strings, variables, comments, operators, redirects, options, and paths
+- Errors-only highlighting by default, including an explicit `✗` marker; optional full semantic colors for commands, builtins, keywords, strings, variables, comments, operators, redirects, options, and paths
 - Valid/unknown command classification after the asynchronous `PATH` cache is ready
 - History-based and generic prefix ghost suggestions
 - Layered candidate matching:
@@ -25,6 +25,8 @@ Copyright © 2026 **Fadouse**. Distributed under the MIT License.
   - `/etc/hosts`, SSH config, and known hosts
   - Bash reserved words
 - Context-aware shell quoting for spaces and metacharacters
+- Readline-style, `LS_COLORS`-aware columnar completion menus
+- Exact candidates remain visible beside longer prefix candidates (`who`, `whoami`)
 - Bounded asynchronous filesystem scanning
 - Native Readline Emacs and Vi keymaps remain intact
 - Safe fallback to unmodified Readline when loading fails
@@ -150,9 +152,12 @@ BASHLUME_COLOR_ERROR
 BASHLUME_COLOR_GHOST
 BASHLUME_COLOR_MENU_SELECTED
 BASHLUME_COLOR_MENU_META
+BASHLUME_COLOR_COMPLETION_DIRECTORY
+BASHLUME_COLOR_COMPLETION_EXECUTABLE
+BASHLUME_COLOR_COMPLETION_FILE
 ```
 
-Values are SGR parameter lists without `ESC[` or the final `m`. Invalid values are rejected to prevent terminal escape injection. `NO_COLOR` disables syntax colors.
+Values are SGR parameter lists without `ESC[` or the final `m`. Invalid values are rejected to prevent terminal escape injection. Completion directory, executable, regular-file, and filename-extension colors follow `LS_COLORS`; the three completion variables above override its base type colors. `NO_COLOR` disables syntax colors.
 
 Set `BASHLUME_DISABLE=1` before loading for an emergency startup bypass.
 
@@ -186,7 +191,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the FFI, threading, and r
 
 ## 中文简介
 
-BashLume 是一个轻量级 Bash 原生插件。它保留 GNU Readline，只增加错误高亮、幽灵建议、模糊补全与交互候选菜单。默认仅标记明确语法错误，正确语法保持终端原色；设置 `BASHLUME_HIGHLIGHT=full` 可启用完整语义着色。默认缓存上限为 16 MiB，文件系统扫描在单独的受限后台线程中执行；加载失败时自动回退到 Bash 原生行为。
+BashLume 是一个轻量级 Bash 原生插件。它保留 GNU Readline，只增加错误高亮、幽灵建议、模糊补全与交互候选菜单。默认仅标记明确语法错误，正确语法保持终端原色；补全列表使用类似 Readline/Bash 的彩色分栏布局并遵循 `LS_COLORS`。设置 `BASHLUME_HIGHLIGHT=full` 可启用完整语义着色。默认缓存上限为 16 MiB，文件系统扫描在单独的受限后台线程中执行；加载失败时自动回退到 Bash 原生行为。
 
 常用配置可直接写入 `.bashrc`，无需 `export`。完整卸载命令为：
 

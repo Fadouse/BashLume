@@ -10,6 +10,7 @@ cargo build --release
 cargo test --release -- --ignored --nocapture
 shellcheck shell/bashlume.bash scripts/check.sh
 python3 tests/pty_smoke.py target/release/libbashlume.so
+python3 tests/tmux_bottom.py target/release/libbashlume.so
 if [[ -n ${BASHLUME_TEST_BASH:-} ]]; then
   python3 tests/pty_smoke.py target/release/libbashlume.so --bash "$BASHLUME_TEST_BASH"
 fi

@@ -38,6 +38,10 @@ pub struct Theme {
     pub ghost: String,
     pub menu_selected: String,
     pub menu_meta: String,
+    pub completion_directory: String,
+    pub completion_executable: String,
+    pub completion_file: String,
+    pub completion_extensions: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +86,10 @@ impl Default for Config {
                 ghost: "2;38;5;244".into(),
                 menu_selected: "1;7".into(),
                 menu_meta: "2;38;5;244".into(),
+                completion_directory: "1;34".into(),
+                completion_executable: "1;32".into(),
+                completion_file: "0".into(),
+                completion_extensions: Vec::new(),
             },
         }
     }
@@ -129,6 +137,9 @@ impl Config {
         if let Some(value) = unsafe { shell_var("BASHLUME_MENU_ROWS") } {
             config.menu_rows = parse_bounded(&value, 1, 100).unwrap_or(config.menu_rows);
         }
+        if let Some(value) = unsafe { shell_var("LS_COLORS") } {
+            apply_ls_colors(&value, &mut config.theme);
+        }
 
         macro_rules! color {
             ($field:ident, $name:literal) => {
@@ -155,9 +166,56 @@ impl Config {
         color!(ghost, "BASHLUME_COLOR_GHOST");
         color!(menu_selected, "BASHLUME_COLOR_MENU_SELECTED");
         color!(menu_meta, "BASHLUME_COLOR_MENU_META");
+        color!(completion_directory, "BASHLUME_COLOR_COMPLETION_DIRECTORY");
+        color!(
+            completion_executable,
+            "BASHLUME_COLOR_COMPLETION_EXECUTABLE"
+        );
+        color!(completion_file, "BASHLUME_COLOR_COMPLETION_FILE");
 
         config
     }
+}
+
+fn apply_ls_colors(value: &str, theme: &mut Theme) {
+    let mut reset = None;
+    let mut regular = None;
+    let mut directory = None;
+    let mut executable = None;
+    let mut extensions = Vec::new();
+    for entry in value.split(':') {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let Some(value) = valid_sgr(value.to_owned()) else {
+            continue;
+        };
+        match key {
+            "rs" => reset = Some(value),
+            "fi" => regular = Some(value),
+            "di" => directory = Some(value),
+            "ex" => executable = Some(value),
+            pattern
+                if pattern.starts_with('*')
+                    && (2..=257).contains(&pattern.len())
+                    && extensions.len() < 1024 =>
+            {
+                extensions.push((pattern[1..].to_owned(), value));
+            }
+            _ => {}
+        }
+    }
+    if let Some(value) = regular.or(reset) {
+        theme.completion_file = value;
+    }
+    if let Some(value) = directory {
+        theme.completion_directory = value;
+    }
+    if let Some(value) = executable {
+        theme.completion_executable = value;
+    }
+    extensions.sort_unstable_by_key(|item| std::cmp::Reverse(item.0.len()));
+    theme.completion_extensions = extensions;
 }
 
 fn parse_highlight_mode(value: &str) -> HighlightMode {
@@ -228,6 +286,19 @@ mod tests {
         assert_eq!(parse_highlight_mode("errors"), HighlightMode::Errors);
         assert_eq!(parse_highlight_mode("full"), HighlightMode::Full);
         assert_eq!(parse_highlight_mode("off"), HighlightMode::Off);
+    }
+
+    #[test]
+    fn completion_colors_follow_ls_colors() {
+        let mut theme = Config::default().theme;
+        apply_ls_colors("rs=0:di=01;34:ex=01;32:*.zip=01;31", &mut theme);
+        assert_eq!(theme.completion_file, "0");
+        assert_eq!(theme.completion_directory, "01;34");
+        assert_eq!(theme.completion_executable, "01;32");
+        assert_eq!(
+            theme.completion_extensions,
+            vec![(".zip".into(), "01;31".into())]
+        );
     }
 
     #[test]

@@ -11,10 +11,12 @@ pub enum MatchClass {
 }
 
 impl MatchClass {
-    fn tier(self) -> u8 {
+    fn candidate_set_tier(self) -> u8 {
         match self {
-            Self::Exact => 5,
-            Self::Prefix => 4,
+            // An exact command is not an unambiguous completion when longer
+            // prefix matches also exist (`who` and `whoami`). Keep both in
+            // the same result set while the score still sorts exact first.
+            Self::Exact | Self::Prefix => 4,
             Self::CaseInsensitivePrefix => 3,
             Self::Substring => 2,
             Self::Fuzzy => 1,
@@ -30,6 +32,7 @@ pub enum CandidateKind {
     Keyword,
     Command,
     Directory,
+    Executable,
     File,
     Variable,
     User,
@@ -37,21 +40,6 @@ pub enum CandidateKind {
 }
 
 impl CandidateKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Alias => "alias",
-            Self::Function => "function",
-            Self::Builtin => "builtin",
-            Self::Keyword => "keyword",
-            Self::Command => "command",
-            Self::Directory => "directory",
-            Self::File => "file",
-            Self::Variable => "variable",
-            Self::User => "user",
-            Self::Host => "host",
-        }
-    }
-
     fn context_weight(self) -> i64 {
         match self {
             Self::Alias => 950,
@@ -60,6 +48,7 @@ impl CandidateKind {
             Self::Keyword => 875,
             Self::Command => 850,
             Self::Directory => 800,
+            Self::Executable => 790,
             Self::File => 775,
             Self::Variable => 750,
             Self::User => 725,
@@ -161,7 +150,7 @@ impl CandidateSink {
     }
 
     pub fn push(&mut self, candidate: Candidate) {
-        let tier = candidate.match_class.tier();
+        let tier = candidate.match_class.candidate_set_tier();
         if tier < self.best_tier {
             return;
         }
@@ -362,26 +351,22 @@ mod tests {
     }
 
     #[test]
-    fn sink_discards_lower_match_layers_when_prefixes_exist() {
+    fn sink_keeps_exact_and_longer_prefixes_but_discards_weaker_matches() {
         let mut sink = CandidateSink::new(16);
-        sink.push(
-            Candidate::from_borrowed("ga", "gamma", "gamma", CandidateKind::File, false, 0)
-                .unwrap(),
-        );
-        sink.push(
-            Candidate::from_borrowed(
-                "ga",
-                "get-alpha",
-                "get-alpha",
-                CandidateKind::File,
-                false,
-                0,
-            )
-            .unwrap(),
-        );
+        for name in ["whoami", "somewho", "who"] {
+            sink.push(
+                Candidate::from_borrowed("who", name, name, CandidateKind::Command, true, 0)
+                    .unwrap(),
+            );
+        }
         let candidates = sink.finish();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].display, "gamma");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.display.as_str())
+                .collect::<Vec<_>>(),
+            ["who", "whoami"]
+        );
     }
 
     #[test]
