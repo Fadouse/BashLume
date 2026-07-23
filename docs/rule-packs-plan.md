@@ -629,7 +629,7 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 ### Phase A — Specification and legal boundary
 
-- [ ] Relicense BashLume core to GPL-2.0-or-later.
+- [x] Relicense BashLume core to GPL-2.0-or-later.
 - [ ] Add SPDX and provenance policy.
 - [ ] Finalize binary format and IR specification.
 - [ ] Add conformance fixture format and versioning policy.

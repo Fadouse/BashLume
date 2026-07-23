@@ -40,7 +40,7 @@
             meta = {
               description = "Lightweight native completion and syntax highlighting for Bash";
               homepage = "https://github.com/Fadouse/BashLume";
-              license = pkgs.lib.licenses.mit;
+              license = pkgs.lib.licenses.gpl2Plus;
               platforms = pkgs.lib.platforms.linux;
             };
           };

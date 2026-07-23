@@ -2,7 +2,7 @@
 
 BashLume is a lightweight, in-process completion and syntax-highlighting plugin for GNU Bash. It keeps GNU Readline as the line editor and adds only the parts Readline does not provide: incremental Bash highlighting, ranked completion, interactive candidate menus, and fish-like ghost suggestions.
 
-Copyright © 2026 **Fadouse**. Distributed under the MIT License.
+Copyright © 2026 **Fadouse**. Distributed under the GNU General Public License, version 2 or (at your option) any later version (`GPL-2.0-or-later`).
 
 ## Features
 

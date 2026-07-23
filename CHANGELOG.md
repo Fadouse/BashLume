@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Relicense the BashLume core from MIT to GPL-2.0-or-later in preparation for separately distributed completion rule packs derived from GPL ecosystems.
+
 ## 0.1.5 — 2026-07-23
 
 - Add optional human-readable descriptions to completion candidates.
