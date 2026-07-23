@@ -63,6 +63,8 @@ pub struct Candidate {
     pub display: String,
     /// Text representing the complete shell word (or line for history).
     pub value: String,
+    /// Optional human-readable detail supplied by a command-aware rule.
+    pub description: Option<String>,
     pub kind: CandidateKind,
     pub append_space: bool,
     pub score: i64,
@@ -122,11 +124,20 @@ impl Candidate {
         Self {
             display,
             value,
+            description: None,
             kind,
             append_space,
             score: match_score + kind.context_weight() + recency_bonus,
             match_class,
         }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        let description = description.into();
+        if !description.is_empty() {
+            self.description = Some(description);
+        }
+        self
     }
 
     pub fn is_strong_prefix(&self) -> bool {
@@ -160,8 +171,22 @@ impl CandidateSink {
         }
 
         match self.candidates.get_mut(&candidate.value) {
-            Some(current) if candidate.score > current.score => *current = candidate,
-            Some(_) => return,
+            Some(current) if candidate.score > current.score => {
+                let description = candidate
+                    .description
+                    .clone()
+                    .or_else(|| current.description.clone());
+                *current = Candidate {
+                    description,
+                    ..candidate
+                };
+            }
+            Some(current) => {
+                if current.description.is_none() {
+                    current.description = candidate.description;
+                }
+                return;
+            }
             None => {
                 self.candidates.insert(candidate.value.clone(), candidate);
             }
@@ -366,6 +391,25 @@ mod tests {
                 .map(|candidate| candidate.display.as_str())
                 .collect::<Vec<_>>(),
             ["who", "whoami"]
+        );
+    }
+
+    #[test]
+    fn sink_merges_description_into_duplicate_candidate() {
+        let mut sink = CandidateSink::new(4);
+        let plain =
+            Candidate::from_borrowed("fo", "for", "for", CandidateKind::Keyword, true, 0).unwrap();
+        sink.push(plain);
+        sink.push(
+            Candidate::from_borrowed("fo", "for", "for", CandidateKind::Keyword, true, 0)
+                .unwrap()
+                .with_description("Iterate over words"),
+        );
+        let candidates = sink.finish();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].description.as_deref(),
+            Some("Iterate over words")
         );
     }
 

@@ -81,7 +81,7 @@ A `pthread_atfork` child hook marks the inherited plugin inactive. A forked chil
 4. Context and history add lower-order ranking bonuses.
 5. The sink deduplicates and retains a bounded top set.
 6. The insertion layer applies minimal Bash-safe quoting while preserving the user's quote style.
-7. The menu lays candidates out in Readline-style top-to-bottom columns, colors filesystem types and extensions from `LS_COLORS`, and pages within a bounded physical row count.
+7. The menu lays candidates out in Readline-style top-to-bottom columns, colors filesystem types and extensions from `LS_COLORS`, and pages within a bounded physical row count. Optional provider descriptions appear on one bounded detail row for the selected candidate by default; inline and hidden modes are configurable.
 
 `CompletionProvider` is a compile-time Rust trait. There is intentionally no unstable Rust dynamic ABI and no subprocess protocol in the first release.
 

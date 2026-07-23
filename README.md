@@ -25,7 +25,7 @@ Copyright © 2026 **Fadouse**. Distributed under the MIT License.
   - `/etc/hosts`, SSH config, and known hosts
   - Bash reserved words
 - Context-aware shell quoting for spaces and metacharacters
-- Readline-style, `LS_COLORS`-aware columnar completion menus
+- Readline-style, `LS_COLORS`-aware columnar completion menus with optional candidate descriptions
 - Exact candidates remain visible beside longer prefix candidates (`who`, `whoami`)
 - Bounded asynchronous filesystem scanning with silent, automatic pending-menu refresh
 - Native Readline Emacs and Vi keymaps remain intact
@@ -120,6 +120,9 @@ BASHLUME_CACHE_MIB=16
 BASHLUME_MAX_CANDIDATES=4096
 BASHLUME_MENU_ROWS=10
 
+# selected (default) | inline | off
+BASHLUME_MENU_DESCRIPTIONS=selected
+
 # errors (default) | full | off
 BASHLUME_HIGHLIGHT=errors
 
@@ -157,6 +160,8 @@ BASHLUME_COLOR_COMPLETION_FILE
 ```
 
 Values are SGR parameter lists without `ESC[` or the final `m`. Invalid values are rejected to prevent terminal escape injection. Completion directory, executable, regular-file, and filename-extension colors follow `LS_COLORS`; the three completion variables above override its base type colors. `NO_COLOR` disables syntax colors.
+
+Candidate descriptions default to a single detail row for the selected item, preserving the compact multi-column menu. `inline` places descriptions beside each candidate when space permits; `off` hides them. The description row counts toward `BASHLUME_MENU_ROWS` and is safely truncated at the terminal edge.
 
 Set `BASHLUME_DISABLE=1` before loading for an emergency startup bypass.
 

@@ -10,6 +10,13 @@ pub enum DiagnosticsMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuDescriptionMode {
+    Selected,
+    Inline,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HighlightMode {
     /// Paint only definite syntax errors; leave valid input untouched.
     Errors,
@@ -53,6 +60,7 @@ pub struct Config {
     pub cache_limit_bytes: usize,
     pub max_candidates: usize,
     pub menu_rows: usize,
+    pub menu_descriptions: MenuDescriptionMode,
     pub theme: Theme,
 }
 
@@ -67,6 +75,7 @@ impl Default for Config {
             cache_limit_bytes: 16 * 1024 * 1024,
             max_candidates: 4096,
             menu_rows: 10,
+            menu_descriptions: MenuDescriptionMode::Selected,
             theme: Theme {
                 normal: "0".into(),
                 command: "38;5;114".into(),
@@ -135,6 +144,9 @@ impl Config {
         if let Some(value) = unsafe { shell_var("BASHLUME_MENU_ROWS") } {
             config.menu_rows = parse_bounded(&value, 1, 100).unwrap_or(config.menu_rows);
         }
+        if let Some(value) = unsafe { shell_var("BASHLUME_MENU_DESCRIPTIONS") } {
+            config.menu_descriptions = parse_menu_description_mode(&value);
+        }
         if let Some(value) = unsafe { shell_var("LS_COLORS") } {
             apply_ls_colors(&value, &mut config.theme);
         }
@@ -171,6 +183,14 @@ impl Config {
         color!(completion_file, "BASHLUME_COLOR_COMPLETION_FILE");
 
         config
+    }
+}
+
+fn parse_menu_description_mode(value: &str) -> MenuDescriptionMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "0" => MenuDescriptionMode::Off,
+        "inline" | "all" | "2" => MenuDescriptionMode::Inline,
+        _ => MenuDescriptionMode::Selected,
     }
 }
 
@@ -283,6 +303,23 @@ mod tests {
         assert_eq!(parse_highlight_mode("errors"), HighlightMode::Errors);
         assert_eq!(parse_highlight_mode("full"), HighlightMode::Full);
         assert_eq!(parse_highlight_mode("off"), HighlightMode::Off);
+    }
+
+    #[test]
+    fn menu_description_modes_are_bounded_to_known_values() {
+        assert_eq!(
+            parse_menu_description_mode("selected"),
+            MenuDescriptionMode::Selected
+        );
+        assert_eq!(
+            parse_menu_description_mode("inline"),
+            MenuDescriptionMode::Inline
+        );
+        assert_eq!(parse_menu_description_mode("off"), MenuDescriptionMode::Off);
+        assert_eq!(
+            parse_menu_description_mode("unexpected"),
+            MenuDescriptionMode::Selected
+        );
     }
 
     #[test]

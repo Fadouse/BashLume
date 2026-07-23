@@ -68,9 +68,28 @@ impl CompletionProvider for GenericProvider {
     }
 }
 
-const KEYWORDS: &[&str] = &[
-    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "in",
-    "esac", "select", "function", "time", "coproc", "[[", "((", "!", "{",
+const KEYWORDS: &[(&str, &str)] = &[
+    ("if", "Begin a conditional command"),
+    ("then", "Begin the successful conditional branch"),
+    ("elif", "Add another conditional branch"),
+    ("else", "Begin the fallback conditional branch"),
+    ("fi", "End a conditional command"),
+    ("for", "Iterate over a list of words"),
+    ("while", "Repeat while a command succeeds"),
+    ("until", "Repeat until a command succeeds"),
+    ("do", "Begin a loop body"),
+    ("done", "End a loop body"),
+    ("case", "Match a word against patterns"),
+    ("in", "Introduce a word list or case patterns"),
+    ("esac", "End a case command"),
+    ("select", "Build an interactive selection loop"),
+    ("function", "Define a shell function"),
+    ("time", "Measure pipeline execution time"),
+    ("coproc", "Start an asynchronous coprocess"),
+    ("[[", "Begin a conditional expression"),
+    ("((", "Begin an arithmetic expression"),
+    ("!", "Negate a pipeline's exit status"),
+    ("{", "Begin a grouped command"),
 ];
 
 fn command_candidates(
@@ -89,8 +108,17 @@ fn command_candidates(
     for name in &shell.builtins {
         push_named(query, name, CandidateKind::Builtin, shell, sink);
     }
-    for &name in KEYWORDS {
-        push_named(query, name, CandidateKind::Keyword, shell, sink);
+    for &(name, description) in KEYWORDS {
+        if let Some(candidate) = Candidate::from_borrowed(
+            query,
+            name,
+            name,
+            CandidateKind::Keyword,
+            true,
+            shell.command_recency_bonus(name),
+        ) {
+            sink.push(candidate.with_description(description));
+        }
     }
     cache.for_each_command(query, |name| {
         push_named(query, name, CandidateKind::Command, shell, sink);

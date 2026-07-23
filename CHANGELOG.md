@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 — 2026-07-23
+
+- Add optional human-readable descriptions to completion candidates.
+- Show the selected candidate's description on one bounded detail row by default while preserving the compact multi-column menu.
+- Add `BASHLUME_MENU_DESCRIPTIONS=selected|inline|off`.
+- Seed native Bash reserved-word candidates with descriptions so the new UI is immediately testable before external rule packs arrive.
+
 ## 0.1.4 — 2026-07-23
 
 - Keep pending completion scans visually silent instead of flashing a `scanning…` row.

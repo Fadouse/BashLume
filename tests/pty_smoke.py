@@ -143,6 +143,15 @@ def main() -> int:
         session.send(b"\x15", 0.2)
         session.send(b"\x07", 0.2)
 
+        keyword_menu = session.send(b"fo", 0.2) + session.send(b"\t", 0.6)
+        require(
+            b"Iterate over a list of words" in keyword_menu,
+            "selected completion description row was not rendered",
+            session.output,
+        )
+        session.send(b"\x07", 0.2)
+        session.send(b"\x15", 0.2)
+
         session.send(
             b"(read -e value; printf 'SUBSHELL:<%s>\\n' \"$value\")\n",
             0.2,

@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use unicode_width::UnicodeWidthChar;
 
 use crate::completion::matcher::Candidate;
-use crate::config::{Config, HighlightMode, Theme};
+use crate::config::{Config, HighlightMode, MenuDescriptionMode, Theme};
 use crate::ffi;
 use crate::syntax::{Diagnostic, Style};
 
@@ -168,23 +168,32 @@ fn render_menu(
     // Readline's default listing uses columns filled from top to bottom. Keep
     // one terminal column unused to avoid an autowrap at the right edge.
     let layout_width = width.saturating_sub(1).max(1);
+    let selected_description = menu
+        .candidates
+        .get(menu.selected)
+        .and_then(|candidate| candidate.description.as_deref())
+        .filter(|description| !description.is_empty());
+    let show_selected_description = config.menu_descriptions == MenuDescriptionMode::Selected
+        && selected_description.is_some()
+        && maximum_rows >= 2;
+    let description_rows = usize::from(show_selected_description);
     let longest = menu
         .candidates
         .iter()
-        .map(|candidate| menu_text_width(&candidate.display))
+        .map(|candidate| candidate_menu_width(candidate, config.menu_descriptions))
         .max()
         .unwrap_or(1)
         .min(layout_width);
     let cell_width = longest.saturating_add(2).min(layout_width).max(1);
     let columns = (layout_width / cell_width).max(1);
-    let rows_per_page = maximum_rows.max(1);
+    let rows_per_page = maximum_rows.saturating_sub(description_rows).max(1);
     let capacity = rows_per_page.saturating_mul(columns).max(1);
     let page_start = (menu.selected / capacity).saturating_mul(capacity);
     let page_end = page_start
         .saturating_add(capacity)
         .min(menu.candidates.len());
     let page_length = page_end.saturating_sub(page_start);
-    let rows = page_length.div_ceil(columns).min(rows_per_page).max(1);
+    let mut rows = page_length.div_ceil(columns).min(rows_per_page).max(1);
     let mut final_column = 0;
 
     for row in 0..rows {
@@ -198,17 +207,21 @@ fn render_menu(
                 break;
             }
             let candidate = &menu.candidates[index];
-            push_sgr(output, completion_sgr(candidate, config));
-            if index == menu.selected {
-                push_sgr(output, &config.theme.menu_selected);
-            }
+            let selected = index == menu.selected;
             let has_next = index.saturating_add(rows) < page_end;
             let text_limit = if has_next {
                 cell_width.saturating_sub(2).max(1)
             } else {
                 layout_width.saturating_sub(column).max(1)
             };
-            let used = render_menu_text(output, &candidate.display, text_limit);
+            let used = render_menu_candidate(
+                output,
+                candidate,
+                selected,
+                config,
+                config.menu_descriptions == MenuDescriptionMode::Inline,
+                text_limit,
+            );
             output.extend_from_slice(b"\x1b[0m");
             column = column.saturating_add(used);
             if has_next {
@@ -220,7 +233,68 @@ fn render_menu(
         final_column = column;
     }
 
+    if show_selected_description {
+        output.extend_from_slice(b"\r\n");
+        push_sgr(output, &config.theme.ghost);
+        final_column = render_menu_text(
+            output,
+            selected_description.unwrap_or_default(),
+            layout_width,
+        );
+        output.extend_from_slice(b"\x1b[0m");
+        rows = rows.saturating_add(1);
+    }
+
     (rows, final_column)
+}
+
+fn candidate_menu_width(candidate: &Candidate, mode: MenuDescriptionMode) -> usize {
+    let display = menu_text_width(&candidate.display);
+    if mode != MenuDescriptionMode::Inline {
+        return display;
+    }
+    candidate
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+        .map_or(display, |description| {
+            display
+                .saturating_add(2)
+                .saturating_add(menu_text_width(description))
+        })
+}
+
+fn render_menu_candidate(
+    output: &mut Vec<u8>,
+    candidate: &Candidate,
+    selected: bool,
+    config: &Config,
+    inline_description: bool,
+    limit: usize,
+) -> usize {
+    push_sgr(output, completion_sgr(candidate, config));
+    if selected {
+        push_sgr(output, &config.theme.menu_selected);
+    }
+    let mut used = render_menu_text(output, &candidate.display, limit);
+    let description = inline_description
+        .then_some(candidate.description.as_deref())
+        .flatten()
+        .filter(|description| !description.is_empty());
+    if let Some(description) = description.filter(|_| used.saturating_add(2) < limit) {
+        output.extend_from_slice(b"  ");
+        used = used.saturating_add(2);
+        push_sgr(output, &config.theme.ghost);
+        if selected {
+            push_sgr(output, &config.theme.menu_selected);
+        }
+        used = used.saturating_add(render_menu_text(
+            output,
+            description,
+            limit.saturating_sub(used),
+        ));
+    }
+    used
 }
 
 fn completion_sgr<'a>(candidate: &Candidate, config: &'a Config) -> &'a str {
@@ -583,6 +657,7 @@ mod tests {
             .map(|display| Candidate {
                 display: display.into(),
                 value: display.into(),
+                description: None,
                 kind: CandidateKind::Command,
                 append_space: true,
                 score: 0,
@@ -611,6 +686,79 @@ mod tests {
         assert!(rendered.contains("whoami"));
         assert!(rendered.contains(&format!("\x1b[{}m", config.theme.completion_executable)));
         assert!(!rendered.contains("[command]"));
+    }
+
+    #[test]
+    fn selected_description_uses_one_bounded_detail_row() {
+        let candidates = vec![Candidate {
+            display: "--branch".into(),
+            value: "--branch".into(),
+            description: Some("Select a Git branch".into()),
+            kind: CandidateKind::Command,
+            append_space: true,
+            score: 0,
+            match_class: MatchClass::Prefix,
+        }];
+        let config = Config::default();
+        let mut output = Vec::new();
+        let extent = render_menu(
+            &mut output,
+            MenuView {
+                candidates: &candidates,
+                selected: 0,
+            },
+            &config,
+            24,
+            4,
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(extent.0, 2);
+        assert!(rendered.contains("--branch"));
+        assert!(rendered.contains("Select a Git branch"));
+    }
+
+    #[test]
+    fn inline_and_off_description_modes_are_respected() {
+        let candidates = vec![Candidate {
+            display: "--force".into(),
+            value: "--force".into(),
+            description: Some("Force the operation".into()),
+            kind: CandidateKind::Command,
+            append_space: true,
+            score: 0,
+            match_class: MatchClass::Prefix,
+        }];
+        let mut config = Config {
+            menu_descriptions: MenuDescriptionMode::Inline,
+            ..Config::default()
+        };
+        let mut output = Vec::new();
+        let inline_extent = render_menu(
+            &mut output,
+            MenuView {
+                candidates: &candidates,
+                selected: 0,
+            },
+            &config,
+            80,
+            4,
+        );
+        assert_eq!(inline_extent.0, 1);
+        assert!(String::from_utf8_lossy(&output).contains("Force the operation"));
+
+        config.menu_descriptions = MenuDescriptionMode::Off;
+        output.clear();
+        render_menu(
+            &mut output,
+            MenuView {
+                candidates: &candidates,
+                selected: 0,
+            },
+            &config,
+            80,
+            4,
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("Force the operation"));
     }
 
     #[test]

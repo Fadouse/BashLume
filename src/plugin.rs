@@ -1058,6 +1058,7 @@ mod tests {
         let candidate = Candidate {
             display: "git".into(),
             value: "git".into(),
+            description: None,
             kind: CandidateKind::Command,
             append_space: true,
             score: 0,

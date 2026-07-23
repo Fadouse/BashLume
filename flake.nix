@@ -21,7 +21,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "bashlume";
-            version = "0.1.4";
+            version = "0.1.5";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
 
