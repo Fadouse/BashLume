@@ -15,6 +15,16 @@ if type -t bashlume >/dev/null 2>&1; then
   return 0
 fi
 
+_bashlume_system_rules=@BASHLUME_RULE_PATH@
+if [[ $_bashlume_system_rules != @BASHLUME_RULE_PATH@ && -d $_bashlume_system_rules ]]; then
+  if [[ -n ${BASHLUME_RULE_PATH:-} ]]; then
+    BASHLUME_RULE_PATH+=":$_bashlume_system_rules"
+  else
+    BASHLUME_RULE_PATH=$_bashlume_system_rules
+  fi
+fi
+unset _bashlume_system_rules
+
 _bashlume_library=${BASHLUME_LIBRARY:-@BASHLUME_LIBRARY@}
 if [[ $_bashlume_library == @BASHLUME_LIBRARY@ ]]; then
   _bashlume_root=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)

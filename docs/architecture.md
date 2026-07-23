@@ -18,12 +18,16 @@ Bash
 Rust core
  ├─ Tree-sitter Bash incremental parser
  ├─ semantic highlighter
- ├─ generic provider registry
+ ├─ generic and native rule-pack providers
+ ├─ signed `.blp` index/manifest verifier
+ ├─ bounded Completion IR VM and multi-source merger
  ├─ candidate matcher/ranker
  ├─ context-aware quoting
  ├─ terminal renderer
  └─ bounded cache
-      └─ one filesystem worker thread
+      └─ one I/O supervisor thread
+          ├─ filesystem and lazy rule-block loading
+          └─ at most two bounded dynamic probe children
 ```
 
 ## Readline integration
@@ -66,24 +70,30 @@ No Rust panic is allowed to unwind across a C callback. Entry points use `catch_
 
 Bash itself is single-threaded. The worker thread:
 
-- reads directories, `/etc/passwd`, `/etc/hosts`, and SSH host files
+- reads directories, `/etc/passwd`, `/etc/hosts`, SSH host files, and local rule-pack indexes/blocks
+- verifies and decompresses lazily requested command blocks
+- supervises at most two signed-capability dynamic probes through nonblocking pipes
 - never reads or writes Bash/Readline globals
 - communicates through message channels
 - has a 256 KiB requested stack
+
+Dynamic probes are emitted only by an explicit Tab evaluation of a trusted pack. They use direct argument vectors rather than shell command strings, have bounded output and deadlines, and are cancelled when their menu context is abandoned. Ordinary typing and ghost evaluation never spawn processes.
 
 A `pthread_atfork` child hook marks the inherited plugin inactive. A forked child therefore does not touch channels or locks inherited while the worker may have been active. A newly executed interactive Bash loads a fresh plugin instance normally.
 
 ## Completion pipeline
 
-1. A tolerant shell lexer derives the word range, quote mode, and whether the cursor is in command position.
-2. Providers emit logical, unquoted candidates.
-3. The matcher assigns strict score bands: exact, prefix, case-insensitive prefix, substring, then fuzzy subsequence. Exact and case-sensitive prefix matches share one retained result set, so an exact `who` does not hide `whoami`; exact still sorts first.
-4. Context and history add lower-order ranking bonuses.
-5. The sink deduplicates and retains a bounded top set.
-6. The insertion layer applies minimal Bash-safe quoting while preserving the user's quote style.
-7. The menu lays candidates out in Readline-style top-to-bottom columns, colors filesystem types and extensions from `LS_COLORS`, and pages within a bounded physical row count. Optional provider descriptions appear on one bounded detail row for the selected candidate by default; inline and hidden modes are configurable.
+1. A tolerant shell lexer derives the word range, quote mode, current simple-command words, command name/path, and whether the cursor is in command position.
+2. The rule provider requests only the matching command block from every installed compatible pack. Each source VM is evaluated independently against the same immutable context.
+3. Candidate outputs are unioned and deduplicated by insertion value in the current replacement range. Source priority (`user > bash > fish > zsh`) resolves metadata only; missing descriptions are filled across sources, `nospace` wins conservatively, and unique candidates are retained.
+4. The generic provider supplements contexts not owned by command rules.
+5. The matcher assigns strict score bands: exact, prefix, case-insensitive prefix, substring, then fuzzy subsequence. Exact and case-sensitive prefix matches share one retained result set, so an exact `who` does not hide `whoami`; exact still sorts first.
+6. Context and history add lower-order ranking bonuses.
+7. The sink retains a bounded top set.
+8. The insertion layer applies minimal Bash-safe quoting while preserving the user's quote style.
+9. The menu lays candidates out in Readline-style top-to-bottom columns, colors filesystem types and extensions from `LS_COLORS`, and pages within a bounded physical row count. Optional provider descriptions appear on one bounded detail row for the selected candidate by default; inline and hidden modes are configurable.
 
-`CompletionProvider` is a compile-time Rust trait. There is intentionally no unstable Rust dynamic ABI and no subprocess protocol in the first release.
+`CompletionProvider` remains a compile-time Rust trait. External rule projects publish pure-data IR, never Rust/C dynamic libraries, so no unstable native plugin ABI is exposed.
 
 ## Filesystem cache
 

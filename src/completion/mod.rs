@@ -313,6 +313,100 @@ mod tests {
     }
 
     #[test]
+    fn installed_rule_packs_are_evaluated_independently_and_deduplicated() {
+        use crate::rules::format::{PackBuildSpec, PackBuilder, PackManifest, SourceKind};
+        use crate::rules::ir::{
+            AppendPolicy, CandidateTemplate, CommandProgram, PredicateOp, RuleCandidateKind,
+            StaticRule,
+        };
+
+        let root = std::env::temp_dir().join(format!("bashlume-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let make_pack = |source: SourceKind, name: &str, candidates: Vec<CandidateTemplate>| {
+            let spec = PackBuildSpec {
+                manifest: PackManifest {
+                    pack_id: format!("org.bashlume.test.{name}"),
+                    pack_version: "1.0.0".into(),
+                    source_kind: source,
+                    source_repository: "https://example.invalid".into(),
+                    source_commit: name.repeat(8),
+                    license_expression: "GPL-2.0-or-later".into(),
+                    channel: "test".into(),
+                    compiler_version: "test".into(),
+                    generated_at: "1970-01-01T00:00:00Z".into(),
+                    stale_commands: Vec::new(),
+                    probe_capabilities: Vec::new(),
+                },
+                minimum_engine: [0, 2, 0],
+                required_opcodes: 0,
+                optional_features: 0,
+                commands: vec![CommandProgram {
+                    canonical_name: "bl-merge".into(),
+                    registrations: vec!["bl-merge".into()],
+                    source_path: name.into(),
+                    source_commit: name.repeat(8),
+                    license: "GPL-2.0-or-later".into(),
+                    static_rules: vec![StaticRule {
+                        when: vec![PredicateOp::True],
+                        candidates,
+                    }],
+                    probes: Vec::new(),
+                }],
+            };
+            let path = root.join(format!("{name}.blp"));
+            std::fs::write(&path, PackBuilder::new(spec).build(None).unwrap()).unwrap();
+            path
+        };
+        let option = |value: &str, description: Option<&str>| CandidateTemplate {
+            value: value.into(),
+            display: value.into(),
+            description: description.map(str::to_owned),
+            kind: RuleCandidateKind::Option,
+            append: AppendPolicy::Space,
+            preserve_order: false,
+        };
+        make_pack(SourceKind::Bash, "bash", vec![option("--shared", None)]);
+        make_pack(
+            SourceKind::Fish,
+            "fish",
+            vec![option("--shared", Some("Shared description"))],
+        );
+        make_pack(SourceKind::Zsh, "zsh", vec![option("--unique", None)]);
+
+        let shell = ShellSnapshot {
+            cwd: root.clone(),
+            ..ShellSnapshot::default()
+        };
+        let mut engine = CompletionEngine::new(1024 * 1024, 128);
+        engine.configure_rules(vec![root.clone()], Vec::new());
+        let context = CompletionContext::analyze("bl-merge --", 11);
+        let mut result = engine.complete_explicit(&context, &shell, 128);
+        for _ in 0..100 {
+            if !result.pending {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            result = engine.complete_explicit(&context, &shell, 128);
+        }
+        assert!(!result.pending);
+        let shared = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "--shared")
+            .unwrap();
+        assert_eq!(shared.description.as_deref(), Some("Shared description"));
+        assert_eq!(shared.source_mask, 0b0011);
+        assert!(
+            result.candidates.iter().any(|candidate| {
+                candidate.value == "--unique" && candidate.source_mask == 0b0100
+            })
+        );
+        engine.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn deleted_navigation_target_is_rejected_after_prompt_refresh() {
         let root = std::env::temp_dir().join(format!("bashlume-navigation-{}", std::process::id()));
         let target = root.join("gone");

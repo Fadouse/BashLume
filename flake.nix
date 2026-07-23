@@ -33,8 +33,10 @@
               install -Dm755 "$library" "$out/lib/bash/libbashlume.so"
               install -Dm755 target/release/bashlume-pack "$out/bin/bashlume-pack"
               install -Dm644 shell/bashlume.bash "$out/share/bashlume/bashlume.bash"
+              mkdir -p "$out/share/bashlume/rules"
               substituteInPlace "$out/share/bashlume/bashlume.bash" \
-                --replace-fail '@BASHLUME_LIBRARY@' "$out/lib/bash/libbashlume.so"
+                --replace-fail '@BASHLUME_LIBRARY@' "$out/lib/bash/libbashlume.so" \
+                --replace-fail '@BASHLUME_RULE_PATH@' "$out/share/bashlume/rules"
               runHook postInstall
             '';
 

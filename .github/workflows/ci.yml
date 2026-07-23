@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-and-pty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - name: Install native test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc pkg-config shellcheck tmux python3
+      - name: Strict Rust checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+          cargo build --release
+          cargo test --release -- --ignored --nocapture
+      - name: Build signed conformance pack
+        run: |
+          target/release/bashlume-pack build \
+            tests/fixtures/rules/demo.json /tmp/bashlume-demo.blp \
+            tests/fixtures/rules/test-signing-key.hex
+          target/release/bashlume-pack verify /tmp/bashlume-demo.blp \
+            tests/fixtures/rules/test-verifying-key.hex
+      - name: PTY, tmux, and resource regressions
+        run: |
+          shellcheck shell/bashlume.bash scripts/check.sh
+          python3 tests/pty_smoke.py target/release/libbashlume.so \
+            --rule-pack /tmp/bashlume-demo.blp \
+            --trusted-key tests/fixtures/rules/test-verifying-key.hex
+          python3 tests/tmux_bottom.py target/release/libbashlume.so
+          python3 tests/resource_budget.py target/release/libbashlume.so
