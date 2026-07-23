@@ -199,11 +199,49 @@ fn is_pack(path: &Path) -> bool {
 }
 
 fn load_trusted_keys(paths: &[PathBuf]) -> (TrustedKeys, Vec<String>) {
+    let mut key_files = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        if key_files.len() >= MAX_TRUSTED_KEYS {
+            break;
+        }
+        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if normalized.is_file() {
+            if seen.insert(normalized.clone()) {
+                key_files.push(normalized);
+            }
+            continue;
+        }
+        let Ok(directory) = fs::read_dir(&normalized) else {
+            continue;
+        };
+        let mut children = directory
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path.extension().is_some_and(|extension| {
+                        extension == "pub" || extension == "hex" || extension == "key"
+                    })
+            })
+            .collect::<Vec<_>>();
+        children.sort_unstable();
+        for child in children {
+            if key_files.len() >= MAX_TRUSTED_KEYS {
+                break;
+            }
+            let child = fs::canonicalize(&child).unwrap_or(child);
+            if seen.insert(child.clone()) {
+                key_files.push(child);
+            }
+        }
+    }
+
     let mut keys = TrustedKeys::default();
     let mut errors = Vec::new();
-    for path in paths.iter().take(MAX_TRUSTED_KEYS) {
+    for path in key_files {
         let result = (|| {
-            let text = fs::read_to_string(path)?;
+            let text = fs::read_to_string(&path)?;
             let bytes = hex::decode(text.trim()).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
@@ -239,5 +277,27 @@ mod tests {
         assert!(version_at_least([1, 0, 0], [0, 99, 99]));
         assert!(version_at_least([0, 2, 1], [0, 2, 0]));
         assert!(!version_at_least([0, 1, 9], [0, 2, 0]));
+    }
+
+    #[test]
+    fn trusted_key_directories_load_only_key_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "bashlume-trusted-keys-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        fs::write(
+            directory.join("official.pub"),
+            hex::encode(signing.verifying_key().as_bytes()),
+        )
+        .unwrap();
+        fs::write(directory.join("README.md"), "not a key").unwrap();
+
+        let (keys, errors) = load_trusted_keys(std::slice::from_ref(&directory));
+        let _ = fs::remove_dir_all(&directory);
+        assert!(errors.is_empty());
+        assert!(!keys.is_empty());
     }
 }

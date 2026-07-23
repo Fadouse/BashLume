@@ -156,8 +156,10 @@ impl Config {
             Some(value) if !value.is_empty() => split_paths(&value),
             _ => default_rule_paths(),
         };
-        config.trusted_rule_key_paths = unsafe { shell_var("BASHLUME_TRUSTED_KEY_PATHS") }
-            .map_or_else(Vec::new, |value| split_paths(&value));
+        config.trusted_rule_key_paths = match unsafe { shell_var("BASHLUME_TRUSTED_KEY_PATHS") } {
+            Some(value) if !value.is_empty() => split_paths(&value),
+            _ => default_trusted_key_paths(),
+        };
         if let Some(value) = unsafe { shell_var("LS_COLORS") } {
             apply_ls_colors(&value, &mut config.theme);
         }
@@ -216,6 +218,20 @@ fn default_rule_paths() -> Vec<PathBuf> {
     }
     paths.push(PathBuf::from("/usr/local/share/bashlume/rules"));
     paths.push(PathBuf::from("/usr/share/bashlume/rules"));
+    paths
+}
+
+fn default_trusted_key_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(config_home) =
+        unsafe { shell_var("XDG_CONFIG_HOME") }.filter(|value| !value.is_empty())
+    {
+        paths.push(PathBuf::from(config_home).join("bashlume/trusted-keys"));
+    } else if let Some(home) = unsafe { shell_var("HOME") }.filter(|value| !value.is_empty()) {
+        paths.push(PathBuf::from(home).join(".config/bashlume/trusted-keys"));
+    }
+    paths.push(PathBuf::from("/usr/local/share/bashlume/trusted-keys"));
+    paths.push(PathBuf::from("/usr/share/bashlume/trusted-keys"));
     paths
 }
 

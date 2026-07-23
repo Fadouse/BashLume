@@ -130,8 +130,8 @@ BASHLUME_MENU_DESCRIPTIONS=selected
 
 # Colon-separated local pack files/directories; runtime never downloads packs.
 BASHLUME_RULE_PATH="$HOME/.local/share/bashlume/rules"
-# Colon-separated raw Ed25519 public-key files authorizing dynamic probes.
-BASHLUME_TRUSTED_KEY_PATHS="$HOME/.config/bashlume/trusted-rule-key.hex"
+# Colon-separated Ed25519 public-key files/directories authorizing dynamic probes.
+BASHLUME_TRUSTED_KEY_PATHS="$HOME/.config/bashlume/trusted-keys"
 
 # errors (default) | full | off
 BASHLUME_HIGHLIGHT=errors
@@ -173,6 +173,8 @@ Values are SGR parameter lists without `ESC[` or the final `m`. Invalid values a
 
 Candidate descriptions default to a single detail row for the selected item, preserving the compact multi-column menu. `inline` places descriptions beside each candidate when space permits; `off` hides them. The description row counts toward `BASHLUME_MENU_ROWS` and is safely truncated at the terminal edge.
 
+Packaged installations include the three official rule-pack public keys under `share/bashlume/trusted-keys`; the packaged loader adds that directory automatically. A trusted signature authorizes only the probe executables declared by that pack and never bypasses format, hash, opcode, timeout, or output-limit validation. User-provided unsigned packs remain static-only.
+
 Set `BASHLUME_DISABLE=1` before loading for an emergency startup bypass.
 
 ## Resource policy
@@ -199,7 +201,7 @@ nix develop -c ./scripts/check.sh
 - Previously submitted continuation lines are not made editable again.
 - Invalid UTF-8 filesystem names are skipped rather than inserted incorrectly.
 - Completion caches may briefly show stale entries; they refresh asynchronously and are bounded with LRU eviction.
-- A background thread performs filesystem I/O only. It never calls Bash APIs.
+- One background supervisor performs filesystem I/O and at most two capability-authorized probes. It never calls Bash APIs; probes are Tab-only, direct `posix_spawnp` executions with no shell.
 
 See [`docs/architecture.md`](docs/architecture.md) for the FFI, threading, and redisplay design.
 

@@ -35,10 +35,12 @@
               install -Dm755 "$library" "$out/lib/bash/libbashlume.so"
               install -Dm755 "$pack_tool" "$out/bin/bashlume-pack"
               install -Dm644 shell/bashlume.bash "$out/share/bashlume/bashlume.bash"
-              mkdir -p "$out/share/bashlume/rules"
+              mkdir -p "$out/share/bashlume/rules" "$out/share/bashlume/trusted-keys"
+              install -m644 rules/trusted-keys/*.pub "$out/share/bashlume/trusted-keys/"
               substituteInPlace "$out/share/bashlume/bashlume.bash" \
                 --replace-fail '@BASHLUME_LIBRARY@' "$out/lib/bash/libbashlume.so" \
-                --replace-fail '@BASHLUME_RULE_PATH@' "$out/share/bashlume/rules"
+                --replace-fail '@BASHLUME_RULE_PATH@' "$out/share/bashlume/rules" \
+                --replace-fail '@BASHLUME_TRUSTED_KEY_PATH@' "$out/share/bashlume/trusted-keys"
               runHook postInstall
             '';
 

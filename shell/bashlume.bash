@@ -25,6 +25,16 @@ if [[ $_bashlume_system_rules != @BASHLUME_RULE_PATH@ && -d $_bashlume_system_ru
 fi
 unset _bashlume_system_rules
 
+_bashlume_system_keys=@BASHLUME_TRUSTED_KEY_PATH@
+if [[ $_bashlume_system_keys != @BASHLUME_TRUSTED_KEY_PATH@ && -d $_bashlume_system_keys ]]; then
+  if [[ -n ${BASHLUME_TRUSTED_KEY_PATHS:-} ]]; then
+    BASHLUME_TRUSTED_KEY_PATHS+=":$_bashlume_system_keys"
+  else
+    BASHLUME_TRUSTED_KEY_PATHS=$_bashlume_system_keys
+  fi
+fi
+unset _bashlume_system_keys
+
 _bashlume_library=${BASHLUME_LIBRARY:-@BASHLUME_LIBRARY@}
 if [[ $_bashlume_library == @BASHLUME_LIBRARY@ ]]; then
   _bashlume_root=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
