@@ -185,8 +185,13 @@ fn style_for_node(
             let text = source
                 .get(node.start_byte()..node.end_byte())
                 .unwrap_or_default();
-            let command = simple_unquote(text);
-            Some(match classify_command(command.as_deref().unwrap_or(text)) {
+            // Variable expansion and command substitution can resolve to a
+            // valid command only when Bash executes the line. Never call them
+            // unknown merely because their literal source is absent from PATH.
+            let Some(command) = simple_unquote(text) else {
+                return Some(Style::Command);
+            };
+            Some(match classify_command(&command) {
                 CommandClass::Valid => Style::Command,
                 CommandClass::Builtin => Style::Builtin,
                 CommandClass::Unknown => Style::UnknownCommand,
@@ -332,6 +337,16 @@ mod tests {
         let result = engine.highlight("echo )", |_| CommandClass::Valid);
         assert!(result.diagnostic.is_some());
         assert!(result.styles.contains(&Style::Error));
+    }
+
+    #[test]
+    fn static_unknown_commands_are_errors_but_dynamic_commands_are_not() {
+        let mut engine = SyntaxEngine::new().unwrap();
+        let unknown = engine.highlight("whoim", |_| CommandClass::Unknown);
+        assert!(unknown.styles.contains(&Style::UnknownCommand));
+
+        let dynamic = engine.highlight("$command", |_| CommandClass::Unknown);
+        assert!(!dynamic.styles.contains(&Style::UnknownCommand));
     }
 
     #[test]

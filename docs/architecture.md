@@ -100,7 +100,7 @@ Tree-sitter Bash provides incremental, error-tolerant concrete syntax trees. Bas
 - asynchronously known `PATH` commands
 - definite non-empty Tree-sitter error nodes
 
-The renderer defaults to `errors` mode, which applies only definite error spans, adds a visible error marker, and leaves valid syntax in the terminal's normal color. `full` mode exposes every semantic category. Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
+The renderer defaults to `errors` mode, which applies definite parse-error spans and statically unknown command names, adds a visible error marker, and leaves valid input in the terminal's normal color. Commands containing runtime expansion (for example `$command` or command substitution) remain pending rather than being falsely marked unknown. `full` mode exposes every semantic category. Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
 
 Input larger than 256 KiB safely falls back to unstyled rendering to bound paste-time work.
 

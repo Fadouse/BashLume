@@ -11,7 +11,7 @@ pub enum DiagnosticsMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HighlightMode {
-    /// Paint only definite syntax errors; leave valid input untouched.
+    /// Paint definite parse errors and statically unknown commands only.
     Errors,
     /// Paint all recognized Bash syntax categories.
     Full,

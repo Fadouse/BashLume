@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 — 2026-07-23
+
+- Treat statically unknown commands such as `whoim` as definite errors in the default errors-only mode.
+- Keep dynamic command expressions such as `$command` unmarked because Bash resolves them only at execution time.
+- Add a real-shell regression for unknown-command coloring and the error marker.
+
 ## 0.1.2 — 2026-07-23
 
 - Add an explicit marker for definite syntax errors while valid input remains uncolored.
