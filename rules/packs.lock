@@ -1,29 +1,29 @@
 {
-  "schema": 1,
   "packs": {
     "bash": {
-      "repository": "Fadouse/BashLume-Rules-Bash",
-      "channel": "stable",
-      "version": null,
       "asset": "bash.blp",
-      "sha256": null,
-      "required": false
-    },
-    "zsh": {
-      "repository": "Fadouse/BashLume-Rules-Zsh",
       "channel": "stable",
-      "version": null,
-      "asset": "zsh.blp",
+      "repository": "Fadouse/BashLume-Rules-Bash",
+      "required": false,
       "sha256": null,
-      "required": false
+      "version": null
     },
     "fish": {
-      "repository": "Fadouse/BashLume-Rules-Fish",
-      "channel": "stable",
-      "version": null,
       "asset": "fish.blp",
+      "channel": "stable",
+      "repository": "Fadouse/BashLume-Rules-Fish",
+      "required": false,
       "sha256": null,
-      "required": false
+      "version": null
+    },
+    "zsh": {
+      "asset": "zsh.blp",
+      "channel": "stable",
+      "repository": "Fadouse/BashLume-Rules-Zsh",
+      "required": false,
+      "sha256": null,
+      "version": null
     }
-  }
+  },
+  "schema": 1
 }
