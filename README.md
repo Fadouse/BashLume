@@ -7,7 +7,7 @@ Copyright © 2026 **Fadouse**. Distributed under the MIT License.
 ## Features
 
 - Incremental Bash parsing through Tree-sitter Bash
-- Semantic colors for commands, builtins, keywords, strings, variables, comments, operators, redirects, options, paths, and syntax errors
+- Errors-only highlighting by default; optional full semantic colors for commands, builtins, keywords, strings, variables, comments, operators, redirects, options, and paths
 - Valid/unknown command classification after the asynchronous `PATH` cache is ready
 - History-based and generic prefix ghost suggestions
 - Layered candidate matching:
@@ -118,6 +118,9 @@ BASHLUME_CACHE_MIB=16
 BASHLUME_MAX_CANDIDATES=4096
 BASHLUME_MENU_ROWS=10
 
+# errors (default) | full | off
+BASHLUME_HIGHLIGHT=errors
+
 # off | marker (default) | inline
 BASHLUME_DIAGNOSTICS=marker
 BASHLUME_DIAGNOSTIC_DELAY_MS=300
@@ -183,7 +186,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the FFI, threading, and r
 
 ## 中文简介
 
-BashLume 是一个轻量级 Bash 原生插件。它保留 GNU Readline，只增加实时语法高亮、幽灵建议、模糊补全与交互候选菜单。默认缓存上限为 16 MiB，文件系统扫描在单独的受限后台线程中执行；加载失败时自动回退到 Bash 原生行为。
+BashLume 是一个轻量级 Bash 原生插件。它保留 GNU Readline，只增加错误高亮、幽灵建议、模糊补全与交互候选菜单。默认仅标记明确语法错误，正确语法保持终端原色；设置 `BASHLUME_HIGHLIGHT=full` 可启用完整语义着色。默认缓存上限为 16 MiB，文件系统扫描在单独的受限后台线程中执行；加载失败时自动回退到 Bash 原生行为。
 
 常用配置可直接写入 `.bashrc`，无需 `export`。完整卸载命令为：
 

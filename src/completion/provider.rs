@@ -209,7 +209,7 @@ fn path_candidates(
         return ProviderStatus::default();
     };
     let key = cache.request_directory(directory, &leaf);
-    let Some((entries, truncated)) = cache.directory_entries(&key) else {
+    let Some((entries, truncated, refreshing)) = cache.directory_entries(&key) else {
         return ProviderStatus {
             pending: true,
             truncated: false,
@@ -238,7 +238,7 @@ fn path_candidates(
     }
 
     ProviderStatus {
-        pending: false,
+        pending: refreshing,
         truncated,
     }
 }

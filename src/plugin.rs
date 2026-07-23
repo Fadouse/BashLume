@@ -65,8 +65,7 @@ impl PluginState {
         let config = unsafe { Config::from_bash() };
         let mut shell = ShellSnapshot::default();
         unsafe { shell.refresh() };
-        let mut completion = CompletionEngine::new(config.cache_limit_bytes, config.max_candidates);
-        completion.refresh(&shell);
+        let completion = CompletionEngine::new(config.cache_limit_bytes, config.max_candidates);
         let syntax = SyntaxEngine::new().map_err(|error| error.to_string())?;
         Ok(Self {
             enabled: config.enabled,

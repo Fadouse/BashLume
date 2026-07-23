@@ -111,6 +111,14 @@ def main() -> int:
         status = session.send(b"bashlume status\n", 0.3)
         require(b"bashlume: enabled" in status, "loadable builtin did not initialize", session.output)
 
+        valid = session.send(b"echo BASHLUME_VALID_SYNTAX", 0.2)
+        require(
+            b"\x1b[1;38;5;108m" not in valid,
+            "valid syntax was colored in the default errors-only mode",
+            session.output,
+        )
+        session.send(b"\x15", 0.2)
+
         session.send(
             b"(read -e value; printf 'SUBSHELL:<%s>\\n' \"$value\")\n",
             0.2,
@@ -152,6 +160,7 @@ def main() -> int:
             (root / "alpha-file").write_text("alpha", encoding="utf-8")
             (root / "alpine-file").write_text("alpine", encoding="utf-8")
             (root / "My File").write_text("space", encoding="utf-8")
+            (root / "gone").mkdir()
             session.send(f"cd {root}\n".encode(), 0.4)
             session.send(b"printf '<%s>\\n' al", 0.2)
             menu = session.send(b"\t", 0.5)
@@ -174,6 +183,17 @@ def main() -> int:
                 "path containing a space was not quoted safely",
                 session.output,
             )
+
+            session.send(b"cd gone\n", 0.3)
+            session.send(b"cd ..\n", 0.3)
+            session.send(b"rmdir gone\n", 0.3)
+            stale = session.send(b"cd g", 0.5)
+            require(
+                b"\x1b[2;38;5;244mone" not in stale,
+                "history suggested a directory that had been deleted",
+                session.output,
+            )
+            session.send(b"\x15", 0.2)
             session.send(b"cd /\n", 0.3)
 
         session.send(b"alias zz_bashlume_alias='printf ALIAS_OK\\n'\n", 0.3)

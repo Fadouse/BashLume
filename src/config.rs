@@ -9,6 +9,16 @@ pub enum DiagnosticsMode {
     Inline,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HighlightMode {
+    /// Paint only definite syntax errors; leave valid input untouched.
+    Errors,
+    /// Paint all recognized Bash syntax categories.
+    Full,
+    /// Disable all syntax styling, including error markers.
+    Off,
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub normal: String,
@@ -34,6 +44,7 @@ pub struct Theme {
 pub struct Config {
     pub enabled: bool,
     pub colors_enabled: bool,
+    pub highlight: HighlightMode,
     pub diagnostics: DiagnosticsMode,
     pub diagnostic_delay_ms: u64,
     pub cache_limit_bytes: usize,
@@ -47,6 +58,7 @@ impl Default for Config {
         Self {
             enabled: true,
             colors_enabled: true,
+            highlight: HighlightMode::Errors,
             diagnostics: DiagnosticsMode::Marker,
             diagnostic_delay_ms: 300,
             cache_limit_bytes: 16 * 1024 * 1024,
@@ -91,6 +103,9 @@ impl Config {
                 .is_some_and(|value| parse_bool(&value, true));
         config.colors_enabled = !no_color;
 
+        if let Some(value) = unsafe { shell_var("BASHLUME_HIGHLIGHT") } {
+            config.highlight = parse_highlight_mode(&value);
+        }
         if let Some(value) = unsafe { shell_var("BASHLUME_DIAGNOSTICS") } {
             config.diagnostics = match value.to_ascii_lowercase().as_str() {
                 "off" | "none" | "0" => DiagnosticsMode::Off,
@@ -142,6 +157,14 @@ impl Config {
         color!(menu_meta, "BASHLUME_COLOR_MENU_META");
 
         config
+    }
+}
+
+fn parse_highlight_mode(value: &str) -> HighlightMode {
+    match value.to_ascii_lowercase().as_str() {
+        "full" | "syntax" | "all" => HighlightMode::Full,
+        "off" | "none" | "0" => HighlightMode::Off,
+        _ => HighlightMode::Errors,
     }
 }
 
@@ -198,6 +221,13 @@ mod tests {
             Some("1;38;5;203")
         );
         assert!(valid_sgr("31m\\e]2;owned".into()).is_none());
+    }
+
+    #[test]
+    fn highlight_defaults_to_errors_only() {
+        assert_eq!(parse_highlight_mode("errors"), HighlightMode::Errors);
+        assert_eq!(parse_highlight_mode("full"), HighlightMode::Full);
+        assert_eq!(parse_highlight_mode("off"), HighlightMode::Off);
     }
 
     #[test]

@@ -30,8 +30,14 @@ pub struct ScanKey {
 
 #[derive(Debug)]
 enum Request {
-    Scan { key: ScanKey, max_candidates: usize },
-    LoadAccounts { home: Option<PathBuf> },
+    Scan {
+        key: ScanKey,
+        max_candidates: usize,
+        generation: u64,
+    },
+    LoadAccounts {
+        home: Option<PathBuf>,
+    },
     Stop,
 }
 
@@ -41,6 +47,7 @@ enum Response {
         key: ScanKey,
         entries: Vec<DirectoryEntry>,
         truncated: bool,
+        generation: u64,
     },
     Accounts {
         users: Vec<String>,
@@ -104,6 +111,7 @@ pub struct CompletionCache {
     worker: Option<WorkerClient>,
     entries: HashMap<ScanKey, CacheEntry>,
     pending: HashSet<ScanKey>,
+    directory_generations: HashMap<PathBuf, u64>,
     path_directories: Vec<PathBuf>,
     users: Vec<String>,
     hosts: Vec<String>,
@@ -120,6 +128,7 @@ impl CompletionCache {
             worker: WorkerClient::start().ok(),
             entries: HashMap::new(),
             pending: HashSet::new(),
+            directory_generations: HashMap::new(),
             path_directories: Vec::new(),
             users: Vec::new(),
             hosts: Vec::new(),
@@ -170,6 +179,38 @@ impl CompletionCache {
         }
     }
 
+    pub fn refresh_directory(&mut self, directory: PathBuf) -> ScanKey {
+        let generation = self
+            .directory_generations
+            .entry(directory.clone())
+            .or_insert(0);
+        *generation = generation.wrapping_add(1);
+
+        // Prefix-specific entries are snapshots of this same directory. Drop
+        // all of them at a new prompt so stale paths cannot become ghost text
+        // while the fresh broad scan is pending.
+        let stale = self
+            .entries
+            .keys()
+            .filter(|key| key.directory == directory && !key.executable_only)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale {
+            if let Some(entry) = self.entries.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
+            }
+            self.pending.remove(&key);
+        }
+
+        let key = ScanKey {
+            directory,
+            prefix: String::new(),
+            executable_only: false,
+        };
+        self.enqueue(key.clone(), true);
+        key
+    }
+
     pub fn request_directory(&mut self, directory: PathBuf, prefix: &str) -> ScanKey {
         let exact = ScanKey {
             directory: directory.clone(),
@@ -204,17 +245,36 @@ impl CompletionCache {
     }
 
     fn request(&mut self, key: ScanKey) {
-        let stale = self
-            .entries
-            .get(&key)
-            .is_none_or(|entry| entry.refreshed_at.elapsed() >= Duration::from_secs(2));
+        self.enqueue(key, false);
+    }
+
+    fn enqueue(&mut self, key: ScanKey, force: bool) {
+        let max_age = if key.executable_only {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(250)
+        };
+        let stale = force
+            || self
+                .entries
+                .get(&key)
+                .is_none_or(|entry| entry.refreshed_at.elapsed() >= max_age);
         if !stale || !self.pending.insert(key.clone()) {
             return;
         }
+        let generation = if key.executable_only {
+            0
+        } else {
+            self.directory_generations
+                .get(&key.directory)
+                .copied()
+                .unwrap_or(0)
+        };
         let sent = self.worker.as_ref().is_some_and(|worker| {
             worker.send(Request::Scan {
                 key: key.clone(),
                 max_candidates: self.max_candidates,
+                generation,
             })
         });
         if !sent {
@@ -237,7 +297,19 @@ impl CompletionCache {
                     key,
                     entries,
                     truncated,
+                    generation,
                 } => {
+                    let current_generation = if key.executable_only {
+                        0
+                    } else {
+                        self.directory_generations
+                            .get(&key.directory)
+                            .copied()
+                            .unwrap_or(0)
+                    };
+                    if generation != current_generation {
+                        continue;
+                    }
                     self.pending.remove(&key);
                     let approximate_bytes = entries.iter().fold(0_usize, |total, entry| {
                         total
@@ -269,11 +341,12 @@ impl CompletionCache {
         }
     }
 
-    pub fn directory_entries(&mut self, key: &ScanKey) -> Option<(&[DirectoryEntry], bool)> {
+    pub fn directory_entries(&mut self, key: &ScanKey) -> Option<(&[DirectoryEntry], bool, bool)> {
+        let refreshing = self.pending.contains(key);
         let entry = self.entries.get_mut(key)?;
         self.clock = self.clock.wrapping_add(1);
         entry.last_used = self.clock;
-        Some((&entry.entries, entry.truncated))
+        Some((&entry.entries, entry.truncated, refreshing))
     }
 
     pub fn for_each_command(&mut self, query: &str, mut visitor: impl FnMut(&str)) -> bool {
@@ -299,7 +372,8 @@ impl CompletionCache {
                 }
                 _ => broad,
             };
-            if let Some((entries, _)) = self.directory_entries(&key) {
+            if let Some((entries, _, refreshing)) = self.directory_entries(&key) {
+                pending |= refreshing;
                 for entry in entries {
                     visitor(&entry.name);
                 }
@@ -322,6 +396,7 @@ impl CompletionCache {
                 Some(entry) if entry.entries.iter().any(|item| item.name == name) => {
                     return Some(true);
                 }
+                Some(_) if self.pending.contains(&key) => complete = false,
                 Some(entry) if entry.truncated => complete = false,
                 Some(_) => {}
                 None => complete = false,
@@ -375,6 +450,7 @@ fn worker_loop(requests: Receiver<Request>, responses: Sender<Response>) {
             Request::Scan {
                 key,
                 max_candidates,
+                generation,
             } => {
                 let (entries, truncated) = scan_directory(&key, max_candidates);
                 if responses
@@ -382,6 +458,7 @@ fn worker_loop(requests: Receiver<Request>, responses: Sender<Response>) {
                         key,
                         entries,
                         truncated,
+                        generation,
                     })
                     .is_err()
                 {

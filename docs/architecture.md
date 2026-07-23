@@ -85,20 +85,20 @@ A `pthread_atfork` child hook marks the inherited plugin inactive. A forked chil
 
 The main thread only sends scan requests and consumes completed responses. It never calls `read_dir`, `stat`, or external programs while handling a key.
 
-A complete result for a short prefix is reused as a lossless superset for longer prefixes. If a directory result is truncated, a refined-prefix scan streams the entire directory and retains only the highest-ranked configured number of matches.
+A complete result for a short prefix is reused as a lossless superset for longer prefixes. The current directory is force-refreshed at every prompt, ordinary directory entries have a short freshness window, and ghost suggestions are suppressed while a relevant refresh is pending. `cd`/`pushd` history predictions perform an asynchronous full-target directory validation. If a directory result is truncated, a refined-prefix scan streams the entire directory and retains only the highest-ranked configured number of matches.
 
 Cache memory is estimated from stored structures and strings. LRU eviction begins at the configured hard limit. The production default is 16 MiB.
 
 ## Syntax pipeline
 
-Tree-sitter Bash provides incremental, error-tolerant concrete syntax trees. BashLume stores the previous line and tree, computes a byte-accurate `InputEdit`, and reparses against the old tree. Semantic classification then overlays:
+Tree-sitter Bash provides incremental, error-tolerant concrete syntax trees. BashLume stores the previous line and tree, computes a byte-accurate `InputEdit`, and reparses against the old tree. Semantic classification then produces:
 
 - Bash syntax categories
 - known builtin/function/alias state
 - asynchronously known `PATH` commands
 - definite non-empty Tree-sitter error nodes
 
-Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
+The renderer defaults to `errors` mode, which applies only definite error spans and leaves valid syntax in the terminal's normal color. `full` mode exposes every semantic category. Zero-width missing nodes at end-of-input are treated as unfinished interactive input, not immediate errors.
 
 Input larger than 256 KiB safely falls back to unstyled rendering to bound paste-time work.
 

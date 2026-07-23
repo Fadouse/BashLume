@@ -73,6 +73,60 @@ impl CompletionContext {
     }
 }
 
+/// Returns the first target of `cd`/`pushd` when the line is a simple
+/// navigation command. The value is dequoted but not expanded.
+pub fn existing_directory_target(line: &str) -> Option<String> {
+    let tokens = lex_shell(line, line.len());
+    let words = tokens
+        .iter()
+        .take_while(|token| !matches!(token.kind, TokenKind::Operator(_)))
+        .filter_map(|token| match &token.kind {
+            TokenKind::Word(word) => Some(word.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut index = 0_usize;
+    while words.get(index).is_some_and(|word| is_assignment(word)) {
+        index += 1;
+    }
+    loop {
+        let command = *words.get(index)?;
+        if !is_command_wrapper(command) {
+            break;
+        }
+        index += 1;
+        let mut skip_value = false;
+        while let Some(word) = words.get(index).copied() {
+            if skip_value {
+                skip_value = false;
+                index += 1;
+            } else if is_assignment(word) {
+                index += 1;
+            } else if word.starts_with('-') {
+                skip_value = wrapper_option_takes_value(command, word);
+                index += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let command = *words.get(index)?;
+    if !matches!(command, "cd" | "pushd") {
+        return None;
+    }
+    index += 1;
+    while let Some(word) = words.get(index).copied() {
+        index += 1;
+        if word == "--" || word.starts_with('-') && word != "-" {
+            continue;
+        }
+        return Some(word.to_owned());
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 enum TokenKind {
     Word(String),
@@ -596,6 +650,20 @@ mod tests {
         let (line, point) = context.apply(&candidate);
         assert_eq!(line, "cat \"My File\" ");
         assert_eq!(point, line.len());
+    }
+
+    #[test]
+    fn extracts_only_real_navigation_targets() {
+        assert_eq!(
+            existing_directory_target("cd old-dir"),
+            Some("old-dir".into())
+        );
+        assert_eq!(
+            existing_directory_target("sudo -u root cd 'My Dir'"),
+            Some("My Dir".into())
+        );
+        assert_eq!(existing_directory_target("echo cd old-dir"), None);
+        assert_eq!(existing_directory_target("git -C old-dir status"), None);
     }
 
     #[test]

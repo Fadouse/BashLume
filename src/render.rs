@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use unicode_width::UnicodeWidthChar;
 
 use crate::completion::matcher::Candidate;
-use crate::config::{Config, Theme};
+use crate::config::{Config, HighlightMode, Theme};
 use crate::ffi;
 use crate::syntax::{Diagnostic, Style};
 
@@ -58,8 +58,7 @@ impl Renderer {
             model.styles,
             prompt_column,
             width,
-            &config.theme,
-            config.colors_enabled,
+            config,
         );
 
         if let Some(ghost) = model.ghost {
@@ -118,19 +117,23 @@ fn render_styled_line(
     styles: &[Style],
     start_column: usize,
     terminal_width: usize,
-    theme: &Theme,
-    colors_enabled: bool,
+    config: &Config,
 ) {
     let mut current = Style::Normal;
     let mut column = start_column;
-    if colors_enabled {
-        push_sgr(output, sgr_for(current, theme));
+    if config.colors_enabled {
+        push_sgr(output, sgr_for(current, &config.theme));
     }
     for (index, character) in line.char_indices() {
-        let style = styles.get(index).copied().unwrap_or(Style::Normal);
-        if colors_enabled && style != current {
+        let parsed_style = styles.get(index).copied().unwrap_or(Style::Normal);
+        let style = match config.highlight {
+            HighlightMode::Full => parsed_style,
+            HighlightMode::Errors if parsed_style == Style::Error => Style::Error,
+            HighlightMode::Errors | HighlightMode::Off => Style::Normal,
+        };
+        if config.colors_enabled && style != current {
             current = style;
-            push_sgr(output, sgr_for(style, theme));
+            push_sgr(output, sgr_for(style, &config.theme));
         }
         render_character(output, character, &mut column, terminal_width);
     }
@@ -439,6 +442,33 @@ mod tests {
         let position = displayed_position("ab测试", 7, 10);
         assert_eq!(position.row, 1);
         assert_eq!(position.column, 3);
+    }
+
+    #[test]
+    fn errors_only_mode_does_not_color_valid_syntax() {
+        let config = Config::default();
+        let mut output = Vec::new();
+        render_styled_line(
+            &mut output,
+            "echo bad",
+            &[Style::Command; 8],
+            0,
+            80,
+            &config,
+        );
+        assert!(
+            !output
+                .windows(config.theme.command.len())
+                .any(|window| window == config.theme.command.as_bytes())
+        );
+
+        output.clear();
+        render_styled_line(&mut output, ")", &[Style::Error], 0, 80, &config);
+        assert!(
+            output
+                .windows(config.theme.error.len())
+                .any(|window| window == config.theme.error.as_bytes())
+        );
     }
 
     #[test]

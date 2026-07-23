@@ -3,8 +3,8 @@ pub mod matcher;
 mod provider;
 mod worker;
 
-use context::CompletionContext;
-use matcher::{Candidate, CandidateSink};
+use context::{CompletionContext, QuoteMode, existing_directory_target, quote_shell_word};
+use matcher::{Candidate, CandidateKind, CandidateSink};
 use provider::{CompletionProvider, GenericProvider};
 use worker::CompletionCache;
 
@@ -43,7 +43,7 @@ impl CompletionEngine {
         self.cache.poll();
         // Prime the current directory before PATH directories so ordinary
         // path completion wins the worker queue at a fresh prompt.
-        self.cache.request_directory(shell.cwd.clone(), "");
+        self.cache.refresh_directory(shell.cwd.clone());
         self.cache.refresh_path(&shell.path);
         self.cache.load_accounts(shell.home.clone());
     }
@@ -85,8 +85,14 @@ impl CompletionEngine {
         }
 
         if let Some(history_line) = unsafe { shell::history_suggestion(&context.line) } {
+            let history_is_valid = match existing_directory_target(&history_line) {
+                Some(target) => self
+                    .existing_directory_target(&target, shell_snapshot, max_candidates)
+                    .unwrap_or(false),
+                None => true,
+            };
             let suffix = history_line[context.line.len()..].to_owned();
-            if !suffix.trim().is_empty() {
+            if history_is_valid && !suffix.trim().is_empty() {
                 return Some(GhostSuggestion { suffix });
             }
         }
@@ -96,6 +102,9 @@ impl CompletionEngine {
         }
 
         let result = self.complete(context, shell_snapshot, max_candidates.min(128));
+        if result.pending {
+            return None;
+        }
         for candidate in result.candidates {
             if !candidate.is_strong_prefix() {
                 continue;
@@ -109,6 +118,41 @@ impl CompletionEngine {
             }
         }
         None
+    }
+
+    fn existing_directory_target(
+        &mut self,
+        target: &str,
+        shell_snapshot: &ShellSnapshot,
+        max_candidates: usize,
+    ) -> Option<bool> {
+        if matches!(target, "/" | "." | ".." | "-" | "~")
+            || target.starts_with(['$', '`'])
+            || target.starts_with('+') && target[1..].bytes().all(|byte| byte.is_ascii_digit())
+            || target.starts_with('-') && target[1..].bytes().all(|byte| byte.is_ascii_digit())
+            || target.starts_with('~') && !target.starts_with("~/")
+        {
+            return Some(true);
+        }
+
+        let target = target.trim_end_matches('/');
+        if target.is_empty() {
+            return Some(true);
+        }
+        let quoted = quote_shell_word(target, QuoteMode::Unquoted);
+        let validation_line = format!("cd {quoted}");
+        let validation = CompletionContext::analyze(&validation_line, validation_line.len());
+        let result = self.complete(&validation, shell_snapshot, max_candidates.min(128));
+        if result.pending {
+            return None;
+        }
+        let expected = target.trim_end_matches('/');
+        Some(result.candidates.iter().any(|candidate| {
+            matches!(
+                candidate.kind,
+                CandidateKind::Directory | CandidateKind::User
+            ) && candidate.value.trim_end_matches('/') == expected
+        }))
     }
 
     pub fn command_known(&self, name: &str) -> Option<bool> {
@@ -184,5 +228,39 @@ mod tests {
             longest_common_display_prefix(&candidates).as_deref(),
             Some("测试")
         );
+    }
+
+    #[test]
+    fn deleted_navigation_target_is_rejected_after_prompt_refresh() {
+        let root = std::env::temp_dir().join(format!("bashlume-navigation-{}", std::process::id()));
+        let target = root.join("gone");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&target).unwrap();
+
+        let shell = ShellSnapshot {
+            cwd: root.clone(),
+            path: String::new(),
+            ..ShellSnapshot::default()
+        };
+        let mut engine = CompletionEngine::new(1024 * 1024, 128);
+        engine.refresh(&shell);
+
+        let wait_for = |engine: &mut CompletionEngine, expected: bool| {
+            for _ in 0..100 {
+                if engine.existing_directory_target("gone", &shell, 128) == Some(expected) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            false
+        };
+        assert!(wait_for(&mut engine, true));
+
+        std::fs::remove_dir(&target).unwrap();
+        engine.refresh(&shell);
+        assert_eq!(engine.existing_directory_target("gone", &shell, 128), None);
+        assert!(wait_for(&mut engine, false));
+        engine.stop();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
