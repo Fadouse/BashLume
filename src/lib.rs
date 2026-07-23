@@ -7,6 +7,7 @@ mod config;
 mod ffi;
 mod plugin;
 mod render;
+pub mod rules;
 mod shell;
 mod syntax;
 
@@ -27,7 +28,7 @@ pub static mut bashlume_struct: ffi::BashBuiltin = ffi::BashBuiltin {
     function: Some(bashlume_command),
     flags: ffi::BUILTIN_ENABLED,
     long_doc: LONG_DOCUMENTATION.0.as_ptr(),
-    short_doc: c"bashlume [status|enable|disable|reload|stats|help]".as_ptr(),
+    short_doc: c"bashlume [status|enable|disable|reload|stats|rules|help]".as_ptr(),
     handle: std::ptr::null_mut(),
 };
 

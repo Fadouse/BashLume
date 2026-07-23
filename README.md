@@ -16,6 +16,9 @@ Copyright © 2026 **Fadouse**. Distributed under the GNU General Public License,
   3. case-insensitive prefix
   4. substring
   5. fuzzy subsequence
+- Versioned, signed, pure-data `.blp` command-rule packs evaluated by a bounded Rust VM
+- Multi-source Bash/Zsh/Fish candidate union with insertion-level deduplication and provenance-aware metadata
+- Tab-only asynchronous dynamic probes with signed capability declarations and no shell execution
 - Generic completion for:
   - executables on `PATH`
   - Bash builtins, aliases, and functions
@@ -31,7 +34,7 @@ Copyright © 2026 **Fadouse**. Distributed under the GNU General Public License,
 - Native Readline Emacs and Vi keymaps remain intact
 - Safe fallback to unmodified Readline when loading fails
 
-BashLume does **not** invoke programmable completion scripts while typing. The first release contains a generic provider and a compile-time Rust provider trait for future command-specific providers.
+BashLume never sources Bash, Zsh, or Fish completion scripts at runtime. Separate rule projects compile upstream definitions into validated `.blp` data; BashLume discovers local packs asynchronously and evaluates them in Rust. Source shells are permitted only in rule-project CI as conversion inputs and differential-test oracles. The complete rollout is tracked in [`docs/rule-packs-plan.md`](docs/rule-packs-plan.md), and the format is documented in [`docs/rule-pack-format.md`](docs/rule-pack-format.md).
 
 ## Requirements
 
@@ -54,6 +57,7 @@ The result contains:
 
 ```text
 result/lib/bash/libbashlume.so
+result/bin/bashlume-pack
 result/share/bashlume/bashlume.bash
 ```
 
@@ -108,6 +112,7 @@ bashlume disable
 bashlume enable
 bashlume reload
 bashlume stats
+bashlume rules         # pack trust, provenance, compatibility, and errors
 enable -d bashlume    # fully unload and restore callbacks/bindings
 ```
 
@@ -122,6 +127,11 @@ BASHLUME_MENU_ROWS=10
 
 # selected (default) | inline | off
 BASHLUME_MENU_DESCRIPTIONS=selected
+
+# Colon-separated local pack files/directories; runtime never downloads packs.
+BASHLUME_RULE_PATH="$HOME/.local/share/bashlume/rules"
+# Colon-separated raw Ed25519 public-key files authorizing dynamic probes.
+BASHLUME_TRUSTED_KEY_PATHS="$HOME/.config/bashlume/trusted-rule-key.hex"
 
 # errors (default) | full | off
 BASHLUME_HIGHLIGHT=errors

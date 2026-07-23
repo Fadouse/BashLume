@@ -21,7 +21,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "bashlume";
-            version = "0.1.5";
+            version = "0.2.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
 
@@ -31,6 +31,7 @@
               library=$(find target -type f -path '*/release/libbashlume.so' -print -quit)
               test -n "$library"
               install -Dm755 "$library" "$out/lib/bash/libbashlume.so"
+              install -Dm755 target/release/bashlume-pack "$out/bin/bashlume-pack"
               install -Dm644 shell/bashlume.bash "$out/share/bashlume/bashlume.bash"
               substituteInPlace "$out/share/bashlume/bashlume.bash" \
                 --replace-fail '@BASHLUME_LIBRARY@' "$out/lib/bash/libbashlume.so"

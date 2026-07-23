@@ -18,6 +18,7 @@ pub struct ShellSnapshot {
     pub builtins: HashSet<String>,
     pub variables: Vec<String>,
     pub command_frequency: HashMap<String, (u32, usize)>,
+    pub environment: HashMap<String, String>,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     pub path: String,
@@ -39,6 +40,7 @@ impl ShellSnapshot {
         self.home = unsafe { shell_variable("HOME") }.map(PathBuf::from);
         self.path = unsafe { shell_variable("PATH") }.unwrap_or_default();
         self.command_frequency = unsafe { command_frequency() };
+        self.environment = std::env::vars().take(4096).collect();
     }
 
     pub fn known_shell_command(&self, name: &str) -> Option<KnownCommand> {

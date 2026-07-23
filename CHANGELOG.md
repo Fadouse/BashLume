@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — Unreleased
 
 - Relicense the BashLume core from MIT to GPL-2.0-or-later in preparation for separately distributed completion rule packs derived from GPL ecosystems.
+- Add the bounded, versioned `.blp` container, signed manifests, independently hashed command blocks, a pure-data Completion IR, and `bashlume-pack` build/inspection tooling.
+- Discover rule packs asynchronously, mmap their indexes, decode command blocks lazily, and expose pack status through `bashlume rules`.
+- Evaluate static rules in a bounded Rust VM and merge candidates from every installed source with description preservation, conservative spacing, and source agreement metadata.
+- Add signed, capability-declared, Tab-only dynamic probes supervised through `posix_spawnp` with concurrency, timeout, output, cache, and shell-execution limits.
 
 ## 0.1.5 — 2026-07-23
 

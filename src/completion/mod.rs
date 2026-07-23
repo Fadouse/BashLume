@@ -5,10 +5,16 @@ mod worker;
 
 use context::{CompletionContext, QuoteMode, existing_directory_target, quote_shell_word};
 use matcher::{Candidate, CandidateKind, CandidateSink};
-use provider::{CompletionProvider, GenericProvider};
+use provider::{CompletionProvider, GenericProvider, RuleProvider};
 use worker::CompletionCache;
 
 use crate::shell::{self, ShellSnapshot};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionMode {
+    Passive,
+    ExplicitTab,
+}
 
 #[derive(Debug)]
 pub struct CompletionResult {
@@ -29,13 +35,24 @@ pub struct CompletionEngine {
 impl CompletionEngine {
     pub fn new(cache_limit_bytes: usize, max_candidates: usize) -> Self {
         Self {
-            providers: vec![Box::<GenericProvider>::default()],
+            providers: vec![
+                Box::<RuleProvider>::default(),
+                Box::<GenericProvider>::default(),
+            ],
             cache: CompletionCache::new(cache_limit_bytes, max_candidates),
         }
     }
 
     pub fn reconfigure(&mut self, cache_limit_bytes: usize, max_candidates: usize) {
         self.cache.reconfigure(cache_limit_bytes, max_candidates);
+    }
+
+    pub fn configure_rules(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        trusted_key_paths: Vec<std::path::PathBuf>,
+    ) {
+        self.cache.configure_rules(paths, trusted_key_paths);
     }
 
     pub fn refresh(&mut self, shell: &ShellSnapshot) {
@@ -53,11 +70,30 @@ impl CompletionEngine {
         shell: &ShellSnapshot,
         max_candidates: usize,
     ) -> CompletionResult {
+        self.complete_with_mode(context, shell, max_candidates, CompletionMode::Passive)
+    }
+
+    pub fn complete_explicit(
+        &mut self,
+        context: &CompletionContext,
+        shell: &ShellSnapshot,
+        max_candidates: usize,
+    ) -> CompletionResult {
+        self.complete_with_mode(context, shell, max_candidates, CompletionMode::ExplicitTab)
+    }
+
+    fn complete_with_mode(
+        &mut self,
+        context: &CompletionContext,
+        shell: &ShellSnapshot,
+        max_candidates: usize,
+        mode: CompletionMode,
+    ) -> CompletionResult {
         self.cache.poll();
         let mut sink = CandidateSink::new(max_candidates);
         let mut pending = false;
         for provider in &mut self.providers {
-            let status = provider.complete(context, shell, &mut self.cache, &mut sink);
+            let status = provider.complete(context, shell, &mut self.cache, &mut sink, mode);
             pending |= status.pending;
         }
         CompletionResult {
@@ -161,6 +197,52 @@ impl CompletionEngine {
 
     pub fn cache_entries(&self) -> usize {
         self.cache.entry_count()
+    }
+
+    pub fn rule_cache_entries(&self) -> usize {
+        self.cache.rule_entry_count()
+    }
+
+    pub fn rule_pack_count(&self) -> usize {
+        self.cache
+            .rule_summaries()
+            .iter()
+            .filter(|summary| summary.compatible)
+            .count()
+    }
+
+    pub fn rules_report(&self) -> String {
+        let mut lines = Vec::new();
+        if self.cache.rule_summaries().is_empty() {
+            lines.push("no rule packs discovered (discovery may still be pending)".to_owned());
+        }
+        for summary in self.cache.rule_summaries() {
+            if let Some(error) = &summary.error {
+                lines.push(format!("{}: rejected: {error}", summary.path.display()));
+                continue;
+            }
+            lines.push(format!(
+                "{} {} source={:?} commit={} format={}.{} trust={:?} commands={} stale={} compatible={} license={}",
+                summary.pack_id,
+                summary.pack_version,
+                summary.source,
+                summary.source_commit,
+                summary.format[0],
+                summary.format[1],
+                summary.trust,
+                summary.command_count,
+                summary.stale_count,
+                summary.compatible,
+                summary.license_expression,
+            ));
+        }
+        for error in self.cache.rule_errors() {
+            lines.push(format!("rule error: {error}"));
+        }
+        for error in self.cache.probe_errors() {
+            lines.push(format!("probe error: {error}"));
+        }
+        lines.join("\n")
     }
 
     pub fn provider_names(&self) -> String {

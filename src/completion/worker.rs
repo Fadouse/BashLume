@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::matcher::match_score;
+use crate::rules::loader::{LoadedProgram, PackSummary, RuleStore};
+use crate::rules::probe::ProbeSupervisor;
+use crate::rules::vm::{ProbeKey, ProbeRequest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
@@ -38,6 +41,16 @@ enum Request {
     LoadAccounts {
         home: Option<PathBuf>,
     },
+    DiscoverRules {
+        paths: Vec<PathBuf>,
+        trusted_key_paths: Vec<PathBuf>,
+        generation: u64,
+    },
+    LoadRules {
+        command: String,
+        generation: u64,
+    },
+    RunProbe(ProbeRequest),
     Stop,
 }
 
@@ -53,6 +66,22 @@ enum Response {
     Accounts {
         users: Vec<String>,
         hosts: Vec<String>,
+    },
+    RuleCatalog {
+        summaries: Vec<PackSummary>,
+        generation: u64,
+    },
+    Rules {
+        command: String,
+        programs: Vec<LoadedProgram>,
+        errors: Vec<String>,
+        generation: u64,
+    },
+    Probe {
+        request: ProbeRequest,
+        values: Vec<String>,
+        error: Option<String>,
+        completed_at: Instant,
     },
 }
 
@@ -108,6 +137,20 @@ struct CacheEntry {
     refreshed_at: Instant,
 }
 
+struct RuleCacheEntry {
+    programs: Vec<LoadedProgram>,
+    approximate_bytes: usize,
+    last_used: u64,
+}
+
+struct ProbeCacheEntry {
+    values: Vec<String>,
+    refreshed_at: Instant,
+    ttl: Duration,
+    approximate_bytes: usize,
+    last_used: u64,
+}
+
 pub struct CompletionCache {
     worker: Option<WorkerClient>,
     entries: HashMap<ScanKey, CacheEntry>,
@@ -121,6 +164,16 @@ pub struct CompletionCache {
     clock: u64,
     max_candidates: usize,
     accounts_requested: bool,
+    rule_generation: u64,
+    rule_catalog_ready: bool,
+    rule_summaries: Vec<PackSummary>,
+    rule_entries: HashMap<String, RuleCacheEntry>,
+    rule_pending: HashSet<String>,
+    rule_errors: Vec<String>,
+    rule_configuration: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
+    probe_entries: HashMap<ProbeKey, ProbeCacheEntry>,
+    probe_pending: HashSet<ProbeKey>,
+    probe_errors: Vec<String>,
 }
 
 impl CompletionCache {
@@ -138,6 +191,16 @@ impl CompletionCache {
             clock: 0,
             max_candidates,
             accounts_requested: false,
+            rule_generation: 0,
+            rule_catalog_ready: true,
+            rule_summaries: Vec::new(),
+            rule_entries: HashMap::new(),
+            rule_pending: HashSet::new(),
+            rule_errors: Vec::new(),
+            rule_configuration: None,
+            probe_entries: HashMap::new(),
+            probe_pending: HashSet::new(),
+            probe_errors: Vec::new(),
         }
     }
 
@@ -177,6 +240,98 @@ impl CompletionCache {
         }
         if let Some(worker) = &self.worker {
             self.accounts_requested = worker.send(Request::LoadAccounts { home });
+        }
+    }
+
+    pub fn configure_rules(&mut self, paths: Vec<PathBuf>, trusted_key_paths: Vec<PathBuf>) {
+        let configuration = (paths, trusted_key_paths);
+        if self.rule_configuration.as_ref() == Some(&configuration) {
+            return;
+        }
+        self.rule_configuration = Some(configuration.clone());
+        let (paths, trusted_key_paths) = configuration;
+        self.rule_generation = self.rule_generation.wrapping_add(1);
+        self.rule_catalog_ready = false;
+        self.rule_summaries.clear();
+        self.rule_pending.clear();
+        for (_, entry) in self.rule_entries.drain() {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
+        }
+        let generation = self.rule_generation;
+        let sent = self.worker.as_ref().is_some_and(|worker| {
+            worker.send(Request::DiscoverRules {
+                paths,
+                trusted_key_paths,
+                generation,
+            })
+        });
+        if !sent {
+            self.rule_catalog_ready = true;
+        }
+    }
+
+    pub fn rule_programs(&mut self, command: &str) -> (Option<&[LoadedProgram]>, bool) {
+        if command.is_empty() {
+            return (None, false);
+        }
+        if !self.rule_entries.contains_key(command)
+            && self.rule_catalog_ready
+            && self.rule_pending.insert(command.to_owned())
+        {
+            let generation = self.rule_generation;
+            let sent = self.worker.as_ref().is_some_and(|worker| {
+                worker.send(Request::LoadRules {
+                    command: command.to_owned(),
+                    generation,
+                })
+            });
+            if !sent {
+                self.rule_pending.remove(command);
+            }
+        }
+        let pending = !self.rule_catalog_ready || self.rule_pending.contains(command);
+        if let Some(entry) = self.rule_entries.get_mut(command) {
+            self.clock = self.clock.wrapping_add(1);
+            entry.last_used = self.clock;
+            (Some(&entry.programs), pending)
+        } else {
+            (None, pending && self.worker.is_some())
+        }
+    }
+
+    pub fn rule_summaries(&self) -> &[PackSummary] {
+        &self.rule_summaries
+    }
+
+    pub fn rule_errors(&self) -> &[String] {
+        &self.rule_errors
+    }
+
+    pub fn probe_errors(&self) -> &[String] {
+        &self.probe_errors
+    }
+
+    pub fn probe_values(&mut self, request: &ProbeRequest) -> (Option<&[String]>, bool) {
+        let stale = self
+            .probe_entries
+            .get(&request.key)
+            .is_none_or(|entry| entry.refreshed_at.elapsed() >= entry.ttl);
+        if stale && self.probe_pending.insert(request.key.clone()) {
+            let sent = self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.send(Request::RunProbe(request.clone())));
+            if !sent {
+                self.probe_pending.remove(&request.key);
+            }
+        }
+        let pending = self.probe_pending.contains(&request.key);
+        if let Some(entry) = self.probe_entries.get_mut(&request.key) {
+            self.clock = self.clock.wrapping_add(1);
+            entry.last_used = self.clock;
+            (Some(&entry.values), pending)
+        } else {
+            (None, pending && self.worker.is_some())
         }
     }
 
@@ -291,6 +446,9 @@ impl CompletionCache {
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.worker = None;
                     self.pending.clear();
+                    self.rule_pending.clear();
+                    self.probe_pending.clear();
+                    self.rule_catalog_ready = true;
                     break;
                 }
             };
@@ -339,6 +497,87 @@ impl CompletionCache {
                 Response::Accounts { users, hosts } => {
                     self.users = users;
                     self.hosts = hosts;
+                }
+                Response::RuleCatalog {
+                    summaries,
+                    generation,
+                } => {
+                    if generation != self.rule_generation {
+                        continue;
+                    }
+                    self.rule_summaries = summaries;
+                    self.rule_catalog_ready = true;
+                }
+                Response::Rules {
+                    command,
+                    programs,
+                    errors,
+                    generation,
+                } => {
+                    if generation != self.rule_generation {
+                        continue;
+                    }
+                    self.rule_pending.remove(&command);
+                    let approximate_bytes = approximate_rule_bytes(&programs);
+                    self.clock = self.clock.wrapping_add(1);
+                    if let Some(previous) = self.rule_entries.insert(
+                        command,
+                        RuleCacheEntry {
+                            programs,
+                            approximate_bytes,
+                            last_used: self.clock,
+                        },
+                    ) {
+                        self.used_bytes =
+                            self.used_bytes.saturating_sub(previous.approximate_bytes);
+                    }
+                    self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
+                    self.rule_errors.extend(errors);
+                    if self.rule_errors.len() > 128 {
+                        self.rule_errors.drain(..self.rule_errors.len() - 128);
+                    }
+                    self.evict_to_limit();
+                }
+                Response::Probe {
+                    request,
+                    values,
+                    error,
+                    completed_at,
+                } => {
+                    self.probe_pending.remove(&request.key);
+                    let failed = error.is_some();
+                    if let Some(error) = error {
+                        self.probe_errors
+                            .push(format!("{}: {error}", request.probe_id));
+                        if self.probe_errors.len() > 128 {
+                            self.probe_errors.drain(..self.probe_errors.len() - 128);
+                        }
+                    }
+                    let approximate_bytes = values.iter().fold(0_usize, |total, value| {
+                        total
+                            .saturating_add(std::mem::size_of::<String>())
+                            .saturating_add(value.capacity())
+                    });
+                    self.clock = self.clock.wrapping_add(1);
+                    if let Some(previous) = self.probe_entries.insert(
+                        request.key,
+                        ProbeCacheEntry {
+                            values,
+                            refreshed_at: completed_at,
+                            ttl: if failed {
+                                Duration::from_secs(10)
+                            } else {
+                                Duration::from_millis(request.cache_ttl_ms.into())
+                            },
+                            approximate_bytes,
+                            last_used: self.clock,
+                        },
+                    ) {
+                        self.used_bytes =
+                            self.used_bytes.saturating_sub(previous.approximate_bytes);
+                    }
+                    self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
+                    self.evict_to_limit();
                 }
             }
         }
@@ -428,6 +667,13 @@ impl CompletionCache {
         self.entries.values().map(|entry| entry.entries.len()).sum()
     }
 
+    pub fn rule_entry_count(&self) -> usize {
+        self.rule_entries
+            .values()
+            .map(|entry| entry.programs.len())
+            .sum()
+    }
+
     pub fn stop(&mut self) {
         if let Some(mut worker) = self.worker.take() {
             worker.stop();
@@ -435,54 +681,227 @@ impl CompletionCache {
     }
 
     fn evict_to_limit(&mut self) {
-        while self.used_bytes > self.byte_limit && self.entries.len() > 1 {
-            let Some(oldest) = self
+        while self.used_bytes > self.byte_limit
+            && self
+                .entries
+                .len()
+                .saturating_add(self.rule_entries.len())
+                .saturating_add(self.probe_entries.len())
+                > 1
+        {
+            let oldest_directory = self
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
+                .map(|(key, entry)| (key.clone(), entry.last_used));
+            let oldest_rule = self
+                .rule_entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, entry)| (key.clone(), entry.last_used));
+            let oldest_probe = self
+                .probe_entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, entry)| (key.clone(), entry.last_used));
+            let minimum_clock = oldest_directory
+                .as_ref()
+                .map(|(_, clock)| *clock)
+                .into_iter()
+                .chain(oldest_rule.as_ref().map(|(_, clock)| *clock))
+                .chain(oldest_probe.as_ref().map(|(_, clock)| *clock))
+                .min();
+            if oldest_probe
+                .as_ref()
+                .is_some_and(|(_, clock)| Some(*clock) == minimum_clock)
+            {
+                let key = oldest_probe.expect("oldest probe exists").0;
+                if let Some(entry) = self.probe_entries.remove(&key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
+                }
+            } else if oldest_rule
+                .as_ref()
+                .is_some_and(|(_, clock)| Some(*clock) == minimum_clock)
+            {
+                let command = oldest_rule.expect("oldest rule exists").0;
+                if let Some(entry) = self.rule_entries.remove(&command) {
+                    self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
+                }
+            } else if let Some((key, _)) = oldest_directory {
+                if let Some(entry) = self.entries.remove(&key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
+                }
+            } else {
                 break;
-            };
-            if let Some(entry) = self.entries.remove(&oldest) {
-                self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
             }
         }
     }
 }
 
 fn worker_loop(requests: Receiver<Request>, responses: Sender<Response>) {
-    while let Ok(request) = requests.recv() {
-        match request {
-            Request::Scan {
-                key,
-                max_candidates,
-                generation,
-            } => {
-                let (entries, truncated) = scan_directory(&key, max_candidates);
-                if responses
-                    .send(Response::Scan {
-                        key,
-                        entries,
-                        truncated,
-                        generation,
-                        completed_at: Instant::now(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+    let mut rules = RuleStore::default();
+    let mut probes = ProbeSupervisor::default();
+    loop {
+        let request = if probes.has_work() {
+            match requests.recv_timeout(Duration::from_millis(10)) {
+                Ok(request) => Some(request),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Request::LoadAccounts { home } => {
-                let users = load_users();
-                let hosts = load_hosts(home.as_deref());
-                if responses.send(Response::Accounts { users, hosts }).is_err() {
-                    break;
-                }
+        } else {
+            match requests.recv() {
+                Ok(request) => Some(request),
+                Err(_) => break,
             }
-            Request::Stop => break,
+        };
+        if let Some(request) = request {
+            match request {
+                Request::Scan {
+                    key,
+                    max_candidates,
+                    generation,
+                } => {
+                    let (entries, truncated) = scan_directory(&key, max_candidates);
+                    if responses
+                        .send(Response::Scan {
+                            key,
+                            entries,
+                            truncated,
+                            generation,
+                            completed_at: Instant::now(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Request::LoadAccounts { home } => {
+                    let users = load_users();
+                    let hosts = load_hosts(home.as_deref());
+                    if responses.send(Response::Accounts { users, hosts }).is_err() {
+                        break;
+                    }
+                }
+                Request::DiscoverRules {
+                    paths,
+                    trusted_key_paths,
+                    generation,
+                } => {
+                    rules = RuleStore::discover(&paths, &trusted_key_paths);
+                    if responses
+                        .send(Response::RuleCatalog {
+                            summaries: rules.summaries().to_vec(),
+                            generation,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Request::LoadRules {
+                    command,
+                    generation,
+                } => {
+                    let (programs, errors) = rules.load_command(&command);
+                    if responses
+                        .send(Response::Rules {
+                            command,
+                            programs,
+                            errors,
+                            generation,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Request::RunProbe(request) => {
+                    if !probes.submit(request.clone())
+                        && responses
+                            .send(Response::Probe {
+                                request,
+                                values: Vec::new(),
+                                error: Some("probe queue rejected the request".into()),
+                                completed_at: Instant::now(),
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+                Request::Stop => break,
+            }
+        }
+        for outcome in probes.poll() {
+            if responses
+                .send(Response::Probe {
+                    request: outcome.request,
+                    values: outcome.values,
+                    error: outcome.error,
+                    completed_at: outcome.completed_at,
+                })
+                .is_err()
+            {
+                return;
+            }
         }
     }
+}
+
+fn approximate_rule_bytes(programs: &[LoadedProgram]) -> usize {
+    programs.iter().fold(0_usize, |total, loaded| {
+        let program = &loaded.program;
+        let metadata = loaded
+            .pack_name
+            .capacity()
+            .saturating_add(loaded.pack_version.capacity())
+            .saturating_add(program.canonical_name.capacity())
+            .saturating_add(program.source_path.capacity())
+            .saturating_add(program.source_commit.capacity())
+            .saturating_add(program.license.capacity())
+            .saturating_add(
+                program
+                    .registrations
+                    .iter()
+                    .map(|value| value.capacity())
+                    .sum::<usize>(),
+            );
+        let rules = program.static_rules.iter().fold(0_usize, |size, rule| {
+            size.saturating_add(std::mem::size_of_val(rule))
+                .saturating_add(
+                    rule.when.len() * std::mem::size_of::<crate::rules::ir::PredicateOp>(),
+                )
+                .saturating_add(rule.candidates.iter().fold(
+                    0_usize,
+                    |candidate_size, candidate| {
+                        candidate_size
+                            .saturating_add(std::mem::size_of_val(candidate))
+                            .saturating_add(candidate.value.capacity())
+                            .saturating_add(candidate.display.capacity())
+                            .saturating_add(
+                                candidate.description.as_ref().map_or(0, String::capacity),
+                            )
+                    },
+                ))
+        });
+        let probes = program.probes.iter().fold(0_usize, |size, probe| {
+            size.saturating_add(std::mem::size_of_val(probe))
+                .saturating_add(probe.id.capacity())
+                .saturating_add(probe.executable.capacity())
+                .saturating_add(
+                    probe
+                        .arguments
+                        .iter()
+                        .map(|value| value.capacity())
+                        .sum::<usize>(),
+                )
+        });
+        total
+            .saturating_add(std::mem::size_of_val(loaded))
+            .saturating_add(metadata)
+            .saturating_add(rules)
+            .saturating_add(probes)
+    })
 }
 
 fn scan_directory(key: &ScanKey, max_candidates: usize) -> (Vec<DirectoryEntry>, bool) {

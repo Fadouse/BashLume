@@ -31,12 +31,19 @@ pub enum CandidateKind {
     Builtin,
     Keyword,
     Command,
+    Option,
+    Subcommand,
+    Value,
     Directory,
     Executable,
     File,
     Variable,
     User,
+    Group,
     Host,
+    Service,
+    Signal,
+    Job,
 }
 
 impl CandidateKind {
@@ -47,12 +54,19 @@ impl CandidateKind {
             Self::Builtin => 900,
             Self::Keyword => 875,
             Self::Command => 850,
+            Self::Option => 840,
+            Self::Subcommand => 835,
+            Self::Value => 825,
             Self::Directory => 800,
             Self::Executable => 790,
             Self::File => 775,
             Self::Variable => 750,
             Self::User => 725,
+            Self::Group => 720,
             Self::Host => 700,
+            Self::Service => 690,
+            Self::Signal => 680,
+            Self::Job => 670,
         }
     }
 }
@@ -65,6 +79,8 @@ pub struct Candidate {
     pub value: String,
     /// Optional human-readable detail supplied by a command-aware rule.
     pub description: Option<String>,
+    /// Bitset of contributing external rule sources (bash, fish, zsh, user).
+    pub source_mask: u8,
     pub kind: CandidateKind,
     pub append_space: bool,
     pub score: i64,
@@ -125,11 +141,17 @@ impl Candidate {
             display,
             value,
             description: None,
+            source_mask: 0,
             kind,
             append_space,
             score: match_score + kind.context_weight() + recency_bonus,
             match_class,
         }
+    }
+
+    pub fn with_source_mask(mut self, source_mask: u8) -> Self {
+        self.source_mask = source_mask;
+        self
     }
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
@@ -160,6 +182,10 @@ impl CandidateSink {
         }
     }
 
+    pub fn remaining_capacity_hint(&self) -> usize {
+        self.limit.saturating_sub(self.candidates.len()).max(1)
+    }
+
     pub fn push(&mut self, candidate: Candidate) {
         let tier = candidate.match_class.candidate_set_tier();
         if tier < self.best_tier {
@@ -176,8 +202,17 @@ impl CandidateSink {
                     .description
                     .clone()
                     .or_else(|| current.description.clone());
+                let new_source = candidate.source_mask & !current.source_mask != 0;
+                let score = candidate
+                    .score
+                    .saturating_add(i64::from(new_source && current.source_mask != 0) * 8);
+                let source_mask = current.source_mask | candidate.source_mask;
+                let append_space = current.append_space && candidate.append_space;
                 *current = Candidate {
                     description,
+                    source_mask,
+                    append_space,
+                    score,
                     ..candidate
                 };
             }
@@ -185,6 +220,12 @@ impl CandidateSink {
                 if current.description.is_none() {
                     current.description = candidate.description;
                 }
+                let new_source = candidate.source_mask & !current.source_mask != 0;
+                if new_source && current.source_mask != 0 {
+                    current.score = current.score.saturating_add(8);
+                }
+                current.source_mask |= candidate.source_mask;
+                current.append_space &= candidate.append_space;
                 return;
             }
             None => {
@@ -397,12 +438,14 @@ mod tests {
     #[test]
     fn sink_merges_description_into_duplicate_candidate() {
         let mut sink = CandidateSink::new(4);
-        let plain =
-            Candidate::from_borrowed("fo", "for", "for", CandidateKind::Keyword, true, 0).unwrap();
+        let plain = Candidate::from_borrowed("fo", "for", "for", CandidateKind::Keyword, true, 0)
+            .unwrap()
+            .with_source_mask(1);
         sink.push(plain);
         sink.push(
             Candidate::from_borrowed("fo", "for", "for", CandidateKind::Keyword, true, 0)
                 .unwrap()
+                .with_source_mask(2)
                 .with_description("Iterate over words"),
         );
         let candidates = sink.finish();
@@ -411,6 +454,8 @@ mod tests {
             candidates[0].description.as_deref(),
             Some("Iterate over words")
         );
+        assert_eq!(candidates[0].source_mask, 3);
+        assert_eq!(candidates[0].score, 4_000_882);
     }
 
     #[test]

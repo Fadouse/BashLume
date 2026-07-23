@@ -631,16 +631,16 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 - [x] Relicense BashLume core to GPL-2.0-or-later.
 - [ ] Add SPDX and provenance policy.
-- [ ] Finalize binary format and IR specification.
-- [ ] Add conformance fixture format and versioning policy.
+- [x] Finalize binary format and IR specification.
+- [x] Add conformance fixture format and versioning policy.
 
 ### Phase B — Core pack infrastructure
 
-- [ ] Implement bounded `.blp` parser and validator.
-- [ ] Implement signatures, manifest verification, and command-block hashes.
-- [ ] Implement mmap index and asynchronous discovery.
-- [ ] Implement current/previous major compatibility.
-- [ ] Implement pack inspection/build tool.
+- [x] Implement bounded `.blp` parser and validator.
+- [x] Implement signatures, manifest verification, and command-block hashes.
+- [x] Implement mmap index and asynchronous discovery.
+- [x] Implement current/previous major compatibility.
+- [x] Implement pack inspection/build tool.
 - [ ] Add malformed-pack fuzz/property tests.
 
 ### Phase C — IR and completion integration

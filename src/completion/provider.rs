@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 
+use super::CompletionMode;
 use super::context::CompletionContext;
 use super::matcher::{Candidate, CandidateKind, CandidateSink};
 use super::worker::{CompletionCache, EntryKind};
+use crate::rules::format::SourceKind;
+use crate::rules::ir::{AppendPolicy, RuleCandidateKind};
+use crate::rules::vm::{EvaluationContext, EvaluationMode, evaluate};
 use crate::shell::ShellSnapshot;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -24,7 +28,166 @@ pub trait CompletionProvider: Send {
         shell: &ShellSnapshot,
         cache: &mut CompletionCache,
         sink: &mut CandidateSink,
+        mode: CompletionMode,
     ) -> ProviderStatus;
+}
+
+#[derive(Default)]
+pub struct RuleProvider;
+
+impl CompletionProvider for RuleProvider {
+    fn name(&self) -> &'static str {
+        "rule-packs"
+    }
+
+    fn complete(
+        &mut self,
+        context: &CompletionContext,
+        shell: &ShellSnapshot,
+        cache: &mut CompletionCache,
+        sink: &mut CandidateSink,
+        mode: CompletionMode,
+    ) -> ProviderStatus {
+        let Some(command) = context.command_name.as_deref() else {
+            return ProviderStatus::default();
+        };
+        let (programs, pending) = cache.rule_programs(command);
+        let mut status = ProviderStatus { pending };
+        let Some(programs) = programs else {
+            return status;
+        };
+        let evaluation_context = EvaluationContext {
+            current_word: &context.query,
+            words: &context.words,
+            word_index: context.word_index,
+            command_path: &context.command_path,
+            environment: &shell.environment,
+            working_directory: &shell.cwd,
+        };
+        let evaluation_mode = match mode {
+            CompletionMode::Passive => EvaluationMode::Passive,
+            CompletionMode::ExplicitTab => EvaluationMode::ExplicitTab,
+        };
+        let mut probes = Vec::new();
+        for loaded in programs {
+            let Ok(evaluated) = evaluate(
+                &loaded.program,
+                &evaluation_context,
+                loaded.source,
+                loaded.trust,
+                evaluation_mode,
+                sink.remaining_capacity_hint(),
+            ) else {
+                continue;
+            };
+            for emitted in evaluated.candidates {
+                push_rule_candidate(
+                    context,
+                    sink,
+                    emitted.candidate.value,
+                    emitted.candidate.display,
+                    emitted.candidate.description,
+                    emitted.candidate.kind,
+                    emitted.candidate.append,
+                    emitted.source,
+                );
+            }
+            probes.extend(evaluated.probes);
+        }
+        for probe in probes {
+            let (values, pending) = cache.probe_values(&probe);
+            status.pending |= pending;
+            let Some(values) = values else {
+                continue;
+            };
+            for value in values {
+                push_rule_candidate(
+                    context,
+                    sink,
+                    value.clone(),
+                    value.clone(),
+                    probe.description.clone(),
+                    probe.candidate_kind,
+                    probe.append,
+                    probe.source,
+                );
+            }
+        }
+        status
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_rule_candidate(
+    context: &CompletionContext,
+    sink: &mut CandidateSink,
+    mut value: String,
+    display: String,
+    description: Option<String>,
+    kind: RuleCandidateKind,
+    append: AppendPolicy,
+    source: SourceKind,
+) {
+    let append_space = match append {
+        AppendPolicy::Space => true,
+        AppendPolicy::NoSpace => false,
+        AppendPolicy::Slash => {
+            if !value.ends_with('/') {
+                value.push('/');
+            }
+            false
+        }
+    };
+    let display = if display.is_empty() {
+        value.clone()
+    } else {
+        display
+    };
+    if let Some(candidate) = Candidate::new(
+        &context.query,
+        display,
+        value,
+        rule_candidate_kind(kind),
+        append_space,
+        source_bonus(source),
+    ) {
+        let candidate = candidate.with_source_mask(source_mask(source));
+        sink.push(match description {
+            Some(description) => candidate.with_description(description),
+            None => candidate,
+        });
+    }
+}
+
+fn source_mask(source: SourceKind) -> u8 {
+    match source {
+        SourceKind::Bash => 1 << 0,
+        SourceKind::Fish => 1 << 1,
+        SourceKind::Zsh => 1 << 2,
+        SourceKind::User => 1 << 3,
+    }
+}
+
+fn source_bonus(source: SourceKind) -> i64 {
+    i64::from(source.priority()) * 4
+}
+
+fn rule_candidate_kind(kind: RuleCandidateKind) -> CandidateKind {
+    match kind {
+        RuleCandidateKind::Option => CandidateKind::Option,
+        RuleCandidateKind::Subcommand => CandidateKind::Subcommand,
+        RuleCandidateKind::Value => CandidateKind::Value,
+        RuleCandidateKind::Command => CandidateKind::Command,
+        RuleCandidateKind::Directory => CandidateKind::Directory,
+        RuleCandidateKind::File => CandidateKind::File,
+        RuleCandidateKind::User => CandidateKind::User,
+        RuleCandidateKind::Group => CandidateKind::Group,
+        RuleCandidateKind::Host => CandidateKind::Host,
+        RuleCandidateKind::Service => CandidateKind::Service,
+        RuleCandidateKind::Signal => CandidateKind::Signal,
+        RuleCandidateKind::Variable => CandidateKind::Variable,
+        RuleCandidateKind::Job => CandidateKind::Job,
+    }
 }
 
 #[derive(Default)]
@@ -41,6 +204,7 @@ impl CompletionProvider for GenericProvider {
         shell: &ShellSnapshot,
         cache: &mut CompletionCache,
         sink: &mut CandidateSink,
+        _mode: CompletionMode,
     ) -> ProviderStatus {
         let mut status = ProviderStatus::default();
 

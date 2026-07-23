@@ -16,7 +16,13 @@ import time
 
 
 class Session:
-    def __init__(self, library: pathlib.Path, bash: pathlib.Path) -> None:
+    def __init__(
+        self,
+        library: pathlib.Path,
+        bash: pathlib.Path,
+        rule_pack: pathlib.Path | None,
+        trusted_key: pathlib.Path | None,
+    ) -> None:
         pid, fd = pty.fork()
         if pid == 0:
             environment = os.environ.copy()
@@ -26,6 +32,10 @@ class Session:
                 HISTFILE="/dev/null",
                 BASH_SILENCE_DEPRECATION_WARNING="1",
             )
+            if rule_pack is not None:
+                environment["BASHLUME_RULE_PATH"] = str(rule_pack)
+            if trusted_key is not None:
+                environment["BASHLUME_TRUSTED_KEY_PATHS"] = str(trusted_key)
             os.execve(
                 bash,
                 [str(bash), "--noprofile", "--norc", "-i"],
@@ -97,19 +107,59 @@ def main() -> int:
             os.environ.get("BASHLUME_TEST_BASH", shutil.which("bash") or "/bin/bash")
         ),
     )
+    parser.add_argument("--rule-pack", type=pathlib.Path)
+    parser.add_argument("--trusted-key", type=pathlib.Path)
     arguments = parser.parse_args()
     library = arguments.library.resolve()
     bash = arguments.bash.resolve()
+    rule_pack = arguments.rule_pack.resolve() if arguments.rule_pack else None
+    trusted_key = arguments.trusted_key.resolve() if arguments.trusted_key else None
     if not library.is_file():
         parser.error(f"shared library not found: {library}")
 
     if not bash.is_file():
         parser.error(f"Bash executable not found: {bash}")
 
-    session = Session(library, bash)
+    if rule_pack is not None and not rule_pack.is_file():
+        parser.error(f"rule pack not found: {rule_pack}")
+    if trusted_key is not None and not trusted_key.is_file():
+        parser.error(f"trusted rule key not found: {trusted_key}")
+
+    session = Session(library, bash, rule_pack, trusted_key)
     try:
         status = session.send(b"bashlume status\n", 0.3)
         require(b"bashlume: enabled" in status, "loadable builtin did not initialize", session.output)
+
+        if rule_pack is not None:
+            time.sleep(0.3)
+            rules = session.send(b"bashlume rules\n", 0.3)
+            require(
+                b"org.bashlume.rules.test" in rules and b"Verified" in rules,
+                "signed rule pack was not discovered and trusted",
+                session.output,
+            )
+            static_rules = session.send(b"bl-demo --", 0.2) + session.send(b"\t", 0.8)
+            require(
+                b"--branch" in static_rules
+                and b"--force" in static_rules
+                and b"Force the operation" in static_rules,
+                "static command rules were not loaded, merged, and rendered",
+                session.output,
+            )
+            session.send(b"\x07", 0.1)
+            session.send(b"\x15", 0.1)
+            dynamic_rules = session.send(b"bl-probe dynamic-", 0.2) + session.send(
+                b"\t", 1.0
+            )
+            require(
+                b"dynamic-one" in dynamic_rules
+                and b"dynamic-two" in dynamic_rules
+                and b"Generated asynchronously" in dynamic_rules,
+                "signed asynchronous probe did not update the menu",
+                session.output,
+            )
+            session.send(b"\x07", 0.1)
+            session.send(b"\x15", 0.1)
 
         valid = session.send(b"echo BASHLUME_VALID_SYNTAX", 0.2)
         require(

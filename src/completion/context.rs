@@ -17,6 +17,15 @@ pub struct CompletionContext {
     pub query: String,
     pub quote: QuoteMode,
     pub command_position: bool,
+    /// Dequoted words in the current simple command, including an empty
+    /// current word after trailing whitespace.
+    pub words: Vec<String>,
+    pub word_index: usize,
+    pub command_name: Option<String>,
+    /// Heuristic command/subcommand path. Source-specific state machines can
+    /// still inspect the complete `words` vector when positional arguments
+    /// make this approximation insufficient.
+    pub command_path: Vec<String>,
 }
 
 impl CompletionContext {
@@ -28,6 +37,16 @@ impl CompletionContext {
         let raw_word = line[replace_start..point].to_owned();
         let query = dequote_prefix(&raw_word);
         let command_position = command_position_before(&tokens, replace_start);
+        let (words, word_index) = completion_words(&tokens, replace_start, &query);
+        let command_index = words.iter().position(|word| !is_assignment(word));
+        let command_name = command_index.and_then(|index| words.get(index)).cloned();
+        let command_path = command_index.map_or_else(Vec::new, |index| {
+            words[index..word_index]
+                .iter()
+                .filter(|word| !word.starts_with('-') && !is_assignment(word))
+                .cloned()
+                .collect()
+        });
 
         Self {
             line: line.to_owned(),
@@ -37,6 +56,10 @@ impl CompletionContext {
             query,
             quote,
             command_position,
+            words,
+            word_index,
+            command_name,
+            command_path,
         }
     }
 
@@ -138,6 +161,54 @@ enum TokenKind {
 struct Token {
     start: usize,
     kind: TokenKind,
+}
+
+fn completion_words(
+    tokens: &[Token],
+    current_start: usize,
+    current_query: &str,
+) -> (Vec<String>, usize) {
+    let segment_start = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.start < current_start)
+        .filter_map(|(index, token)| match &token.kind {
+            TokenKind::Operator(operator)
+                if matches!(operator.as_str(), ";" | "&" | "&&" | "|" | "||" | "(") =>
+            {
+                Some(index + 1)
+            }
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(0);
+
+    let mut words = Vec::new();
+    let mut redirect_target = false;
+    let mut current_present = false;
+    for token in &tokens[segment_start..] {
+        match &token.kind {
+            TokenKind::Redirect => redirect_target = true,
+            TokenKind::Operator(_) => {}
+            TokenKind::Word(word) => {
+                if redirect_target {
+                    redirect_target = false;
+                    continue;
+                }
+                if token.start == current_start {
+                    words.push(current_query.to_owned());
+                    current_present = true;
+                } else if token.start < current_start {
+                    words.push(word.clone());
+                }
+            }
+        }
+    }
+    if !current_present {
+        words.push(current_query.to_owned());
+    }
+    let word_index = words.len().saturating_sub(1);
+    (words, word_index)
 }
 
 fn command_position_before(tokens: &[Token], current_start: usize) -> bool {
@@ -633,6 +704,19 @@ mod tests {
         assert!(CompletionContext::analyze("env A=1 gi", 10).command_position);
         assert!(CompletionContext::analyze("sudo -u root sys", 16).command_position);
         assert!(CompletionContext::analyze("sudo env A=1 gi", 15).command_position);
+    }
+
+    #[test]
+    fn exposes_current_simple_command_words_for_rule_evaluation() {
+        let context = CompletionContext::analyze("echo done; git checkout ma", 26);
+        assert_eq!(context.words, ["git", "checkout", "ma"]);
+        assert_eq!(context.word_index, 2);
+        assert_eq!(context.command_name.as_deref(), Some("git"));
+        assert_eq!(context.command_path, ["git", "checkout"]);
+
+        let trailing = CompletionContext::analyze("git status ", 11);
+        assert_eq!(trailing.words, ["git", "status", ""]);
+        assert_eq!(trailing.word_index, 2);
     }
 
     #[test]

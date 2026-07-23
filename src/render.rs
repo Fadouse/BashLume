@@ -306,6 +306,9 @@ fn completion_sgr<'a>(candidate: &Candidate, config: &'a Config) -> &'a str {
         CandidateKind::Builtin => &config.theme.builtin,
         CandidateKind::Keyword => &config.theme.keyword,
         CandidateKind::Command | CandidateKind::Executable => &config.theme.completion_executable,
+        CandidateKind::Option => &config.theme.option,
+        CandidateKind::Subcommand => &config.theme.command,
+        CandidateKind::Value => &config.theme.normal,
         CandidateKind::Directory => &config.theme.completion_directory,
         CandidateKind::File => config
             .theme
@@ -314,7 +317,12 @@ fn completion_sgr<'a>(candidate: &Candidate, config: &'a Config) -> &'a str {
             .find(|(suffix, _)| candidate.display.ends_with(suffix))
             .map_or(&config.theme.completion_file, |(_, color)| color),
         CandidateKind::Variable => &config.theme.variable,
-        CandidateKind::User | CandidateKind::Host => &config.theme.path,
+        CandidateKind::User
+        | CandidateKind::Group
+        | CandidateKind::Host
+        | CandidateKind::Service
+        | CandidateKind::Signal
+        | CandidateKind::Job => &config.theme.path,
     }
 }
 
@@ -658,6 +666,7 @@ mod tests {
                 display: display.into(),
                 value: display.into(),
                 description: None,
+                source_mask: 0,
                 kind: CandidateKind::Command,
                 append_space: true,
                 score: 0,
@@ -694,6 +703,7 @@ mod tests {
             display: "--branch".into(),
             value: "--branch".into(),
             description: Some("Select a Git branch".into()),
+            source_mask: 1,
             kind: CandidateKind::Command,
             append_space: true,
             score: 0,
@@ -723,6 +733,7 @@ mod tests {
             display: "--force".into(),
             value: "--force".into(),
             description: Some("Force the operation".into()),
+            source_mask: 1,
             kind: CandidateKind::Command,
             append_space: true,
             score: 0,

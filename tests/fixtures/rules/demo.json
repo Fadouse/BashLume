@@ -1,0 +1,73 @@
+{
+  "manifest": {
+    "pack_id": "org.bashlume.rules.test",
+    "pack_version": "1.0.0",
+    "source_kind": "user",
+    "source_repository": "https://example.invalid/bashlume-test-rules",
+    "source_commit": "0000000000000000000000000000000000000000",
+    "license_expression": "GPL-2.0-or-later",
+    "channel": "test",
+    "compiler_version": "0.1.0",
+    "generated_at": "1970-01-01T00:00:00Z",
+    "stale_commands": [],
+    "probe_capabilities": ["printf"]
+  },
+  "minimum_engine": [0, 2, 0],
+  "required_opcodes": 0,
+  "optional_features": 0,
+  "commands": [
+    {
+      "canonical_name": "bl-demo",
+      "registrations": ["bl-demo"],
+      "source_path": "tests/bl-demo",
+      "source_commit": "0000000000000000000000000000000000000000",
+      "license": "GPL-2.0-or-later",
+      "static_rules": [
+        {
+          "when": [{"op": "true"}],
+          "candidates": [
+            {
+              "value": "--branch",
+              "display": "--branch",
+              "description": "Select a branch",
+              "kind": "option",
+              "append": "space"
+            },
+            {
+              "value": "--force",
+              "display": "--force",
+              "description": "Force the operation",
+              "kind": "option",
+              "append": "space"
+            }
+          ]
+        }
+      ],
+      "probes": []
+    },
+    {
+      "canonical_name": "bl-probe",
+      "registrations": ["bl-probe"],
+      "source_path": "tests/bl-probe",
+      "source_commit": "0000000000000000000000000000000000000000",
+      "license": "GPL-2.0-or-later",
+      "static_rules": [],
+      "probes": [
+        {
+          "id": "test-values",
+          "when": [{"op": "true"}],
+          "executable": "printf",
+          "arguments": ["dynamic-one\\ndynamic-two\\n"],
+          "environment": [],
+          "parser": "lines",
+          "candidate_kind": "value",
+          "append": "space",
+          "timeout_ms": 1000,
+          "output_limit": 65536,
+          "cache_ttl_ms": 10000,
+          "description": "Generated asynchronously"
+        }
+      ]
+    }
+  ]
+}

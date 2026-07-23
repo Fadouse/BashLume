@@ -64,7 +64,11 @@ impl PluginState {
         let config = unsafe { Config::from_bash() };
         let mut shell = ShellSnapshot::default();
         unsafe { shell.refresh() };
-        let completion = CompletionEngine::new(config.cache_limit_bytes, config.max_candidates);
+        let mut completion = CompletionEngine::new(config.cache_limit_bytes, config.max_candidates);
+        completion.configure_rules(
+            config.rule_paths.clone(),
+            config.trusted_rule_key_paths.clone(),
+        );
         let syntax = SyntaxEngine::new().map_err(|error| error.to_string())?;
         Ok(Self {
             enabled: config.enabled,
@@ -94,6 +98,10 @@ impl PluginState {
         self.enabled = self.config.enabled;
         self.completion
             .reconfigure(self.config.cache_limit_bytes, self.config.max_candidates);
+        self.completion.configure_rules(
+            self.config.rule_paths.clone(),
+            self.config.trusted_rule_key_paths.clone(),
+        );
         unsafe { self.sync_event_hook() };
     }
 
@@ -105,9 +113,9 @@ impl PluginState {
             .candidates
             .get(current.selected)
             .map(|candidate| candidate.value.clone());
-        let result = self
-            .completion
-            .complete(context, &self.shell, self.config.max_candidates);
+        let result =
+            self.completion
+                .complete_explicit(context, &self.shell, self.config.max_candidates);
         let selected = previous
             .as_ref()
             .and_then(|value| {
@@ -297,7 +305,7 @@ impl PluginState {
         let mut context = CompletionContext::analyze(&line, point);
         let mut result =
             self.completion
-                .complete(&context, &self.shell, self.config.max_candidates);
+                .complete_explicit(&context, &self.shell, self.config.max_candidates);
         if result.candidates.is_empty() {
             if !result.pending {
                 unsafe { ffi::rl_ding() };
@@ -342,7 +350,7 @@ impl PluginState {
                     unsafe { apply_candidate(&context, &partial) };
                     if let Some((new_line, new_point)) = unsafe { readline_line() } {
                         context = CompletionContext::analyze(&new_line, new_point);
-                        result = self.completion.complete(
+                        result = self.completion.complete_explicit(
                             &context,
                             &self.shell,
                             self.config.max_candidates,
@@ -542,10 +550,12 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
     match command {
         "status" => {
             println!(
-                "bashlume: {} (version: {}; providers: {}; cache: {} entries, {} KiB)",
+                "bashlume: {} (version: {}; providers: {}; rules: {} packs/{} loaded blocks; cache: {} entries, {} KiB)",
                 if state.enabled { "enabled" } else { "disabled" },
                 env!("CARGO_PKG_VERSION"),
                 state.completion.provider_names(),
+                state.completion.rule_pack_count(),
+                state.completion.rule_cache_entries(),
                 state.completion.cache_entries(),
                 state.completion.cache_bytes() / 1024,
             );
@@ -568,15 +578,20 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
         }
         "stats" => {
             println!(
-                "cache_bytes={} cache_entries={} max_candidates={}",
+                "cache_bytes={} cache_entries={} rule_blocks={} max_candidates={}",
                 state.completion.cache_bytes(),
                 state.completion.cache_entries(),
+                state.completion.rule_cache_entries(),
                 state.config.max_candidates,
             );
             0
         }
+        "rules" => {
+            println!("{}", state.completion.rules_report());
+            0
+        }
         "help" | "--help" | "-h" => {
-            println!("usage: bashlume [status|enable|disable|reload|stats|help]");
+            println!("usage: bashlume [status|enable|disable|reload|stats|rules|help]");
             0
         }
         _ => {
@@ -1059,6 +1074,7 @@ mod tests {
             display: "git".into(),
             value: "git".into(),
             description: None,
+            source_mask: 0,
             kind: CandidateKind::Command,
             append_space: true,
             score: 0,

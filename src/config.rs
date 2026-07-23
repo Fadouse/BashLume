@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString};
+use std::path::PathBuf;
 
 use crate::ffi;
 
@@ -61,6 +62,8 @@ pub struct Config {
     pub max_candidates: usize,
     pub menu_rows: usize,
     pub menu_descriptions: MenuDescriptionMode,
+    pub rule_paths: Vec<PathBuf>,
+    pub trusted_rule_key_paths: Vec<PathBuf>,
     pub theme: Theme,
 }
 
@@ -76,6 +79,8 @@ impl Default for Config {
             max_candidates: 4096,
             menu_rows: 10,
             menu_descriptions: MenuDescriptionMode::Selected,
+            rule_paths: Vec::new(),
+            trusted_rule_key_paths: Vec::new(),
             theme: Theme {
                 normal: "0".into(),
                 command: "38;5;114".into(),
@@ -147,6 +152,12 @@ impl Config {
         if let Some(value) = unsafe { shell_var("BASHLUME_MENU_DESCRIPTIONS") } {
             config.menu_descriptions = parse_menu_description_mode(&value);
         }
+        config.rule_paths = match unsafe { shell_var("BASHLUME_RULE_PATH") } {
+            Some(value) if !value.is_empty() => split_paths(&value),
+            _ => default_rule_paths(),
+        };
+        config.trusted_rule_key_paths = unsafe { shell_var("BASHLUME_TRUSTED_KEY_PATHS") }
+            .map_or_else(Vec::new, |value| split_paths(&value));
         if let Some(value) = unsafe { shell_var("LS_COLORS") } {
             apply_ls_colors(&value, &mut config.theme);
         }
@@ -184,6 +195,28 @@ impl Config {
 
         config
     }
+}
+
+fn split_paths(value: &str) -> Vec<PathBuf> {
+    value
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .take(128)
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn default_rule_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(data_home) = unsafe { shell_var("XDG_DATA_HOME") }.filter(|value| !value.is_empty())
+    {
+        paths.push(PathBuf::from(data_home).join("bashlume/rules"));
+    } else if let Some(home) = unsafe { shell_var("HOME") }.filter(|value| !value.is_empty()) {
+        paths.push(PathBuf::from(home).join(".local/share/bashlume/rules"));
+    }
+    paths.push(PathBuf::from("/usr/local/share/bashlume/rules"));
+    paths.push(PathBuf::from("/usr/share/bashlume/rules"));
+    paths
 }
 
 fn parse_menu_description_mode(value: &str) -> MenuDescriptionMode {
