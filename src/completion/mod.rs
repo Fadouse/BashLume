@@ -187,6 +187,10 @@ impl CompletionEngine {
         }))
     }
 
+    pub fn poll_background(&mut self) {
+        self.cache.poll();
+    }
+
     pub fn cancel_dynamic(&mut self) {
         self.cache.cancel_probes();
     }

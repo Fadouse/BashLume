@@ -584,6 +584,7 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
             0
         }
         "stats" => {
+            state.completion.poll_background();
             println!(
                 "cache_bytes={} cache_entries={} rule_blocks={} max_candidates={}",
                 state.completion.cache_bytes(),
@@ -594,6 +595,7 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
             0
         }
         "rules" => {
+            state.completion.poll_background();
             println!("{}", state.completion.rules_report());
             0
         }
