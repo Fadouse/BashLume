@@ -239,30 +239,34 @@ impl ActiveProbe {
             // SAFETY: stdout is an owned nonblocking descriptor and buffer is
             // valid for its complete length.
             let read = unsafe { libc::read(self.stdout, buffer.as_mut_ptr().cast(), buffer.len()) };
-            if read > 0 {
-                let read = read as usize;
-                let limit = self.request.output_limit as usize;
-                if self.output.len().saturating_add(read) > limit {
-                    let remaining = limit.saturating_sub(self.output.len());
-                    self.output.extend_from_slice(&buffer[..remaining]);
-                    self.failure
-                        .get_or_insert_with(|| "probe output limit exceeded".into());
-                    self.terminate();
+            match read.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    let read = read as usize;
+                    let limit = self.request.output_limit as usize;
+                    if self.output.len().saturating_add(read) > limit {
+                        let remaining = limit.saturating_sub(self.output.len());
+                        self.output.extend_from_slice(&buffer[..remaining]);
+                        self.failure
+                            .get_or_insert_with(|| "probe output limit exceeded".into());
+                        self.terminate();
+                        break;
+                    }
+                    self.output.extend_from_slice(&buffer[..read]);
+                }
+                std::cmp::Ordering::Equal => {
+                    self.eof = true;
+                    self.close_stdout();
                     break;
                 }
-                self.output.extend_from_slice(&buffer[..read]);
-            } else if read == 0 {
-                self.eof = true;
-                self.close_stdout();
-                break;
-            } else {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    self.failure
-                        .get_or_insert_with(|| format!("probe output read failed: {error}"));
-                    self.terminate();
+                std::cmp::Ordering::Less => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::WouldBlock {
+                        self.failure
+                            .get_or_insert_with(|| format!("probe output read failed: {error}"));
+                        self.terminate();
+                    }
+                    break;
                 }
-                break;
             }
         }
     }

@@ -195,11 +195,13 @@ fn completion_words(
                     redirect_target = false;
                     continue;
                 }
-                if token.start == current_start {
-                    words.push(current_query.to_owned());
-                    current_present = true;
-                } else if token.start < current_start {
-                    words.push(word.clone());
+                match token.start.cmp(&current_start) {
+                    std::cmp::Ordering::Equal => {
+                        words.push(current_query.to_owned());
+                        current_present = true;
+                    }
+                    std::cmp::Ordering::Less => words.push(word.clone()),
+                    std::cmp::Ordering::Greater => {}
                 }
             }
         }

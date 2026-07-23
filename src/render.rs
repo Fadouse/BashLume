@@ -425,10 +425,14 @@ fn move_to_input_start(output: &mut Vec<u8>, cursor: Position, prompt_column: us
 
 fn return_to_cursor(output: &mut Vec<u8>, current: Position, cursor: Position) {
     output.push(b'\r');
-    if current.row > cursor.row {
-        push_csi_number(output, current.row - cursor.row, b'A');
-    } else if cursor.row > current.row {
-        push_csi_number(output, cursor.row - current.row, b'B');
+    match current.row.cmp(&cursor.row) {
+        std::cmp::Ordering::Greater => {
+            push_csi_number(output, current.row - cursor.row, b'A');
+        }
+        std::cmp::Ordering::Less => {
+            push_csi_number(output, cursor.row - current.row, b'B');
+        }
+        std::cmp::Ordering::Equal => {}
     }
     if cursor.column > 0 {
         push_csi_number(output, cursor.column, b'C');
