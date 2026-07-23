@@ -10,7 +10,7 @@ use crate::config::{Config, DiagnosticsMode, HighlightMode};
 use crate::ffi::{self, ReadlineCommand, RedisplayFunction};
 use crate::render::{MenuView, RenderModel, Renderer};
 use crate::shell::{KnownCommand, ShellSnapshot};
-use crate::syntax::{CommandClass, Style, SyntaxEngine};
+use crate::syntax::{CommandClass, SyntaxEngine};
 
 static STATE: Mutex<Option<PluginState>> = Mutex::new(None);
 static ORIGINAL_REDISPLAY: AtomicUsize = AtomicUsize::new(0);
@@ -167,9 +167,8 @@ impl PluginState {
             }
         });
 
-        let has_definite_error =
-            highlighted.diagnostic.is_some() || highlighted.styles.contains(&Style::UnknownCommand);
-        if has_definite_error {
+        let has_syntax_error = highlighted.diagnostic.is_some();
+        if has_syntax_error {
             self.last_ghost = None;
         }
         let diagnostic = match (self.config.diagnostics, highlighted.diagnostic.as_ref()) {
@@ -201,7 +200,7 @@ impl PluginState {
             point,
             styles: &highlighted.styles,
             ghost: self.last_ghost.as_ref().map(|ghost| ghost.suffix.as_str()),
-            error_marker: has_definite_error
+            error_marker: has_syntax_error
                 && self.config.diagnostics == DiagnosticsMode::Marker
                 && self.config.highlight != HighlightMode::Off,
             menu,

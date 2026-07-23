@@ -141,11 +141,7 @@ fn render_styled_line(
         let parsed_style = styles.get(index).copied().unwrap_or(Style::Normal);
         let style = match config.highlight {
             HighlightMode::Full => parsed_style,
-            HighlightMode::Errors
-                if matches!(parsed_style, Style::Error | Style::UnknownCommand) =>
-            {
-                parsed_style
-            }
+            HighlightMode::Errors if parsed_style == Style::Error => Style::Error,
             HighlightMode::Errors | HighlightMode::Off => Style::Normal,
         };
         if config.colors_enabled && style != current {
@@ -577,15 +573,13 @@ mod tests {
                 .any(|window| window == config.theme.command.as_bytes())
         );
 
-        for style in [Style::Error, Style::UnknownCommand] {
-            output.clear();
-            render_styled_line(&mut output, ")", &[style], 0, 80, &config);
-            assert!(
-                output
-                    .windows(config.theme.error.len())
-                    .any(|window| window == config.theme.error.as_bytes())
-            );
-        }
+        output.clear();
+        render_styled_line(&mut output, ")", &[Style::Error], 0, 80, &config);
+        assert!(
+            output
+                .windows(config.theme.error.len())
+                .any(|window| window == config.theme.error.as_bytes())
+        );
     }
 
     #[test]

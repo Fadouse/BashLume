@@ -127,18 +127,6 @@ def main() -> int:
         )
         session.send(b"\x15", 0.2)
 
-        unknown_command = session.send(b"whoim", 0.5)
-        if "✗".encode() not in unknown_command:
-            unknown_command += session.send(b"x", 0.2)
-            unknown_command += session.send(b"\x7f", 0.3)
-        require(
-            b"\x1b[4;38;5;203m" in unknown_command
-            and "✗".encode() in unknown_command,
-            "statically unknown command was not highlighted and marked",
-            session.output,
-        )
-        session.send(b"\x15", 0.2)
-
         command_menu = session.send(b"who", 0.2) + session.send(b"\t", 0.5)
         if b"whoami" not in command_menu:
             command_menu += session.send(b"\t", 0.4)
