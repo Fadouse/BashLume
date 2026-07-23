@@ -30,8 +30,10 @@
               runHook preInstall
               library=$(find target -type f -path '*/release/libbashlume.so' -print -quit)
               test -n "$library"
+              pack_tool=$(find target -type f -path '*/release/bashlume-pack' -print -quit)
+              test -n "$pack_tool"
               install -Dm755 "$library" "$out/lib/bash/libbashlume.so"
-              install -Dm755 target/release/bashlume-pack "$out/bin/bashlume-pack"
+              install -Dm755 "$pack_tool" "$out/bin/bashlume-pack"
               install -Dm644 shell/bashlume.bash "$out/share/bashlume/bashlume.bash"
               mkdir -p "$out/share/bashlume/rules"
               substituteInPlace "$out/share/bashlume/bashlume.bash" \
