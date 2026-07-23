@@ -228,7 +228,6 @@ impl PluginState {
         let menu = self.menu.as_ref().map(|menu| MenuView {
             candidates: &menu.candidates,
             selected: menu.selected.min(menu.candidates.len().saturating_sub(1)),
-            pending: menu.pending,
         });
         let model = RenderModel {
             line: &line,

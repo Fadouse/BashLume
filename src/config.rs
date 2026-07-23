@@ -37,7 +37,6 @@ pub struct Theme {
     pub error: String,
     pub ghost: String,
     pub menu_selected: String,
-    pub menu_meta: String,
     pub completion_directory: String,
     pub completion_executable: String,
     pub completion_file: String,
@@ -85,7 +84,6 @@ impl Default for Config {
                 error: "4;38;5;203".into(),
                 ghost: "2;38;5;244".into(),
                 menu_selected: "1;7".into(),
-                menu_meta: "2;38;5;244".into(),
                 completion_directory: "1;34".into(),
                 completion_executable: "1;32".into(),
                 completion_file: "0".into(),
@@ -165,7 +163,6 @@ impl Config {
         color!(error, "BASHLUME_COLOR_ERROR");
         color!(ghost, "BASHLUME_COLOR_GHOST");
         color!(menu_selected, "BASHLUME_COLOR_MENU_SELECTED");
-        color!(menu_meta, "BASHLUME_COLOR_MENU_META");
         color!(completion_directory, "BASHLUME_COLOR_COMPLETION_DIRECTORY");
         color!(
             completion_executable,

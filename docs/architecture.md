@@ -42,7 +42,7 @@ Readline remains authoritative for cursor movement, undo, kill/yank, history sea
 
 During Readline search, active-region display, macro definition, completion internals, or signal handling, BashLume does not paint an overlay.
 
-While a completion menu is pending, BashLume temporarily wraps `rl_event_hook`. Each periodic callback consumes ready worker responses and compares the new candidate snapshot with the displayed one. It forces redisplay only when candidates or pending state changed, then restores the original event hook as soon as no asynchronous redraw remains. Idle prompts therefore do not acquire a periodic wakeup.
+While a completion menu is pending, BashLume temporarily wraps `rl_event_hook`. The pending state itself is visually silent. Each periodic callback consumes ready worker responses and compares the new candidate snapshot with the displayed one. It forces redisplay only when candidates or pending state changed, then restores the original event hook as soon as no asynchronous redraw remains. Idle prompts therefore do not acquire a periodic wakeup.
 
 ## Key bindings
 

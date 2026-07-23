@@ -10,7 +10,6 @@ use crate::syntax::{Diagnostic, Style};
 pub struct MenuView<'a> {
     pub candidates: &'a [Candidate],
     pub selected: usize,
-    pub pending: bool,
 }
 
 pub struct RenderModel<'a> {
@@ -161,13 +160,8 @@ fn render_menu(
     maximum_rows: usize,
 ) -> (usize, usize) {
     if menu.candidates.is_empty() {
-        if menu.pending {
-            output.extend_from_slice(b"\r\n");
-            push_sgr(output, &config.theme.menu_meta);
-            let column = render_menu_text(output, "scanning\u{2026}", width.saturating_sub(1));
-            output.extend_from_slice(b"\x1b[0m");
-            return (1, column);
-        }
+        // Pending scans intentionally render no placeholder. The event hook
+        // will repaint the completed candidates without a distracting flash.
         return (0, 0);
     }
 
@@ -606,7 +600,6 @@ mod tests {
             MenuView {
                 candidates: &candidates,
                 selected: 0,
-                pending: false,
             },
             &config,
             80,

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 — 2026-07-23
+
+- Keep pending completion scans visually silent instead of flashing a `scanning…` row.
+- Continue to reveal candidates automatically as soon as the worker completes.
+- Remove the now-unused `BASHLUME_COLOR_MENU_META` setting.
+
 ## 0.1.3 — 2026-07-23
 
 - Automatically replace `scanning…` with completed candidates without requiring another keypress.

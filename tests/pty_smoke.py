@@ -228,6 +228,11 @@ def main() -> int:
             first_scan = session.send(b"\t", 0.03)
             automatic_update = first_scan + session.read_for(1.5)
             require(
+                b"scanning" not in automatic_update,
+                "pending scan placeholder was rendered",
+                session.output,
+            )
+            require(
                 b"entry-00000" in automatic_update,
                 "completed asynchronous scan did not redraw without another keypress",
                 session.output,
