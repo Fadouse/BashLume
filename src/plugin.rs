@@ -85,6 +85,7 @@ impl PluginState {
     }
 
     unsafe fn refresh_prompt(&mut self) {
+        self.completion.cancel_dynamic();
         unsafe { self.shell.refresh() };
         self.completion.refresh(&self.shell);
         self.menu = None;
@@ -172,6 +173,10 @@ impl PluginState {
             self.last_ghost = None;
         }
 
+        let menu_line_changed = self.menu.as_ref().is_some_and(|menu| menu.line != line);
+        if menu_line_changed {
+            self.completion.cancel_dynamic();
+        }
         let refresh_menu = self
             .menu
             .as_ref()
@@ -427,6 +432,7 @@ impl PluginState {
 
     unsafe fn cancel(&mut self, count: i32, key: i32) -> i32 {
         if self.menu.take().is_some() {
+            self.completion.cancel_dynamic();
             self.last_ghost = None;
             unsafe { self.sync_event_hook() };
             return 0;
@@ -569,6 +575,7 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
             state.enabled = false;
             state.menu = None;
             state.last_ghost = None;
+            state.completion.cancel_dynamic();
             unsafe { state.sync_event_hook() };
             0
         }

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
+use serde::Serialize;
+
 use super::format::{SourceKind, TrustStatus};
 use super::ir::{CandidateTemplate, CommandProgram, PredicateOp, ProbeParser, RuleCandidateKind};
 
@@ -26,13 +28,13 @@ pub enum EvaluationMode {
     ExplicitTab,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EmittedCandidate {
     pub candidate: CandidateTemplate,
     pub source: SourceKind,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ProbeKey {
     pub executable: String,
     pub arguments: Vec<String>,
@@ -41,7 +43,7 @@ pub struct ProbeKey {
     pub parser: ProbeParser,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProbeRequest {
     pub key: ProbeKey,
     pub probe_id: String,
@@ -55,7 +57,7 @@ pub struct ProbeRequest {
     pub dynamic_authorized: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct EvaluationResult {
     pub candidates: Vec<EmittedCandidate>,
     pub probes: Vec<ProbeRequest>,

@@ -663,9 +663,9 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 ### Phase E — Rule repositories and converters
 
-- [ ] Create and initialize Bash rule repository.
-- [ ] Create and initialize Zsh rule repository.
-- [ ] Create and initialize Fish rule repository.
+- [x] Create and initialize Bash rule repository.
+- [x] Create and initialize Zsh rule repository.
+- [x] Create and initialize Fish rule repository.
 - [ ] Implement source-specific parser/compiler pipelines.
 - [ ] Implement source helper semantics required by every pinned baseline file.
 - [ ] Generate deterministic packs and provenance manifests.
@@ -682,9 +682,9 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 ### Phase G — Workflows and packaging
 
-- [ ] Add Stable/Edge synchronization workflows to each rule repository.
-- [ ] Add deterministic release/signing workflows.
-- [ ] Add core pack-lock update PR workflow.
+- [x] Add Stable/Edge synchronization workflows to each rule repository.
+- [x] Add deterministic release/signing workflows.
+- [x] Add core pack-lock update PR workflow.
 - [ ] Add Nix outputs and local rule search paths.
 - [ ] Verify runtime is offline and builds are pinned/reproducible.
 

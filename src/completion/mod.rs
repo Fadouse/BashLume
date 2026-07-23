@@ -187,6 +187,10 @@ impl CompletionEngine {
         }))
     }
 
+    pub fn cancel_dynamic(&mut self) {
+        self.cache.cancel_probes();
+    }
+
     pub fn command_known(&self, name: &str) -> Option<bool> {
         self.cache.command_known(name)
     }

@@ -191,12 +191,16 @@ impl ActiveProbe {
 
     fn poll(&mut self, now: Instant) -> ProbePoll {
         self.read_available();
-        if !self.reaped
+        if (!self.reaped || !self.eof)
             && now.duration_since(self.started)
                 >= Duration::from_millis(self.request.timeout_ms.into())
         {
             self.failure.get_or_insert_with(|| "probe timed out".into());
             self.terminate();
+            if self.reaped {
+                self.eof = true;
+                self.close_stdout();
+            }
         }
         self.reap();
         if self.reaped {
@@ -285,7 +289,7 @@ impl ActiveProbe {
     }
 
     fn terminate(&mut self) {
-        if self.terminated || self.pid <= 0 || self.reaped {
+        if self.terminated || self.pid <= 0 {
             return;
         }
         self.terminated = true;
@@ -306,7 +310,9 @@ impl ActiveProbe {
 
 impl Drop for ActiveProbe {
     fn drop(&mut self) {
-        self.terminate();
+        if !self.reaped {
+            self.terminate();
+        }
         if !self.reaped && self.pid > 0 {
             let mut status = 0;
             unsafe {

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use bashlume::rules::format::{PackBuildSpec, PackBuilder, PackFile, TrustedKeys};
+use bashlume::rules::vm::{EvaluationContext, EvaluationMode, evaluate};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::Deserialize;
 
 fn main() {
     if let Err(error) = run() {
@@ -28,6 +31,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify" => inspect(&remaining, true),
         "key-id" => key_id(&remaining),
         "public-key" => public_key(&remaining),
+        "evaluate" => evaluate_pack(&remaining),
         "help" | "--help" | "-h" => usage(),
         _ => usage(),
     }
@@ -35,7 +39,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
     Err(
-        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex"
+        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex\n  bashlume-pack evaluate PACK.blp CONTEXT.json [VERIFYING_KEY.hex ...]"
             .into(),
     )
 }
@@ -96,6 +100,67 @@ fn inspect(
         }
         println!("all command blocks verified");
     }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct EvaluationInput {
+    command: String,
+    #[serde(default)]
+    current_word: String,
+    words: Vec<String>,
+    word_index: usize,
+    #[serde(default)]
+    command_path: Vec<String>,
+    #[serde(default)]
+    environment: HashMap<String, String>,
+    #[serde(default = "default_working_directory")]
+    working_directory: PathBuf,
+    #[serde(default)]
+    explicit_tab: bool,
+}
+
+fn default_working_directory() -> PathBuf {
+    PathBuf::from(".")
+}
+
+fn evaluate_pack(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() < 2 {
+        return usage();
+    }
+    let mut keys = TrustedKeys::default();
+    for path in &arguments[2..] {
+        keys.insert(read_verifying_key(Path::new(path))?);
+    }
+    let pack = PackFile::open(Path::new(&arguments[0]), &keys)?;
+    let input: EvaluationInput = serde_json::from_slice(&fs::read(Path::new(&arguments[1]))?)?;
+    if input.word_index >= input.words.len() {
+        return Err("context word_index is outside words".into());
+    }
+    let program = pack
+        .load_command(&input.command)?
+        .ok_or_else(|| format!("no rule for command {}", input.command))?;
+    let context = EvaluationContext {
+        current_word: &input.current_word,
+        words: &input.words,
+        word_index: input.word_index,
+        command_path: &input.command_path,
+        environment: &input.environment,
+        working_directory: &input.working_directory,
+    };
+    let result = evaluate(
+        &program,
+        &context,
+        pack.source_kind(),
+        pack.trust(),
+        if input.explicit_tab {
+            EvaluationMode::ExplicitTab
+        } else {
+            EvaluationMode::Passive
+        },
+        65_536,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 

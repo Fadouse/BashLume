@@ -51,6 +51,7 @@ enum Request {
         generation: u64,
     },
     RunProbe(ProbeRequest),
+    CancelProbes,
     Stop,
 }
 
@@ -309,6 +310,13 @@ impl CompletionCache {
 
     pub fn probe_errors(&self) -> &[String] {
         &self.probe_errors
+    }
+
+    pub fn cancel_probes(&mut self) {
+        self.probe_pending.clear();
+        if let Some(worker) = &self.worker {
+            let _ = worker.send(Request::CancelProbes);
+        }
     }
 
     pub fn probe_values(&mut self, request: &ProbeRequest) -> (Option<&[String]>, bool) {
@@ -829,6 +837,7 @@ fn worker_loop(requests: Receiver<Request>, responses: Sender<Response>) {
                         break;
                     }
                 }
+                Request::CancelProbes => probes.cancel_all(),
                 Request::Stop => break,
             }
         }
