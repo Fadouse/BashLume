@@ -13,6 +13,27 @@ This document is the authoritative implementation and acceptance plan for replac
 
 A component, prototype, partial converter, or partially populated rule pack is **not** completion of this plan. The first Stable rule-pack baseline must meet the full-baseline gate defined below.
 
+## Implementation status
+
+The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories now exist locally. No upstream-derived Stable pack has been released or installed because the complete-baseline gate is not yet met.
+
+Current pinned-baseline converter accounting (development artifacts only):
+
+| Source | Pinned Stable | Source files | Files still requiring semantic lowering |
+|---|---:|---:|---:|
+| Bash completion | 2.18.0 | 531 | 526 |
+| Zsh completion | 5.9.2 | 756 | 739 |
+| Fish completion | 4.8.1 | 1,061 | 819 |
+
+Development output explicitly records every affected registration as stale, and the strict compiler/release workflow rejects it. These numbers are implementation work remaining, not an accepted partial baseline; they must reach zero before Phase H can pass.
+
+Local repository commits at this checkpoint:
+
+- BashLume core: `264d37e` and predecessors
+- Bash rules: `94c2bb2`
+- Zsh rules: `08fcc6a`
+- Fish rules: `7ea80b9`
+
 ## 1. Non-negotiable product requirements
 
 1. BashLume must not require `bash-completion`, Zsh, or Fish at runtime.
@@ -647,19 +668,19 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 - [ ] Expand normalized command-line context.
 - [ ] Implement all required static VM opcodes.
-- [ ] Implement lazy command block cache.
-- [ ] Evaluate all installed source rules independently.
-- [ ] Merge/deduplicate candidates and descriptions with provenance.
-- [ ] Integrate static rule candidates into Tab and ghost paths.
-- [ ] Add status/rules observability.
+- [x] Implement lazy command block cache.
+- [x] Evaluate all installed source rules independently.
+- [x] Merge/deduplicate candidates and descriptions with provenance.
+- [x] Integrate static rule candidates into Tab and ghost paths.
+- [x] Add status/rules observability.
 
 ### Phase D — Dynamic probes
 
-- [ ] Extend the one-thread worker into a nonblocking supervisor.
-- [ ] Implement `posix_spawnp`, two-child concurrency, timeout, cancellation, and output limits.
-- [ ] Implement capability manifests and trust enforcement.
-- [ ] Implement probe transforms and cache.
-- [ ] Merge late results into the menu without placeholders or flicker.
+- [x] Extend the one-thread worker into a nonblocking supervisor.
+- [x] Implement `posix_spawnp`, two-child concurrency, timeout, cancellation, and output limits.
+- [x] Implement capability manifests and trust enforcement.
+- [ ] Implement the complete source transform set and cache semantics.
+- [x] Merge late results into the menu without placeholders or flicker.
 
 ### Phase E — Rule repositories and converters
 
