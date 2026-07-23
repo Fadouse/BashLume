@@ -478,6 +478,18 @@ mod tests {
         assert_eq!(values[0].display, "alto");
     }
 
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: CLOCK_THREAD_CPUTIME_ID writes one initialized timespec and
+        // is available on every supported Linux target.
+        let result =
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, value.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        // SAFETY: a zero return from clock_gettime initialized the value.
+        let value = unsafe { value.assume_init() };
+        std::time::Duration::new(value.tv_sec as u64, value.tv_nsec as u32)
+    }
+
     #[test]
     #[ignore = "development performance budget"]
     fn generic_ranking_stays_under_hot_path_budget() {
@@ -486,7 +498,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut samples = Vec::with_capacity(1_000);
         for _ in 0..1_000 {
-            let started = std::time::Instant::now();
+            let started = thread_cpu_time();
             let mut sink = CandidateSink::new(4_096);
             for name in &names {
                 if let Some(candidate) =
@@ -496,11 +508,14 @@ mod tests {
                 }
             }
             std::hint::black_box(sink.finish());
-            samples.push(started.elapsed());
+            samples.push(thread_cpu_time().saturating_sub(started));
         }
         samples.sort_unstable();
         let p99 = samples[samples.len() * 99 / 100];
-        eprintln!("completion ranking p99: {p99:?} for {} names", names.len());
+        eprintln!(
+            "completion ranking thread-CPU p99: {p99:?} for {} names",
+            names.len()
+        );
         if !cfg!(debug_assertions) {
             assert!(p99 < std::time::Duration::from_micros(500));
         }

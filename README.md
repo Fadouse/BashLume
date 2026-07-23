@@ -184,7 +184,7 @@ Release builds perform no runtime benchmarking or acceptance checks.
 Development checks enforce:
 
 - incremental syntax-highlighting p99 below 0.5 ms for an approximately 1 KiB line
-- generic ranking p99 below 0.5 ms across 5,000 command names
+- generic ranking thread-CPU p99 below 0.5 ms across 5,000 command names
 - additional private memory below 3 MiB in the standard smoke workload
 - cache hard limit of 16 MiB by default
 - top 4,096 candidates retained per scan by default
