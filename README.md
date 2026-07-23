@@ -27,7 +27,7 @@ Copyright © 2026 **Fadouse**. Distributed under the MIT License.
 - Context-aware shell quoting for spaces and metacharacters
 - Readline-style, `LS_COLORS`-aware columnar completion menus
 - Exact candidates remain visible beside longer prefix candidates (`who`, `whoami`)
-- Bounded asynchronous filesystem scanning
+- Bounded asynchronous filesystem scanning with automatic pending-menu refresh
 - Native Readline Emacs and Vi keymaps remain intact
 - Safe fallback to unmodified Readline when loading fails
 

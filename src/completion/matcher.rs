@@ -57,7 +57,7 @@ impl CandidateKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
     /// Human-readable candidate without shell quoting.
     pub display: String,

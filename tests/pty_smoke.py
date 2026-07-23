@@ -213,6 +213,28 @@ def main() -> int:
                 session.output,
             )
 
+            late_directory = root / "late-scan"
+            session.send(
+                f"printf '<%s>\\n' {late_directory}/".encode(),
+                0.4,
+            )
+            # The initial missing-directory scan may still be queued for the
+            # main thread; freshness must use worker completion time, not the
+            # later instant at which Tab consumes that response.
+            late_directory.mkdir()
+            for index in range(30_000):
+                (late_directory / f"entry-{index:05d}").touch()
+            time.sleep(0.3)
+            first_scan = session.send(b"\t", 0.03)
+            automatic_update = first_scan + session.read_for(1.5)
+            require(
+                b"entry-00000" in automatic_update,
+                "completed asynchronous scan did not redraw without another keypress",
+                session.output,
+            )
+            session.send(b"\x07", 0.2)
+            session.send(b"\x15", 0.2)
+
             session.send(b"cd gone\n", 0.3)
             session.send(b"cd ..\n", 0.3)
             session.send(b"rmdir gone\n", 0.3)

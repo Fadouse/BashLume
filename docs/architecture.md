@@ -42,6 +42,8 @@ Readline remains authoritative for cursor movement, undo, kill/yank, history sea
 
 During Readline search, active-region display, macro definition, completion internals, or signal handling, BashLume does not paint an overlay.
 
+While a completion menu is pending, BashLume temporarily wraps `rl_event_hook`. Each periodic callback consumes ready worker responses and compares the new candidate snapshot with the displayed one. It forces redisplay only when candidates or pending state changed, then restores the original event hook as soon as no asynchronous redraw remains. Idle prompts therefore do not acquire a periodic wakeup.
+
 ## Key bindings
 
 Only `emacs-standard` and `vi-insertion` are modified. Every replaced function pointer is saved. A widget invokes the original function when BashLume has no enhancement to apply. Unload restores a binding only when it still points to BashLume, so a later user rebind is not overwritten.
@@ -85,7 +87,7 @@ A `pthread_atfork` child hook marks the inherited plugin inactive. A forked chil
 
 ## Filesystem cache
 
-The main thread only sends scan requests and consumes completed responses. It never calls `read_dir`, `stat`, or external programs while handling a key.
+The main thread only sends scan requests and consumes completed responses. It never calls `read_dir`, `stat`, or external programs while handling a key. Cache age starts at the worker's scan-completion timestamp rather than the later time at which an idle main thread consumes the response.
 
 A complete result for a short prefix is reused as a lossless superset for longer prefixes. The current directory is force-refreshed at every prompt, ordinary directory entries have a short freshness window, and ghost suggestions are suppressed while a relevant refresh is pending. `cd`/`pushd` history predictions perform an asynchronous full-target directory validation. If a directory result is truncated, a refined-prefix scan streams the entire directory and retains only the highest-ranked configured number of matches.
 

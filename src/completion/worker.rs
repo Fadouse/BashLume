@@ -48,6 +48,7 @@ enum Response {
         entries: Vec<DirectoryEntry>,
         truncated: bool,
         generation: u64,
+        completed_at: Instant,
     },
     Accounts {
         users: Vec<String>,
@@ -289,6 +290,7 @@ impl CompletionCache {
                 Some(Err(TryRecvError::Empty)) | None => break,
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.worker = None;
+                    self.pending.clear();
                     break;
                 }
             };
@@ -298,6 +300,7 @@ impl CompletionCache {
                     entries,
                     truncated,
                     generation,
+                    completed_at,
                 } => {
                     let current_generation = if key.executable_only {
                         0
@@ -324,7 +327,7 @@ impl CompletionCache {
                             truncated,
                             approximate_bytes,
                             last_used: self.clock,
-                            refreshed_at: Instant::now(),
+                            refreshed_at: completed_at,
                         },
                     ) {
                         self.used_bytes =
@@ -378,7 +381,7 @@ impl CompletionCache {
                     visitor(&entry.name);
                 }
             } else {
-                pending = true;
+                pending |= self.worker.is_some();
             }
         }
         pending
@@ -403,6 +406,10 @@ impl CompletionCache {
             }
         }
         complete.then_some(false)
+    }
+
+    pub fn scan_available(&self) -> bool {
+        self.worker.is_some()
     }
 
     pub fn users(&self) -> &[String] {
@@ -459,6 +466,7 @@ fn worker_loop(requests: Receiver<Request>, responses: Sender<Response>) {
                         entries,
                         truncated,
                         generation,
+                        completed_at: Instant::now(),
                     })
                     .is_err()
                 {

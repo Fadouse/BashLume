@@ -208,7 +208,9 @@ fn path_candidates(
     };
     let key = cache.request_directory(directory, &leaf);
     let Some((entries, _truncated, refreshing)) = cache.directory_entries(&key) else {
-        return ProviderStatus { pending: true };
+        return ProviderStatus {
+            pending: cache.scan_available(),
+        };
     };
 
     for entry in entries {

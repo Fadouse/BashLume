@@ -86,6 +86,7 @@ impl PluginState {
         self.menu = None;
         self.last_ghost = None;
         self.diagnostic_due = None;
+        unsafe { self.sync_event_hook() };
     }
 
     unsafe fn reload_config(&mut self) {
@@ -93,7 +94,60 @@ impl PluginState {
         self.enabled = self.config.enabled;
         self.completion
             .reconfigure(self.config.cache_limit_bytes, self.config.max_candidates);
-        unsafe { configure_event_hook(self.config.diagnostics) };
+        unsafe { self.sync_event_hook() };
+    }
+
+    fn refresh_menu(&mut self, line: &str, context: &CompletionContext) -> bool {
+        let Some(current) = self.menu.as_ref() else {
+            return false;
+        };
+        let previous = current
+            .candidates
+            .get(current.selected)
+            .map(|candidate| candidate.value.clone());
+        let result = self
+            .completion
+            .complete(context, &self.shell, self.config.max_candidates);
+        let selected = previous
+            .as_ref()
+            .and_then(|value| {
+                result
+                    .candidates
+                    .iter()
+                    .position(|candidate| &candidate.value == value)
+            })
+            .unwrap_or(0);
+        let changed = self.menu.as_ref().is_none_or(|menu| {
+            menu.line != line
+                || menu.selected != selected
+                || menu.pending != result.pending
+                || menu.candidates != result.candidates
+        });
+        self.menu = Some(MenuState {
+            line: line.to_owned(),
+            candidates: result.candidates,
+            selected,
+            pending: result.pending,
+        });
+        changed
+    }
+
+    unsafe fn poll_pending_menu(&mut self) -> bool {
+        if !self.menu.as_ref().is_some_and(|menu| menu.pending) {
+            return false;
+        }
+        let Some((line, point)) = (unsafe { readline_line() }) else {
+            return false;
+        };
+        let context = CompletionContext::analyze(&line, point);
+        self.refresh_menu(&line, &context)
+    }
+
+    unsafe fn sync_event_hook(&self) {
+        let required = self.enabled
+            && (self.menu.as_ref().is_some_and(|menu| menu.pending)
+                || self.diagnostic_due.is_some());
+        unsafe { configure_event_hook(required) };
     }
 
     unsafe fn render(&mut self) {
@@ -110,31 +164,12 @@ impl PluginState {
             self.last_ghost = None;
         }
 
-        if let Some(menu) = &self.menu {
-            if menu.line != line || menu.pending {
-                let previous = menu
-                    .candidates
-                    .get(menu.selected)
-                    .map(|candidate| candidate.value.clone());
-                let result =
-                    self.completion
-                        .complete(&context, &self.shell, self.config.max_candidates);
-                let selected = previous
-                    .as_ref()
-                    .and_then(|value| {
-                        result
-                            .candidates
-                            .iter()
-                            .position(|candidate| &candidate.value == value)
-                    })
-                    .unwrap_or(0);
-                self.menu = Some(MenuState {
-                    line: line.clone(),
-                    candidates: result.candidates,
-                    selected,
-                    pending: result.pending,
-                });
-            }
+        let refresh_menu = self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.line != line || menu.pending);
+        if refresh_menu {
+            self.refresh_menu(&line, &context);
         }
 
         if !vi_command_mode {
@@ -207,6 +242,7 @@ impl PluginState {
             diagnostic,
         };
         unsafe { self.renderer.draw(model, &self.config) };
+        unsafe { self.sync_event_hook() };
     }
 
     unsafe fn complete(&mut self, backwards: bool) -> i32 {
@@ -227,10 +263,10 @@ impl PluginState {
         if self
             .menu
             .as_ref()
-            .is_some_and(|menu| menu.candidates.is_empty() && menu.pending)
+            .is_some_and(|menu| menu.candidates.is_empty())
         {
-            // Poll the worker again on repeated Tab instead of cycling an
-            // empty placeholder menu forever.
+            // Retry empty results instead of leaving either a pending or a
+            // completed empty placeholder menu sticky forever.
             self.menu = None;
         } else if let Some(menu) = &mut self.menu {
             if !menu.candidates.is_empty() {
@@ -385,6 +421,7 @@ impl PluginState {
     unsafe fn cancel(&mut self, count: i32, key: i32) -> i32 {
         if self.menu.take().is_some() {
             self.last_ghost = None;
+            unsafe { self.sync_event_hook() };
             return 0;
         }
         unsafe { self.call_fallback(Action::Cancel, count, key) }
@@ -448,7 +485,7 @@ pub unsafe fn load() -> Result<(), String> {
     unsafe {
         ffi::rl_redisplay_function = Some(redisplay_callback);
         ffi::rl_startup_hook = Some(startup_callback);
-        configure_event_hook(state.config.diagnostics);
+        configure_event_hook(false);
     }
     let mark_active = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"rl_mark_active_p".as_ptr()) };
     MARK_ACTIVE_FUNCTION.store(mark_active as usize, Ordering::Release);
@@ -523,6 +560,7 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
             state.enabled = false;
             state.menu = None;
             state.last_ghost = None;
+            unsafe { state.sync_event_hook() };
             0
         }
         "reload" => {
@@ -596,14 +634,38 @@ unsafe extern "C" fn event_callback() -> i32 {
     if FORKED_CHILD.load(Ordering::Acquire) {
         return status;
     }
-    let should_redraw = {
-        let guard = lock_state();
-        guard.as_ref().is_some_and(|state| {
-            state.enabled
-                && state
-                    .diagnostic_due
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-        })
+    let busy = unsafe { ffi::rl_readline_state }
+        & (ffi::RL_STATE_ISEARCH
+            | ffi::RL_STATE_NSEARCH
+            | ffi::RL_STATE_SEARCH
+            | ffi::RL_STATE_MACRODEF
+            | ffi::RL_STATE_COMPLETING
+            | ffi::RL_STATE_SIGHANDLER)
+        != 0;
+    if busy || mark_active() {
+        return status;
+    }
+
+    let should_redraw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = lock_state();
+        let Some(state) = guard.as_mut().filter(|state| state.enabled) else {
+            return false;
+        };
+        let menu_changed = unsafe { state.poll_pending_menu() };
+        let diagnostic_due = state
+            .diagnostic_due
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        menu_changed || diagnostic_due
+    })) {
+        Ok(changed) => changed,
+        Err(_) => {
+            if let Some(state) = lock_state().as_mut() {
+                state.enabled = false;
+            }
+            unsafe { configure_event_hook(false) };
+            eprintln!("bashlume: asynchronous redraw failed; falling back to native Readline");
+            false
+        }
     };
     if should_redraw {
         unsafe { ffi::rl_forced_update_display() };
@@ -929,18 +991,18 @@ fn original_event() -> Option<ffi::ReadlineHook> {
     (pointer != 0).then(|| unsafe { std::mem::transmute::<usize, ffi::ReadlineHook>(pointer) })
 }
 
-unsafe fn configure_event_hook(mode: DiagnosticsMode) {
+unsafe fn configure_event_hook(required: bool) {
     let current = unsafe { ffi::rl_event_hook };
-    if mode == DiagnosticsMode::Inline {
+    let is_ours =
+        current.is_some_and(|function| function as usize == event_callback as *const () as usize);
+    if required && !is_ours {
         let original = ORIGINAL_EVENT.load(Ordering::Acquire);
         let current_is_original =
             current.map_or(original == 0, |function| function as usize == original);
         if current_is_original {
             unsafe { ffi::rl_event_hook = Some(event_callback) };
         }
-    } else if current
-        .is_some_and(|function| function as usize == event_callback as *const () as usize)
-    {
+    } else if !required && is_ours {
         unsafe { ffi::rl_event_hook = original_event() };
     }
 }

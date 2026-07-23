@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-07-23
+
+- Automatically replace `scanning…` with completed candidates without requiring another keypress.
+- Install Readline's periodic event hook only while an asynchronous menu or delayed diagnostic is pending, then remove it again to avoid idle wakeups.
+- Compare candidate snapshots before repainting so an unfinished scan does not cause continuous redraws.
+- Measure cache freshness from worker completion time rather than delayed main-thread receipt time.
+- Prevent unavailable workers and completed empty menus from remaining permanently pending or sticky.
+
 ## 0.1.2 — 2026-07-23
 
 - Add an explicit marker for definite syntax errors while valid input remains uncolored.
