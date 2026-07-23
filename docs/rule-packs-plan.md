@@ -15,7 +15,7 @@ A component, prototype, partial converter, or partially populated rule pack is *
 
 ## Implementation status
 
-The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories now exist locally. No upstream-derived Stable pack has been released or installed because the complete-baseline gate is not yet met.
+The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories are now published under the GitHub locations above. Format 1.1 adds rule-controlled file/directory fallback while retaining the version-1 decoder. Independent official Ed25519 identities are provisioned through reviewed `stable-release` environments. No upstream-derived Stable pack has been released or installed because the complete-baseline gate is not yet met.
 
 Current pinned-baseline converter accounting (development artifacts only):
 
@@ -27,12 +27,14 @@ Current pinned-baseline converter accounting (development artifacts only):
 
 Development output explicitly records every affected registration as stale, and the strict compiler/release workflow rejects it. These numbers are implementation work remaining, not an accepted partial baseline; they must reach zero before Phase H can pass.
 
-Local repository commits at this checkpoint:
+Repository commits at this checkpoint:
 
-- BashLume core: `264d37e` and predecessors
-- Bash rules: `94c2bb2`
-- Zsh rules: `08fcc6a`
-- Fish rules: `7ea80b9`
+- BashLume core: `5dcf47a`
+- Bash rules: `9861566`
+- Zsh rules: `2475478`
+- Fish rules: `206086e`
+
+All four current CI runs pass. Stable release jobs remain fail-closed behind the strict converter gate; this is intentional until the remaining counts above reach zero.
 
 ## 1. Non-negotiable product requirements
 
