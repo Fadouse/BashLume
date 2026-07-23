@@ -7,6 +7,7 @@
 - Discover rule packs asynchronously, mmap their indexes, decode command blocks lazily, and expose pack status through `bashlume rules`.
 - Evaluate static rules in a bounded Rust VM and merge candidates from every installed source with description preservation, conservative spacing, and source agreement metadata.
 - Add signed, capability-declared, Tab-only dynamic probes supervised through `posix_spawnp` with concurrency, timeout, output, cache, and shell-execution limits.
+- Add Completion IR block version 2 and pack format 1.1 path policies so matched rules can suppress files, request directories, or force file completion while version-1 blocks remain readable.
 
 ## 0.1.5 — 2026-07-23
 

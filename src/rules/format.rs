@@ -14,7 +14,7 @@ use super::ir::{CommandProgram, IrError, MAX_COMMAND_BLOCK_BYTES};
 
 pub const PACK_MAGIC: &[u8; 4] = b"BLPK";
 pub const FORMAT_MAJOR: u16 = 1;
-pub const FORMAT_MINOR: u16 = 0;
+pub const FORMAT_MINOR: u16 = 1;
 // No older on-disk major exists yet. Keep this equal to the current major
 // until format 2 is introduced with an explicit format-1 decoder.
 pub const PREVIOUS_FORMAT_MAJOR: u16 = FORMAT_MAJOR;
@@ -176,7 +176,9 @@ impl PackFile {
         }
         let format_major = read_u16(header, 4)?;
         let format_minor = read_u16(header, 6)?;
-        if format_major != FORMAT_MAJOR && format_major != PREVIOUS_FORMAT_MAJOR {
+        if (format_major != FORMAT_MAJOR && format_major != PREVIOUS_FORMAT_MAJOR)
+            || format_major == FORMAT_MAJOR && format_minor > FORMAT_MINOR
+        {
             return Err(PackError::UnsupportedFormat {
                 major: format_major,
                 minor: format_minor,
@@ -867,7 +869,7 @@ mod tests {
 
     use super::*;
     use crate::rules::ir::{
-        AppendPolicy, CandidateTemplate, PredicateOp, RuleCandidateKind, StaticRule,
+        AppendPolicy, CandidateTemplate, PathCompletion, PredicateOp, RuleCandidateKind, StaticRule,
     };
 
     fn command(name: &str) -> CommandProgram {
@@ -879,6 +881,7 @@ mod tests {
             license: "GPL-2.0-or-later".into(),
             static_rules: vec![StaticRule {
                 when: vec![PredicateOp::True],
+                path_completion: PathCompletion::Inherit,
                 candidates: vec![CandidateTemplate {
                     value: "--help".into(),
                     display: "--help".into(),

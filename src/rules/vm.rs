@@ -7,7 +7,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::format::{SourceKind, TrustStatus};
-use super::ir::{CandidateTemplate, CommandProgram, PredicateOp, ProbeParser, RuleCandidateKind};
+use super::ir::{
+    CandidateTemplate, CommandProgram, PathCompletion, PredicateOp, ProbeParser, RuleCandidateKind,
+};
 
 pub const MAX_EVALUATED_RULES: usize = 65_536;
 pub const MAX_EMITTED_CANDIDATES: usize = 65_536;
@@ -62,6 +64,7 @@ pub struct EvaluationResult {
     pub candidates: Vec<EmittedCandidate>,
     pub probes: Vec<ProbeRequest>,
     pub denied_probe_count: usize,
+    pub path_completion: PathCompletion,
 }
 
 pub fn evaluate(
@@ -83,6 +86,7 @@ pub fn evaluate(
             return Err(VmError::Limit("evaluated rules"));
         }
         if evaluate_predicates(&rule.when, context)? {
+            result.path_completion = result.path_completion.merge(rule.path_completion);
             for candidate in &rule.candidates {
                 if result.candidates.len() >= candidate_limit {
                     break;
@@ -314,6 +318,7 @@ mod tests {
             license: "GPL-2.0-or-later".into(),
             static_rules: vec![StaticRule {
                 when: vec![PredicateOp::True],
+                path_completion: PathCompletion::Inherit,
                 candidates: vec![CandidateTemplate {
                     value: "checkout".into(),
                     display: "checkout".into(),

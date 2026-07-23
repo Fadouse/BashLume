@@ -3,6 +3,7 @@ pub mod matcher;
 mod provider;
 mod worker;
 
+use crate::rules::ir::PathCompletion;
 use context::{CompletionContext, QuoteMode, existing_directory_target, quote_shell_word};
 use matcher::{Candidate, CandidateKind, CandidateSink};
 use provider::{CompletionProvider, GenericProvider, RuleProvider};
@@ -92,9 +93,18 @@ impl CompletionEngine {
         self.cache.poll();
         let mut sink = CandidateSink::new(max_candidates);
         let mut pending = false;
+        let mut path_completion = PathCompletion::Inherit;
         for provider in &mut self.providers {
-            let status = provider.complete(context, shell, &mut self.cache, &mut sink, mode);
+            let status = provider.complete(
+                context,
+                shell,
+                &mut self.cache,
+                &mut sink,
+                mode,
+                path_completion,
+            );
             pending |= status.pending;
+            path_completion = path_completion.merge(status.path_completion);
         }
         CompletionResult {
             candidates: sink.finish(),
@@ -353,6 +363,7 @@ mod tests {
                     license: "GPL-2.0-or-later".into(),
                     static_rules: vec![StaticRule {
                         when: vec![PredicateOp::True],
+                        path_completion: PathCompletion::Suppress,
                         candidates,
                     }],
                     probes: Vec::new(),
@@ -377,6 +388,7 @@ mod tests {
             vec![option("--shared", Some("Shared description"))],
         );
         make_pack(SourceKind::Zsh, "zsh", vec![option("--unique", None)]);
+        std::fs::write(root.join("fixture-file"), "test").unwrap();
 
         let shell = ShellSnapshot {
             cwd: root.clone(),
@@ -406,6 +418,18 @@ mod tests {
                 candidate.value == "--unique" && candidate.source_mask == 0b0100
             })
         );
+
+        let file_context = CompletionContext::analyze("bl-merge fixture", 16);
+        let mut file_result = engine.complete_explicit(&file_context, &shell, 128);
+        for _ in 0..100 {
+            if !file_result.pending {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            file_result = engine.complete_explicit(&file_context, &shell, 128);
+        }
+        assert!(!file_result.pending);
+        assert!(file_result.candidates.is_empty());
         engine.stop();
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -5,7 +5,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub const COMMAND_BLOCK_MAGIC: &[u8; 4] = b"BLIR";
-pub const COMMAND_BLOCK_VERSION: u16 = 1;
+pub const COMMAND_BLOCK_VERSION: u16 = 2;
+pub const PREVIOUS_COMMAND_BLOCK_VERSION: u16 = 1;
 pub const MAX_COMMAND_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_REGISTRATIONS: usize = 4096;
 pub const MAX_RULES: usize = 65_536;
@@ -131,10 +132,52 @@ pub struct CandidateTemplate {
     pub preserve_order: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathCompletion {
+    #[default]
+    Inherit,
+    Suppress,
+    Directories,
+    Files,
+}
+
+impl PathCompletion {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Inherit => 0,
+            Self::Suppress => 1,
+            Self::Directories => 2,
+            Self::Files => 3,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, IrError> {
+        match value {
+            0 => Ok(Self::Inherit),
+            1 => Ok(Self::Suppress),
+            2 => Ok(Self::Directories),
+            3 => Ok(Self::Files),
+            _ => Err(IrError::InvalidEnum("path completion", value)),
+        }
+    }
+
+    pub const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Files, _) | (_, Self::Files) => Self::Files,
+            (Self::Directories, _) | (_, Self::Directories) => Self::Directories,
+            (Self::Suppress, _) | (_, Self::Suppress) => Self::Suppress,
+            _ => Self::Inherit,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StaticRule {
     #[serde(default = "default_true_program")]
     pub when: Vec<PredicateOp>,
+    #[serde(default)]
+    pub path_completion: PathCompletion,
     pub candidates: Vec<CandidateTemplate>,
 }
 
@@ -323,10 +366,18 @@ impl CommandProgram {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, IrError> {
+        self.encode_version(COMMAND_BLOCK_VERSION)
+    }
+
+    fn encode_version(&self, block_version: u16) -> Result<Vec<u8>, IrError> {
         self.validate()?;
+        if block_version != COMMAND_BLOCK_VERSION && block_version != PREVIOUS_COMMAND_BLOCK_VERSION
+        {
+            return Err(IrError::Invalid("unsupported command block version"));
+        }
         let mut encoder = Encoder::new();
         encoder.bytes.extend_from_slice(COMMAND_BLOCK_MAGIC);
-        encoder.u16(COMMAND_BLOCK_VERSION);
+        encoder.u16(block_version);
         encoder.u16(0);
         encoder.string(&self.canonical_name)?;
         encoder.strings(&self.registrations)?;
@@ -336,6 +387,9 @@ impl CommandProgram {
         encoder.count(self.static_rules.len())?;
         for rule in &self.static_rules {
             encode_predicates(&mut encoder, &rule.when)?;
+            if block_version >= 2 {
+                encoder.u8(rule.path_completion.encode());
+            }
             encoder.count(rule.candidates.len())?;
             for candidate in &rule.candidates {
                 encode_candidate(&mut encoder, candidate)?;
@@ -375,7 +429,9 @@ impl CommandProgram {
         if decoder.take(4)? != COMMAND_BLOCK_MAGIC {
             return Err(IrError::Invalid("invalid command block magic"));
         }
-        if decoder.u16()? != COMMAND_BLOCK_VERSION {
+        let block_version = decoder.u16()?;
+        if block_version != COMMAND_BLOCK_VERSION && block_version != PREVIOUS_COMMAND_BLOCK_VERSION
+        {
             return Err(IrError::Invalid("unsupported command block version"));
         }
         if decoder.u16()? != 0 {
@@ -390,12 +446,21 @@ impl CommandProgram {
         let mut static_rules = Vec::with_capacity(rule_count);
         for _ in 0..rule_count {
             let when = decode_predicates(&mut decoder)?;
+            let path_completion = if block_version >= 2 {
+                PathCompletion::decode(decoder.u8()?)?
+            } else {
+                PathCompletion::Inherit
+            };
             let candidate_count = decoder.count(MAX_RULES)?;
             let mut candidates = Vec::with_capacity(candidate_count);
             for _ in 0..candidate_count {
                 candidates.push(decode_candidate(&mut decoder)?);
             }
-            static_rules.push(StaticRule { when, candidates });
+            static_rules.push(StaticRule {
+                when,
+                path_completion,
+                candidates,
+            });
         }
         let probe_count = decoder.count(MAX_PROBES)?;
         let mut probes = Vec::with_capacity(probe_count);
@@ -848,6 +913,7 @@ mod tests {
             license: "GPL-2.0-or-later".into(),
             static_rules: vec![StaticRule {
                 when: vec![PredicateOp::PreviousWordEquals("checkout".into())],
+                path_completion: PathCompletion::Directories,
                 candidates: vec![CandidateTemplate {
                     value: "--detach".into(),
                     display: "--detach".into(),
@@ -878,6 +944,17 @@ mod tests {
     fn command_program_round_trips_without_native_layout() {
         let expected = fixture();
         let bytes = expected.encode().unwrap();
+        assert_eq!(CommandProgram::decode(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn previous_command_block_version_remains_decodable() {
+        let program = fixture();
+        let bytes = program
+            .encode_version(PREVIOUS_COMMAND_BLOCK_VERSION)
+            .unwrap();
+        let mut expected = program;
+        expected.static_rules[0].path_completion = PathCompletion::Inherit;
         assert_eq!(CommandProgram::decode(&bytes).unwrap(), expected);
     }
 

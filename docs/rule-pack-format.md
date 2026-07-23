@@ -1,4 +1,4 @@
-# BashLume Rule Pack Format 1.0
+# BashLume Rule Pack Format 1.1
 
 Status: implemented core container and IR baseline. This specification is GPL-2.0-or-later and is intended for independent rule-pack implementations.
 
@@ -92,7 +92,7 @@ Each decompressed block starts with:
 
 ```text
 bytes[4] `BLIR`
-u16 block version (1)
+u16 block version (2; version 1 remains readable)
 u16 flags (zero)
 ```
 
@@ -107,6 +107,8 @@ The remaining order is:
 5. SPDX license expression
 6. static rule list
 7. dynamic probe list
+
+A block-version-2 static rule stores its predicate program, one path-completion byte, and its candidate list. Path completion is `inherit` (0), `suppress` (1), `directories` (2), or `files` (3). Block version 1 omitted this byte and decodes as `inherit`.
 
 ### Predicates
 
@@ -145,6 +147,8 @@ A candidate stores:
 
 The runtime filters and ranks candidates against the current query, then merges identical insertion values from all installed packs. Source priority resolves metadata only; unique candidates remain in the union.
 
+Matched path policies are merged independently. Explicit file completion wins over directory-only completion, which wins over suppression; suppression wins over an unspecified policy. The resulting policy controls the asynchronous generic path provider, allowing source rules to reproduce Fish `-f`/`-F`, Bash `compopt`, and Zsh file actions without synchronous I/O.
+
 ### Dynamic probes
 
 A probe stores:
@@ -180,4 +184,4 @@ These are parser security boundaries, not recommended generation targets.
 
 ## Compatibility
 
-Format-major changes are breaking. Minor additions must remain backward compatible and be guarded by feature bits. BashLume supports the current major and, once a second major exists, the immediately preceding major through a dedicated decoder. It must never treat an unknown major as the current layout.
+Format-major changes are breaking. Minor additions must remain backward compatible and be guarded by feature bits. Engine 0.2 reads container minors 1.0 and 1.1 and command-block versions 1 and 2; it writes 1.1/version 2. BashLume supports the current major and, once a second major exists, the immediately preceding major through a dedicated decoder. It must never treat an unknown major or newer minor as the current layout.

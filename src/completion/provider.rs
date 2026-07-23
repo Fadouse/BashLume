@@ -5,13 +5,14 @@ use super::context::CompletionContext;
 use super::matcher::{Candidate, CandidateKind, CandidateSink};
 use super::worker::{CompletionCache, EntryKind};
 use crate::rules::format::SourceKind;
-use crate::rules::ir::{AppendPolicy, RuleCandidateKind};
+use crate::rules::ir::{AppendPolicy, PathCompletion, RuleCandidateKind};
 use crate::rules::vm::{EvaluationContext, EvaluationMode, evaluate};
 use crate::shell::ShellSnapshot;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProviderStatus {
     pub pending: bool,
+    pub path_completion: PathCompletion,
 }
 
 /// Compile-time extension point for command-aware completers.
@@ -29,6 +30,7 @@ pub trait CompletionProvider: Send {
         cache: &mut CompletionCache,
         sink: &mut CandidateSink,
         mode: CompletionMode,
+        path_completion: PathCompletion,
     ) -> ProviderStatus;
 }
 
@@ -47,12 +49,16 @@ impl CompletionProvider for RuleProvider {
         cache: &mut CompletionCache,
         sink: &mut CandidateSink,
         mode: CompletionMode,
+        _path_completion: PathCompletion,
     ) -> ProviderStatus {
         let Some(command) = context.command_name.as_deref() else {
             return ProviderStatus::default();
         };
         let (programs, pending) = cache.rule_programs(command);
-        let mut status = ProviderStatus { pending };
+        let mut status = ProviderStatus {
+            pending,
+            ..ProviderStatus::default()
+        };
         let Some(programs) = programs else {
             return status;
         };
@@ -80,6 +86,7 @@ impl CompletionProvider for RuleProvider {
             ) else {
                 continue;
             };
+            status.path_completion = status.path_completion.merge(evaluated.path_completion);
             for emitted in evaluated.candidates {
                 push_rule_candidate(
                     context,
@@ -205,6 +212,7 @@ impl CompletionProvider for GenericProvider {
         cache: &mut CompletionCache,
         sink: &mut CandidateSink,
         _mode: CompletionMode,
+        path_completion: PathCompletion,
     ) -> ProviderStatus {
         let mut status = ProviderStatus::default();
 
@@ -223,8 +231,16 @@ impl CompletionProvider for GenericProvider {
         let explicit_path = context.query.contains('/')
             || context.query.starts_with('.')
             || context.query.starts_with('~');
-        if !context.command_position || explicit_path {
-            let path_status = path_candidates(context, shell, cache, sink);
+        if (!context.command_position || explicit_path)
+            && path_completion != PathCompletion::Suppress
+        {
+            let path_status = path_candidates(
+                context,
+                shell,
+                cache,
+                sink,
+                path_completion == PathCompletion::Directories,
+            );
             status.pending |= path_status.pending;
         }
 
@@ -393,6 +409,7 @@ fn path_candidates(
     shell: &ShellSnapshot,
     cache: &mut CompletionCache,
     sink: &mut CandidateSink,
+    directories_only: bool,
 ) -> ProviderStatus {
     let (typed_parent, leaf) = context.typed_parent_and_leaf();
     let Some(directory) = resolve_parent(&typed_parent, shell) else {
@@ -402,10 +419,14 @@ fn path_candidates(
     let Some((entries, _truncated, refreshing)) = cache.directory_entries(&key) else {
         return ProviderStatus {
             pending: cache.scan_available(),
+            ..ProviderStatus::default()
         };
     };
 
     for entry in entries {
+        if directories_only && entry.kind != EntryKind::Directory {
+            continue;
+        }
         if context.command_position
             && entry.kind != EntryKind::Directory
             && entry.kind != EntryKind::Executable
@@ -430,6 +451,7 @@ fn path_candidates(
 
     ProviderStatus {
         pending: refreshing,
+        ..ProviderStatus::default()
     }
 }
 
