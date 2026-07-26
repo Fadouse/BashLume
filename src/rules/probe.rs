@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("BashLume's probe sandbox currently supports x86_64 and aarch64 Linux");
+
 use std::collections::{HashSet, VecDeque};
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::ir::ProbeParser;
@@ -20,6 +26,7 @@ const MAX_PROBE_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_PROBE_ENVIRONMENT: usize = 256;
 const MAX_PROBE_ENVIRONMENT_BYTES: usize = 256 * 1024;
 const MAX_PROBE_PATH_BYTES: usize = 64 * 1024;
+const PROBE_HELPER_PROTOCOL: &str = "--bashlume-probe-v1";
 
 #[derive(Clone, Debug)]
 pub struct ProbeOutcome {
@@ -331,9 +338,36 @@ impl ActiveProbe {
         if self.reaped || self.pid <= 0 {
             return;
         }
+        let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+        // Observe an exited leader without reaping it. Its PID/process-group ID
+        // therefore cannot be reused before every still-running group member
+        // has received SIGKILL.
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if observed != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                self.kill_group();
+                self.reaped = true;
+            } else {
+                self.failure
+                    .get_or_insert_with(|| format!("waitid failed: {error}"));
+            }
+            return;
+        }
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } != self.pid {
+            return;
+        }
+        self.kill_group();
         let mut status = 0;
-        // SAFETY: pid names the child created by this ActiveProbe. WNOHANG
-        // never blocks the supervisor thread.
+        // SAFETY: waitid above retained this exited child with WNOWAIT.
         let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
         if result == self.pid {
             self.reaped = true;
@@ -348,14 +382,22 @@ impl ActiveProbe {
         }
     }
 
+    fn kill_group(&self) {
+        if self.pid > 0 {
+            // The sandbox prevents descendants from changing process groups or
+            // creating sessions, so this covers the complete probe tree.
+            unsafe {
+                libc::kill(-self.pid, libc::SIGKILL);
+            }
+        }
+    }
+
     fn terminate(&mut self) {
         if !self.terminated && self.pid > 0 {
             self.terminated = true;
             // The child is placed in a fresh process group whose ID equals pid.
             // SAFETY: a negative pid targets only that process group.
-            unsafe {
-                libc::kill(-self.pid, libc::SIGKILL);
-            }
+            self.kill_group();
         }
         // Completion after a resource failure never depends on descendants
         // closing inherited descriptors; escaped pipe holders are ignored.
@@ -415,11 +457,7 @@ fn validate_request(request: &ProbeRequest) -> io::Result<()> {
         || argument_bytes > MAX_PROBE_ARGUMENT_BYTES
         || request.key.environment.len() > MAX_PROBE_ENVIRONMENT
         || environment_bytes > MAX_PROBE_ENVIRONMENT_BYTES
-        || executable.is_empty()
-        || executable.len() > MAX_PROBE_VALUE_BYTES
-        || executable.contains(['/', '\0'])
         || request.key.working_directory.len() > MAX_PROBE_PATH_BYTES
-        || is_shell(executable)
         || request
             .key
             .arguments
@@ -429,7 +467,22 @@ fn validate_request(request: &ProbeRequest) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "probe attempts forbidden shell execution or contains NUL",
+            "probe exceeds argument/environment bounds or contains NUL",
+        ));
+    }
+    validate_probe_target(executable, &request.key.arguments)
+}
+
+fn validate_probe_target(executable: &str, arguments: &[String]) -> io::Result<()> {
+    if executable.is_empty()
+        || executable.len() > MAX_PROBE_VALUE_BYTES
+        || executable.contains(['/', '\0'])
+        || is_shell(executable)
+        || executable == "bashlume-probe"
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "probe attempts forbidden shell or helper execution",
         ));
     }
     if matches!(
@@ -447,7 +500,7 @@ fn validate_request(request: &ProbeRequest) -> io::Result<()> {
             | "sudo"
             | "doas"
             | "chroot"
-    ) && !matches!(request.key.arguments.as_slice(), [option] if matches!(option.as_str(), "--help" | "--version"))
+    ) && !matches!(arguments, [option] if matches!(option.as_str(), "--help" | "--version"))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -466,13 +519,9 @@ fn spawn_with_pipe(
     read_fd: RawFd,
     write_fd: RawFd,
 ) -> io::Result<libc::pid_t> {
-    let executable = CString::new(request.key.executable.as_str())?;
-    let mut argument_strings = Vec::with_capacity(request.key.arguments.len() + 1);
-    argument_strings.push(CString::new(request.key.executable.as_str())?);
-    for argument in &request.key.arguments {
-        argument_strings.push(CString::new(argument.as_str())?);
-    }
-    let mut argv = argument_strings
+    let spawn = probe_spawn_command(request)?;
+    let mut argv = spawn
+        .arguments
         .iter()
         .map(|argument| argument.as_ptr().cast_mut())
         .collect::<Vec<_>>();
@@ -553,20 +602,281 @@ fn spawn_with_pipe(
         let mut pid = 0;
         check_spawn(libc::posix_spawnp(
             &mut pid,
-            executable.as_ptr(),
+            spawn.executable.as_ptr(),
             &actions.0,
             &attributes.0,
             argv.as_ptr(),
             envp.as_ptr(),
         ))?;
-        if let Err(error) = apply_probe_resource_limits(pid, request.timeout_ms) {
-            libc::kill(-pid, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(pid, &mut status, libc::WNOHANG);
-            return Err(error);
+        if !spawn.sandboxed {
+            if let Err(error) = apply_probe_resource_limits(pid, request.timeout_ms) {
+                libc::kill(-pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, libc::WNOHANG);
+                return Err(error);
+            }
         }
         Ok(pid)
     }
+}
+
+struct ProbeSpawnCommand {
+    executable: CString,
+    arguments: Vec<CString>,
+    sandboxed: bool,
+}
+
+fn probe_spawn_command(request: &ProbeRequest) -> io::Result<ProbeSpawnCommand> {
+    match probe_helper_path() {
+        Ok(helper) => {
+            let executable = CString::new(helper.as_os_str().as_bytes())?;
+            let mut arguments = Vec::with_capacity(request.key.arguments.len() + 4);
+            arguments.push(executable.clone());
+            arguments.push(CString::new(PROBE_HELPER_PROTOCOL)?);
+            arguments.push(CString::new(request.timeout_ms.to_string())?);
+            arguments.push(CString::new(request.key.executable.as_str())?);
+            for argument in &request.key.arguments {
+                arguments.push(CString::new(argument.as_str())?);
+            }
+            Ok(ProbeSpawnCommand {
+                executable,
+                arguments,
+                sandboxed: true,
+            })
+        }
+        #[cfg(test)]
+        Err(_) => {
+            // Unit-test binaries are not accompanied by an un-hashed helper
+            // on a clean `cargo test --lib` build. Production fails closed.
+            let executable = CString::new(request.key.executable.as_str())?;
+            let mut arguments = Vec::with_capacity(request.key.arguments.len() + 1);
+            arguments.push(executable.clone());
+            for argument in &request.key.arguments {
+                arguments.push(CString::new(argument.as_str())?);
+            }
+            Ok(ProbeSpawnCommand {
+                executable,
+                arguments,
+                sandboxed: false,
+            })
+        }
+        #[cfg(not(test))]
+        Err(error) => Err(error),
+    }
+}
+
+fn probe_helper_path() -> io::Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("BASHLUME_PROBE_HELPER") {
+        candidates.push(PathBuf::from(path));
+    }
+    let mut info = MaybeUninit::<libc::Dl_info>::zeroed();
+    let address = probe_helper_path as *const () as *const libc::c_void;
+    if unsafe { libc::dladdr(address, info.as_mut_ptr()) } != 0 {
+        let info = unsafe { info.assume_init() };
+        if !info.dli_fname.is_null() {
+            let path = PathBuf::from(OsStr::from_bytes(unsafe {
+                CStr::from_ptr(info.dli_fname).to_bytes()
+            }));
+            if let Some(parent) = path.parent() {
+                candidates.push(parent.join("bashlume-probe"));
+            }
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("bashlume-probe"));
+            if parent.file_name().is_some_and(|name| name == "deps") {
+                if let Some(profile) = parent.parent() {
+                    candidates.push(profile.join("bashlume-probe"));
+                }
+            }
+        }
+    }
+    for candidate in candidates {
+        if !candidate.is_absolute() {
+            continue;
+        }
+        let Ok(candidate) = candidate.canonicalize() else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode();
+        let owner = metadata.uid();
+        if metadata.is_file()
+            && mode & 0o111 != 0
+            && mode & 0o022 == 0
+            && (owner == 0 || owner == unsafe { libc::geteuid() })
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "trusted bashlume-probe helper was not found beside libbashlume",
+    ))
+}
+
+/// Applies limits and replaces the helper with one validated probe target.
+///
+/// This is public only for the separately installed `bashlume-probe` binary;
+/// completion packs cannot invoke it as a probe capability.
+pub fn probe_helper_main(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
+    let mut arguments = arguments.into_iter();
+    let _program = arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(PROBE_HELPER_PROTOCOL)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid probe-helper protocol",
+        ));
+    }
+    let timeout_ms = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=60_000).contains(value))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid probe timeout"))?;
+    let executable = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing probe executable"))?;
+    let arguments = arguments
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "probe argument is not UTF-8")
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    validate_probe_target(&executable, &arguments)?;
+
+    if unsafe { libc::setpgid(0, 0) } != 0 && unsafe { libc::getpgrp() != libc::getpid() } {
+        return Err(io::Error::last_os_error());
+    }
+    close_probe_inherited_descriptors()?;
+    apply_probe_resource_limits(0, timeout_ms)?;
+    install_probe_process_filter()?;
+
+    let executable = CString::new(executable)?;
+    let mut argument_strings = Vec::with_capacity(arguments.len() + 1);
+    argument_strings.push(executable.clone());
+    for argument in arguments {
+        argument_strings.push(CString::new(argument)?);
+    }
+    let mut argv = argument_strings
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .collect::<Vec<_>>();
+    argv.push(std::ptr::null());
+    unsafe {
+        libc::execvp(executable.as_ptr(), argv.as_ptr());
+    }
+    Err(io::Error::last_os_error())
+}
+
+fn close_probe_inherited_descriptors() -> io::Result<()> {
+    let result =
+        unsafe { libc::syscall(libc::SYS_close_range, libc::STDERR_FILENO + 1, u32::MAX, 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EINVAL)
+    ) {
+        return Err(error);
+    }
+
+    // Linux before close_range(2) is uncommon but still supported. Bound the
+    // fallback by the inherited descriptor ceiling; closing an absent fd is
+    // harmless, and the helper needs no descriptor above stderr.
+    let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let limit = unsafe { limit.assume_init() };
+    let maximum = if limit.rlim_max == libc::RLIM_INFINITY {
+        1_048_576
+    } else {
+        limit.rlim_max.min(1_048_576) as libc::c_int
+    };
+    for descriptor in (libc::STDERR_FILENO + 1)..maximum {
+        unsafe {
+            libc::close(descriptor);
+        }
+    }
+    Ok(())
+}
+
+fn install_probe_process_filter() -> io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JSET_K: u16 = 0x45;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
+
+    const fn statement(code: u16, value: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k: value,
+        }
+    }
+    const fn jump(code: u16, value: u32, yes: u8, no: u8) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: yes,
+            jf: no,
+            k: value,
+        }
+    }
+
+    let mut filter = vec![
+        statement(BPF_LD_W_ABS, 4),
+        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 1, 0),
+        statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        statement(BPF_LD_W_ABS, 0),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The x32 ABI shares AUDIT_ARCH_X86_64 but ORs this bit into syscall
+        // numbers. Kill it rather than permitting alternate syscall numbers.
+        filter.push(jump(BPF_JMP_JSET_K, 0x4000_0000, 0, 1));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+    }
+    for syscall in [libc::SYS_setpgid, libc::SYS_setsid] {
+        filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    }
+    filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+    let program = libc::sock_fprog {
+        len: filter
+            .len()
+            .try_into()
+            .map_err(|_| io::Error::other("probe seccomp filter is too large"))?,
+        filter: filter.as_mut_ptr(),
+    };
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        || unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn apply_probe_resource_limits(pid: libc::pid_t, timeout_ms: u32) -> io::Result<()> {
@@ -909,6 +1219,95 @@ mod tests {
         assert!(active.eof);
         assert_eq!(active.stdout, -1);
         unsafe { libc::close(descriptors[1]) };
+    }
+
+    #[test]
+    fn exited_leader_cannot_leave_same_group_descendants_running() {
+        let mut descriptors = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Only async-signal-safe operations are used after forking the
+            // multi-threaded test harness.
+            unsafe {
+                libc::close(descriptors[0]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(120);
+                }
+                let descendant = libc::fork();
+                if descendant == 0 {
+                    libc::close(descriptors[1]);
+                    libc::sleep(10);
+                    libc::_exit(0);
+                }
+                if descendant < 0 {
+                    libc::_exit(121);
+                }
+                let bytes = descendant.to_ne_bytes();
+                if libc::write(descriptors[1], bytes.as_ptr().cast(), bytes.len())
+                    != bytes.len() as isize
+                {
+                    libc::_exit(122);
+                }
+                libc::close(descriptors[1]);
+                libc::_exit(0);
+            }
+        }
+        assert!(pid > 0);
+        unsafe { libc::close(descriptors[1]) };
+        let mut descendant_bytes = [0_u8; std::mem::size_of::<libc::pid_t>()];
+        let mut offset = 0;
+        while offset < descendant_bytes.len() {
+            let count = unsafe {
+                libc::read(
+                    descriptors[0],
+                    descendant_bytes[offset..].as_mut_ptr().cast(),
+                    descendant_bytes.len() - offset,
+                )
+            };
+            assert!(count > 0);
+            offset += count as usize;
+        }
+        let descendant = libc::pid_t::from_ne_bytes(descendant_bytes);
+        let flags = unsafe { libc::fcntl(descriptors[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptors[0], libc::F_SETFL, flags | libc::O_NONBLOCK,) },
+            0
+        );
+        let mut active = ActiveProbe {
+            request: request("fixture", &[]),
+            pid,
+            stdout: descriptors[0],
+            output: Vec::new(),
+            started: Instant::now(),
+            eof: false,
+            reaped: false,
+            status: None,
+            failure: None,
+            terminated: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let ProbePoll::Complete { error, .. } = active.poll(Instant::now()) {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if unsafe { libc::kill(descendant, 0) } == 0 {
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+            panic!("probe descendant {descendant} survived leader completion");
+        }
     }
 
     #[test]

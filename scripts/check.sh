@@ -8,6 +8,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo build --release
 cargo test --release -- --ignored --nocapture
+python3 tests/probe_sandbox.py target/release/bashlume-probe
 shellcheck shell/bashlume.bash scripts/check.sh
 rule_pack=$(mktemp --suffix=.blp)
 trap 'rm -f -- "$rule_pack"' EXIT

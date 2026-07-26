@@ -448,13 +448,13 @@ impl PluginState {
         if self.enabled {
             if let Some(menu) = self.menu.take() {
                 if let Some(candidate) = menu.candidates.get(menu.selected) {
-                    if let Some((line, point)) = unsafe { readline_line() }
-                        && menu.matches_context(&line, point)
-                    {
-                        let context = CompletionContext::analyze(&line, point);
-                        unsafe { apply_candidate(&context, candidate) };
-                        self.last_ghost = None;
-                        return 0;
+                    if let Some((line, point)) = unsafe { readline_line() } {
+                        if menu.matches_context(&line, point) {
+                            let context = CompletionContext::analyze(&line, point);
+                            unsafe { apply_candidate(&context, candidate) };
+                            self.last_ghost = None;
+                            return 0;
+                        }
                     }
                 }
             }

@@ -52,6 +52,21 @@ if [[ ! -r $_bashlume_library ]]; then
   return 0
 fi
 
+# Keep dladdr-based lookup of the co-installed probe helper independent of
+# later `cd` commands, even when BASHLUME_LIBRARY was supplied as a relative
+# development path.
+if [[ $_bashlume_library != /* ]]; then
+  _bashlume_library_name=${_bashlume_library##*/}
+  _bashlume_library_dir=${_bashlume_library%/*}
+  [[ $_bashlume_library_dir == "$_bashlume_library" ]] && _bashlume_library_dir=.
+  if _bashlume_library_dir=$(
+    builtin cd -- "$_bashlume_library_dir" 2>/dev/null && builtin pwd -P
+  ); then
+    _bashlume_library=$_bashlume_library_dir/$_bashlume_library_name
+  fi
+  unset _bashlume_library_name _bashlume_library_dir
+fi
+
 if ! enable -f "$_bashlume_library" bashlume; then
   printf 'bashlume: failed to load %s; using native Readline\n' "$_bashlume_library" >&2
 fi

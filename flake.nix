@@ -32,7 +32,10 @@
               test -n "$library"
               pack_tool=$(find target -type f -path '*/release/bashlume-pack' -print -quit)
               test -n "$pack_tool"
+              probe_helper=$(find target -type f -path '*/release/bashlume-probe' -print -quit)
+              test -n "$probe_helper"
               install -Dm755 "$library" "$out/lib/bash/libbashlume.so"
+              install -Dm755 "$probe_helper" "$out/lib/bash/bashlume-probe"
               install -Dm755 "$pack_tool" "$out/bin/bashlume-pack"
               install -Dm644 shell/bashlume.bash "$out/share/bashlume/bashlume.bash"
               mkdir -p "$out/share/bashlume/rules" "$out/share/bashlume/trusted-keys"
@@ -48,7 +51,10 @@
               description = "Lightweight native completion and syntax highlighting for Bash";
               homepage = "https://github.com/Fadouse/BashLume";
               license = pkgs.lib.licenses.gpl2Plus;
-              platforms = pkgs.lib.platforms.linux;
+              platforms = [
+                "x86_64-linux"
+                "aarch64-linux"
+              ];
             };
           };
         }

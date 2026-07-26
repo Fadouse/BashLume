@@ -39,7 +39,7 @@ BashLume never sources Bash, Zsh, or Fish completion scripts at runtime. Separat
 
 ## Requirements
 
-- Linux
+- x86_64 or AArch64 Linux
 - GNU Bash 5.0 or newer, built with dynamic builtin loading
 - GNU Readline 8.x
 - An ANSI-compatible terminal (`xterm`, Kitty, tmux, screen, and common SSH terminals)
@@ -58,6 +58,7 @@ The result contains:
 
 ```text
 result/lib/bash/libbashlume.so
+result/lib/bash/bashlume-probe  # internal pre-exec sandbox helper
 result/bin/bashlume-pack
 result/share/bashlume/bashlume.bash
 ```
@@ -186,7 +187,7 @@ Development checks enforce:
 
 - incremental syntax-highlighting p99 below 0.5 ms for an approximately 1 KiB line
 - generic ranking thread-CPU p99 below 0.5 ms across 5,000 command names
-- additional private memory below 3 MiB in the standard smoke workload
+- additional private memory below 3.75 MiB (3,840 KiB) in the standard smoke workload
 - cache hard limit of 16 MiB by default
 - top 4,096 candidates retained per scan by default
 
@@ -202,7 +203,7 @@ nix develop -c ./scripts/check.sh
 - Previously submitted continuation lines are not made editable again.
 - Invalid UTF-8 filesystem names are skipped rather than inserted incorrectly.
 - Completion caches may briefly show stale entries; they refresh asynchronously and are bounded with LRU eviction.
-- One background supervisor performs filesystem I/O and at most two capability-authorized probes. It never calls Bash APIs; probes are Tab-only, direct `posix_spawnp` executions with no shell.
+- Separate bounded workers handle filesystem I/O and at most two capability-authorized probes. Neither calls Bash APIs. Probes are Tab-only and shell-free: `posix_spawnp` starts the co-installed sandbox helper, which applies limits and a process-group confinement filter before `execvp` replaces it with the declared target.
 
 See [`docs/architecture.md`](docs/architecture.md) for the FFI, threading, and redisplay design.
 

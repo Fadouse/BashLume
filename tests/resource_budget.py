@@ -119,9 +119,10 @@ def main() -> int:
             raise AssertionError(f"RSS regression: {rss_delta}KiB")
         # Private_Clean includes demand-paged code from the full three-shell VM,
         # while the independently bounded cache and probe-supervisor workers
-        # commit small allocator/stack arenas. Five warm measurements after
-        # splitting probe deadlines from filesystem I/O were 3584--3592 KiB;
-        # retain a tighter cap than RSS with one 256 KiB page-band of headroom.
+        # commit small allocator/stack arenas. Repeated warm measurements of
+        # the full VM and pre-exec probe sandbox are 3576 KiB, with 3664 KiB
+        # observed in the complete gate; retain the next 256 KiB budget band
+        # while keeping the cap tighter than RSS.
         if private_delta >= 15 * 256:
             raise AssertionError(f"private-memory regression: {private_delta}KiB")
     finally:

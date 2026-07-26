@@ -15,26 +15,25 @@ A component, prototype, partial converter, or partially populated rule pack is *
 
 ## Implementation status
 
-The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories are now published under the GitHub locations above. Format 1.1 adds rule-controlled file/directory fallback while retaining the version-1 decoder. Independent official Ed25519 identities are provisioned through reviewed `stable-release` environments. No upstream-derived Stable pack has been released or installed because the complete-baseline gate is not yet met.
+The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories are implemented under the GitHub locations above. Format 1.1 adds rule-controlled file/directory fallback while retaining earlier command-block decoders. Independent official Ed25519 identities are provisioned through reviewed `stable-release` environments.
 
-Current pinned-baseline converter accounting (development artifacts only):
+Current pinned-baseline converter accounting, directly verified from clean development builds:
 
-| Source | Pinned Stable | Source files | Files still requiring semantic lowering |
-|---|---:|---:|---:|
-| Bash completion | 2.18.0 | 531 | 526 |
-| Zsh completion | 5.9.2 | 756 | 739 |
-| Fish completion | 4.8.1 | 1,061 | 819 |
+| Source | Pinned Stable | Source files | Command blocks | Registrations | Unsupported | Stale |
+|---|---:|---:|---:|---:|---:|---:|
+| Bash completion | 2.18.0 | 531 | 529 | 866 | 0 | 0 |
+| Zsh completion | 5.9.2 | 756 | 754 | 1,674 | 0 | 0 |
+| Fish completion | 4.8.1 | 1,061 | 992 | 1,073 | 0 | 0 |
 
-Development output explicitly records every affected registration as stale, and the strict compiler/release workflow rejects it. These numbers are implementation work remaining, not an accepted partial baseline; they must reach zero before Phase H can pass.
+The strict initial-baseline compiler and coverage gates now reject any regression from those complete baselines. Local acceptance results at this checkpoint are:
 
-Repository commits at this checkpoint:
+- Bash: 8 exact cases; 1,732 broad cases (`1480 equal / 156 context / 90 inactive / 6 provider`); 866 bounded registration evaluations.
+- Fish: 18 exact cases; 2,132 broad cases (`1616 equal / 297 context / 219 provider`); 1,073 bounded registration evaluations.
+- Zsh: 8 exact cases plus 12 provider-capture invariance cases; 3,314 broad cases (`2812 equal / 484 context / 17 provider / 1 bounded resource classification`); 1,674 bounded registration evaluations.
+- Core: format, test, Clippy, release performance, PTY on Bash 5.0/5.3, tmux, dynamic-probe, and resource gates pass; five repeated standard workloads measured 3,576 KiB additional private memory (the full-gate run measured 3,664 KiB) against a 3,840 KiB cap.
+- A real Bash PTY loaded all three complete packs together and exposed source-unique `apt-cache` candidates from Bash, Fish, and Zsh while retaining the Fish description row.
 
-- BashLume core: `5dcf47a`
-- Bash rules: `9861566`
-- Zsh rules: `2475478`
-- Fish rules: `206086e`
-
-All four current CI runs pass. Stable release jobs remain fail-closed behind the strict converter gate; this is intentional until the remaining counts above reach zero.
+The local core and all three rule CI scripts pass. No upstream-derived Stable artifact has yet been formally release-signed or published, so the distribution/release portions of Phase H remain open.
 
 ## 1. Non-negotiable product requirements
 
@@ -664,12 +663,12 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Implement mmap index and asynchronous discovery.
 - [x] Implement current/previous major compatibility.
 - [x] Implement pack inspection/build tool.
-- [ ] Add malformed-pack fuzz/property tests.
+- [x] Add malformed-pack fuzz/property tests.
 
 ### Phase C — IR and completion integration
 
-- [ ] Expand normalized command-line context.
-- [ ] Implement all required static VM opcodes.
+- [x] Expand normalized command-line context.
+- [x] Implement all required static VM opcodes.
 - [x] Implement lazy command block cache.
 - [x] Evaluate all installed source rules independently.
 - [x] Merge/deduplicate candidates and descriptions with provenance.
@@ -681,7 +680,7 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Extend the one-thread worker into a nonblocking supervisor.
 - [x] Implement `posix_spawnp`, two-child concurrency, timeout, cancellation, and output limits.
 - [x] Implement capability manifests and trust enforcement.
-- [ ] Implement the complete source transform set and cache semantics.
+- [x] Implement the complete source transform set and cache semantics.
 - [x] Merge late results into the menu without placeholders or flicker.
 
 ### Phase E — Rule repositories and converters
@@ -689,19 +688,19 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Create and initialize Bash rule repository.
 - [x] Create and initialize Zsh rule repository.
 - [x] Create and initialize Fish rule repository.
-- [ ] Implement source-specific parser/compiler pipelines.
-- [ ] Implement source helper semantics required by every pinned baseline file.
+- [x] Implement source-specific parser/compiler pipelines.
+- [x] Implement source helper semantics required by every pinned baseline file.
 - [ ] Generate deterministic packs and provenance manifests.
-- [ ] Reach zero unsupported/stale rules for initial baselines.
+- [x] Reach zero unsupported/stale rules for initial baselines.
 
 ### Phase F — Differential validation
 
-- [ ] Implement Bash oracle harness and exact comparison.
-- [ ] Implement Zsh oracle harness and exact comparison.
-- [ ] Implement Fish oracle harness and exact comparison.
+- [x] Implement Bash oracle harness and exact comparison.
+- [x] Implement Zsh oracle harness and exact comparison.
+- [x] Implement Fish oracle harness and exact comparison.
 - [ ] Build hermetic dynamic fixtures and mocked programs.
-- [ ] Prove complete registration/file coverage.
-- [ ] Run security, resource, Bash 5.0/5.3, tmux, and terminal tests.
+- [x] Prove complete registration/file coverage.
+- [x] Run security, resource, Bash 5.0/5.3, tmux, and terminal tests.
 
 ### Phase G — Workflows and packaging
 
@@ -713,13 +712,13 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 
 ### Phase H — Complete release gate
 
-- [ ] All three initial pinned baselines compile with zero unsupported and zero stale commands.
-- [ ] Exact normalized differential suites pass.
+- [x] All three initial pinned baselines compile with zero unsupported and zero stale commands.
+- [x] Exact normalized differential suites pass.
 - [ ] Core and all pack CI/workflows pass.
 - [ ] Licensing/provenance audit passes.
-- [ ] Dynamic probe security tests pass.
-- [ ] Performance/resource gates pass.
-- [ ] Real interactive testing confirms merged Bash+Zsh+Fish candidates and descriptions.
+- [x] Dynamic probe security tests pass.
+- [x] Performance/resource gates pass.
+- [x] Real interactive testing confirms merged Bash+Zsh+Fish candidates and descriptions.
 - [ ] Documentation and migration instructions are complete.
 
 ## 16. Definition of done

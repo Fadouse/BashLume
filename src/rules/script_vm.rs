@@ -5349,7 +5349,8 @@ impl<'a> Machine<'a> {
             self.path_completion = self.path_completion.merge(PathCompletion::Files);
         }
         if actions.contains(&"user") {
-            for value in self.context.users.unwrap_or_default().to_vec() {
+            for index in 0..self.context.users.unwrap_or_default().len() {
+                let value = self.context.users.unwrap_or_default()[index].clone();
                 self.emit(
                     format!("{prefix}{value}{suffix}"),
                     None,
@@ -5359,7 +5360,8 @@ impl<'a> Machine<'a> {
             }
         }
         if actions.contains(&"group") {
-            for value in self.context.groups.unwrap_or_default().to_vec() {
+            for index in 0..self.context.groups.unwrap_or_default().len() {
+                let value = self.context.groups.unwrap_or_default()[index].clone();
                 self.emit(
                     format!("{prefix}{value}{suffix}"),
                     None,

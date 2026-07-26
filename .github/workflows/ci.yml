@@ -27,6 +27,7 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test --all-targets
           cargo build --release
+          python3 tests/probe_sandbox.py target/release/bashlume-probe
           cargo test --release -- --ignored --nocapture
       - name: Build signed conformance pack
         run: |

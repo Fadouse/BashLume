@@ -701,7 +701,15 @@ impl SupportLibrary {
                 .iter()
                 .any(|function| &function.name == name)
         });
-        if let Some(name) = implicit_name.filter(|_| !has_implicit) {
+        // Zsh and Fish autoload files may use their filename as the implicit
+        // function name. Bash completion modules are sourced for their
+        // declarations instead; treating a command-named `find.bash` as a
+        // function named `find` confuses external commands with helpers and
+        // recursively links unrelated completion modules.
+        if let Some(name) = implicit_name
+            .filter(|_| self.dialect != ScriptDialect::Bash)
+            .filter(|_| !has_implicit)
+        {
             if self.functions.len() >= MAX_SUPPORT_LIBRARY_FUNCTIONS
                 && !self.functions.contains_key(&name)
             {
@@ -732,8 +740,10 @@ impl SupportLibrary {
         if self.functions.contains_key(name) {
             return Ok(());
         }
-        if let Some(path) = self.files.get(name).cloned() {
-            self.load_file(&path)?;
+        if self.dialect != ScriptDialect::Bash || name.starts_with('_') {
+            if let Some(path) = self.files.get(name).cloned() {
+                self.load_file(&path)?;
+            }
         }
         if self.functions.contains_key(name) {
             return Ok(());
@@ -782,7 +792,11 @@ impl SupportLibrary {
         pending.extend(dynamic_function_targets(
             module,
             &analyzed,
-            self.functions.keys().chain(self.files.keys()),
+            self.functions.keys().chain(
+                self.files
+                    .keys()
+                    .filter(|name| self.dialect != ScriptDialect::Bash || name.starts_with('_')),
+            ),
         ));
         while let Some(name) = pending.pop_first() {
             if shell_vm_primitive(&name)
@@ -804,7 +818,11 @@ impl SupportLibrary {
                     pending.extend(dynamic_function_targets(
                         module,
                         &analyzed,
-                        self.functions.keys().chain(self.files.keys()),
+                        self.functions
+                            .keys()
+                            .chain(self.files.keys().filter(|name| {
+                                self.dialect != ScriptDialect::Bash || name.starts_with('_')
+                            })),
                     ));
                 }
                 continue;
@@ -871,6 +889,17 @@ fn dynamic_function_targets<'a>(
             let mut visible = incoming.get(name).cloned().unwrap_or_default();
             let mut invoked = BTreeSet::new();
             collect_dynamic_function_data(&function.body, &mut visible, &mut invoked);
+            // `_comp_compgen` dispatches through `_generator`, but every
+            // generator selected by its call syntax is collected directly by
+            // `comp_compgen_dynamic_target`. Keeping the partial
+            // `_comp_compgen_` assignment here links every generator in the
+            // support library to every command block.
+            if matches!(
+                name.as_str(),
+                "_comp_compgen" | "_comp_compgen__call_generator"
+            ) {
+                invoked.remove("_generator");
+            }
             let mut calls = BTreeSet::new();
             collect_executable_calls(&function.body, &mut calls);
             calls.extend(resolved_dynamic_targets(
@@ -900,6 +929,12 @@ fn dynamic_function_targets<'a>(
         let mut assignments = incoming.remove(&name).unwrap_or(global_assignments.clone());
         let mut invoked = BTreeSet::new();
         collect_dynamic_function_data(&function.body, &mut assignments, &mut invoked);
+        if matches!(
+            name.as_str(),
+            "_comp_compgen" | "_comp_compgen__call_generator"
+        ) {
+            invoked.remove("_generator");
+        }
         collect_dynamic_prefixes(&assignments, &invoked, &mut prefixes);
     }
     candidate_names
@@ -1213,16 +1248,11 @@ fn completion_identifier(value: &str) -> String {
 }
 
 fn comp_compgen_dynamic_target(command: &bashlume::rules::script::ScriptCommand) -> Option<String> {
-    let words = command
-        .words
-        .iter()
-        .map(ScriptWord::as_unquoted_plain_literal)
-        .collect::<Vec<_>>();
     let mut external_command = None;
     let mut internal_command = None;
     let mut index = 1_usize;
-    while index < words.len() {
-        let value = words[index]?;
+    while index < command.words.len() {
+        let value = command.words[index].as_unquoted_plain_literal()?;
         if value == "--" {
             return None;
         }
@@ -1246,18 +1276,20 @@ fn comp_compgen_dynamic_target(command: &bashlume::rules::script::ScriptCommand)
         let mut flag_index = 0_usize;
         while flag_index < flags.len() {
             let flag = flags[flag_index] as char;
-            if matches!(flag, 'x' | 'i' | 'F' | 'v' | 'c' | 'P') {
+            if matches!(flag, 'x' | 'i' | 'F' | 'v' | 'c' | 'C' | 'P' | 'U') {
                 let attached = std::str::from_utf8(&flags[flag_index + 1..]).ok()?;
-                let argument = if attached.is_empty() {
+                if attached.is_empty() {
                     index += 1;
-                    words.get(index).copied().flatten()?
-                } else {
-                    attached
-                };
-                if flag == 'x' {
-                    external_command = Some(argument);
+                    let argument = command.words.get(index)?;
+                    if flag == 'x' {
+                        external_command = Some(argument.as_unquoted_plain_literal()?);
+                    } else if flag == 'i' {
+                        internal_command = Some(argument.as_unquoted_plain_literal()?);
+                    }
+                } else if flag == 'x' {
+                    external_command = Some(attached);
                 } else if flag == 'i' {
-                    internal_command = Some(argument);
+                    internal_command = Some(attached);
                 }
                 break;
             }
@@ -1589,6 +1621,9 @@ fn collect_probe_calls(
                 for word in &command.words {
                     collect_word_probe_calls(word, calls, data_calls, declared);
                 }
+                for redirection in &command.redirections {
+                    collect_word_probe_calls(&redirection.target, calls, data_calls, declared);
+                }
             }
             ScriptStatement::Pipeline { commands, .. } => {
                 for (index, command) in commands.iter().enumerate() {
@@ -1764,7 +1799,11 @@ fn word_uses_registration_service(word: &ScriptWord) -> bool {
             return false;
         };
         let expression = expression.trim_matches(|character| matches!(character, '{' | '}'));
-        matches!(expression, "1" | "service" | "words[1]" | "argv[1]")
+        let name = expression
+            .split(['[', ':', '/', '%', '#', '-', '+'])
+            .next()
+            .unwrap_or_default();
+        matches!(name, "1" | "service" | "words" | "argv" | "comp_args")
     })
 }
 
@@ -1790,11 +1829,17 @@ fn abstract_registration_word_values(
                     .unwrap_or(0);
                 let name = &expression[..name_end];
                 let rest = &expression[name_end..];
-                let mut expanded = if matches!(name, "1" | "service" | "words" | "argv") {
+                let registration_vector = matches!(name, "words" | "argv" | "comp_args");
+                let mut expanded = if matches!(name, "1" | "service") || registration_vector {
                     registrations.iter().cloned().collect::<BTreeSet<_>>()
                 } else {
                     variables.get(name)?.clone()
                 };
+                // The normalized words/argv/comp_args snapshots always start
+                // with the active service. Array subscripts and slices may
+                // narrow the argv tail, but retaining that service is the safe
+                // capability over-approximation for indirect execution.
+                let rest = if registration_vector { "" } else { rest };
                 if let Some(suffix) = rest.strip_prefix("%%").or_else(|| rest.strip_prefix('%')) {
                     if !suffix.contains(['*', '?', '[']) {
                         expanded = expanded
@@ -1879,7 +1924,25 @@ fn collect_derived_external_capabilities(
                         registrations,
                         variables,
                     ) {
-                        variables.insert(assignment.name.clone(), values);
+                        if assignment.append {
+                            variables
+                                .entry(assignment.name.clone())
+                                .or_default()
+                                .extend(values);
+                        } else {
+                            variables.insert(assignment.name.clone(), values);
+                        }
+                    }
+                }
+                let command_name = command
+                    .words
+                    .first()
+                    .and_then(ScriptWord::as_unquoted_plain_literal);
+                if command_name == Some("_comp_dequote") {
+                    if let Some(values) = command.words.get(1).and_then(|word| {
+                        abstract_registration_word_values(word, registrations, variables)
+                    }) {
+                        variables.insert("REPLY".into(), values);
                     }
                 }
                 let command_word = if command
@@ -1900,7 +1963,9 @@ fn collect_derived_external_capabilities(
                         .split(['[', ':', '/', '%', '#'])
                         .next()
                         .unwrap_or_default();
-                    if let Some(values) = variables.get(name) {
+                    if matches!(name, "1" | "service" | "words" | "argv" | "comp_args") {
+                        output.extend(registrations.iter().cloned());
+                    } else if let Some(values) = variables.get(name) {
                         output.extend(values.iter().cloned());
                     }
                 }
@@ -1992,9 +2057,202 @@ fn collect_derived_external_capabilities(
     }
 }
 
+fn positional_parameter_index(word: &ScriptWord) -> Option<usize> {
+    let ScriptWordPart::Parameter { expression, .. } = word.parts.first()? else {
+        return None;
+    };
+    let expression = expression.trim_start_matches('(');
+    if let Some(rest) = expression
+        .strip_prefix('@')
+        .or_else(|| expression.strip_prefix('*'))
+    {
+        return rest
+            .strip_prefix(':')
+            .and_then(|offset| offset.split(':').next())
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .filter(|index| *index > 0)
+            .or(Some(1));
+    }
+    if let Some(rest) = expression.strip_prefix("argv") {
+        return rest
+            .strip_prefix('[')
+            .and_then(|index| index.split([']', '.']).next())
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|index| *index > 0)
+            .or(Some(1));
+    }
+    expression
+        .split(['[', ']', '/', ':', '}', ')'])
+        .next()?
+        .parse::<usize>()
+        .ok()
+        .filter(|index| *index > 0)
+}
+
+fn collect_word_positional_command_indices(word: &ScriptWord, output: &mut BTreeSet<usize>) {
+    for part in &word.parts {
+        match part {
+            ScriptWordPart::CommandSubstitution { statements, .. } => {
+                collect_positional_command_indices(statements, output)
+            }
+            ScriptWordPart::DeferredScript {
+                statements, words, ..
+            } => {
+                collect_positional_command_indices(statements, output);
+                for word in words {
+                    collect_word_positional_command_indices(word, output);
+                }
+            }
+            ScriptWordPart::Array { elements }
+            | ScriptWordPart::BraceExpansion {
+                alternatives: elements,
+                ..
+            } => {
+                for element in elements {
+                    collect_word_positional_command_indices(element, output);
+                }
+            }
+            ScriptWordPart::Literal { .. }
+            | ScriptWordPart::Parameter { .. }
+            | ScriptWordPart::Arithmetic { .. } => {}
+        }
+    }
+}
+
+fn collect_positional_command_indices(
+    statements: &[ScriptStatement],
+    output: &mut BTreeSet<usize>,
+) {
+    for statement in statements {
+        match statement {
+            ScriptStatement::Command { command } => {
+                let command_name = command
+                    .words
+                    .first()
+                    .and_then(ScriptWord::as_unquoted_plain_literal);
+                let command_word = if matches!(
+                    command_name,
+                    Some("command" | "builtin" | "exec" | "noglob")
+                ) {
+                    command.words.iter().skip(1).find(|word| {
+                        word.as_unquoted_plain_literal()
+                            .is_none_or(|argument| !argument.starts_with('-'))
+                    })
+                } else {
+                    command.words.first()
+                };
+                if let Some(index) = command_word.and_then(positional_parameter_index) {
+                    output.insert(index);
+                }
+                for assignment in &command.assignments {
+                    if let Some(index) = &assignment.index {
+                        collect_word_positional_command_indices(index, output);
+                    }
+                    collect_word_positional_command_indices(&assignment.value, output);
+                }
+                for word in &command.words {
+                    collect_word_positional_command_indices(word, output);
+                }
+                for redirection in &command.redirections {
+                    collect_word_positional_command_indices(&redirection.target, output);
+                }
+            }
+            ScriptStatement::Pipeline { commands, .. } => {
+                collect_positional_command_indices(commands, output)
+            }
+            ScriptStatement::AndOr { first, rest } => {
+                collect_positional_command_indices(std::slice::from_ref(first), output);
+                for arm in rest {
+                    collect_positional_command_indices(
+                        std::slice::from_ref(&arm.statement),
+                        output,
+                    );
+                }
+            }
+            ScriptStatement::If {
+                branches,
+                otherwise,
+            } => {
+                for branch in branches {
+                    collect_positional_command_indices(&branch.condition, output);
+                    collect_positional_command_indices(&branch.body, output);
+                }
+                collect_positional_command_indices(otherwise, output);
+            }
+            ScriptStatement::While {
+                condition, body, ..
+            } => {
+                collect_positional_command_indices(condition, output);
+                collect_positional_command_indices(body, output);
+            }
+            ScriptStatement::For { words, body, .. } => {
+                for word in words {
+                    collect_word_positional_command_indices(word, output);
+                }
+                collect_positional_command_indices(body, output);
+            }
+            ScriptStatement::Group { body, .. } => collect_positional_command_indices(body, output),
+            ScriptStatement::Case { word, arms } => {
+                collect_word_positional_command_indices(word, output);
+                for arm in arms {
+                    collect_positional_command_indices(&arm.body, output);
+                }
+            }
+            ScriptStatement::Redirected {
+                statement,
+                redirections,
+            } => {
+                collect_positional_command_indices(std::slice::from_ref(statement), output);
+                for redirection in redirections {
+                    collect_word_positional_command_indices(&redirection.target, output);
+                }
+            }
+            ScriptStatement::Function { .. }
+            | ScriptStatement::Return { .. }
+            | ScriptStatement::Break
+            | ScriptStatement::Continue
+            | ScriptStatement::Noop => {}
+        }
+    }
+}
+
+fn collect_word_positional_command_call_arguments(
+    word: &ScriptWord,
+    targets: &HashMap<String, BTreeSet<usize>>,
+    output: &mut BTreeSet<String>,
+) {
+    for part in &word.parts {
+        match part {
+            ScriptWordPart::CommandSubstitution { statements, .. } => {
+                collect_positional_command_call_arguments(statements, targets, output)
+            }
+            ScriptWordPart::DeferredScript {
+                statements, words, ..
+            } => {
+                collect_positional_command_call_arguments(statements, targets, output);
+                for word in words {
+                    collect_word_positional_command_call_arguments(word, targets, output);
+                }
+            }
+            ScriptWordPart::Array { elements }
+            | ScriptWordPart::BraceExpansion {
+                alternatives: elements,
+                ..
+            } => {
+                for element in elements {
+                    collect_word_positional_command_call_arguments(element, targets, output);
+                }
+            }
+            ScriptWordPart::Literal { .. }
+            | ScriptWordPart::Parameter { .. }
+            | ScriptWordPart::Arithmetic { .. } => {}
+        }
+    }
+}
+
 fn collect_positional_command_call_arguments(
     statements: &[ScriptStatement],
-    targets: &BTreeSet<String>,
+    targets: &HashMap<String, BTreeSet<usize>>,
     output: &mut BTreeSet<String>,
 ) {
     for statement in statements {
@@ -2004,16 +2262,37 @@ fn collect_positional_command_call_arguments(
                     .words
                     .first()
                     .and_then(ScriptWord::as_unquoted_plain_literal);
-                if target.is_some_and(|target| targets.contains(target)) {
-                    if let Some(argument) = command
-                        .words
-                        .iter()
-                        .skip(1)
-                        .find_map(ScriptWord::as_unquoted_plain_literal)
-                        .filter(|argument| !argument.starts_with('-'))
-                    {
-                        output.insert(argument.to_owned());
+                if let Some(indices) = target.and_then(|target| targets.get(target)) {
+                    for index in indices {
+                        if let Some(argument) = command
+                            .words
+                            .get(*index)
+                            .and_then(ScriptWord::as_unquoted_plain_literal)
+                            .filter(|argument| !argument.starts_with('-'))
+                        {
+                            output.insert(argument.to_owned());
+                        }
                     }
+                }
+                for assignment in &command.assignments {
+                    if let Some(index) = &assignment.index {
+                        collect_word_positional_command_call_arguments(index, targets, output);
+                    }
+                    collect_word_positional_command_call_arguments(
+                        &assignment.value,
+                        targets,
+                        output,
+                    );
+                }
+                for word in &command.words {
+                    collect_word_positional_command_call_arguments(word, targets, output);
+                }
+                for redirection in &command.redirections {
+                    collect_word_positional_command_call_arguments(
+                        &redirection.target,
+                        targets,
+                        output,
+                    );
                 }
             }
             ScriptStatement::Pipeline { commands, .. } => {
@@ -2049,20 +2328,37 @@ fn collect_positional_command_call_arguments(
                 collect_positional_command_call_arguments(condition, targets, output);
                 collect_positional_command_call_arguments(body, targets, output);
             }
-            ScriptStatement::For { body, .. } | ScriptStatement::Group { body, .. } => {
+            ScriptStatement::For { words, body, .. } => {
+                for word in words {
+                    collect_word_positional_command_call_arguments(word, targets, output);
+                }
                 collect_positional_command_call_arguments(body, targets, output)
             }
-            ScriptStatement::Case { arms, .. } => {
+            ScriptStatement::Group { body, .. } => {
+                collect_positional_command_call_arguments(body, targets, output)
+            }
+            ScriptStatement::Case { word, arms } => {
+                collect_word_positional_command_call_arguments(word, targets, output);
                 for arm in arms {
                     collect_positional_command_call_arguments(&arm.body, targets, output);
                 }
             }
-            ScriptStatement::Redirected { statement, .. } => {
+            ScriptStatement::Redirected {
+                statement,
+                redirections,
+            } => {
                 collect_positional_command_call_arguments(
                     std::slice::from_ref(statement),
                     targets,
                     output,
-                )
+                );
+                for redirection in redirections {
+                    collect_word_positional_command_call_arguments(
+                        &redirection.target,
+                        targets,
+                        output,
+                    );
+                }
             }
             ScriptStatement::Function { .. }
             | ScriptStatement::Return { .. }
@@ -2141,6 +2437,14 @@ fn script_probe_capabilities(
             collect_executable_calls(&functions_by_name[name.as_str()].body, &mut calls);
         }
     }
+    // bash-completion's help helper constructs an argv array from
+    // `comp_args[0]` and invokes it indirectly. Its default branch therefore
+    // has the same executable identity as the active registration even though
+    // the generic command scanner cannot recover that array dataflow.
+    if linked.contains("_comp_compgen_help__get_help_lines") {
+        calls.insert("@registration-service".into());
+        data_calls.insert("@registration-service".into());
+    }
     let registration_executables = if calls.remove("@registration-service") {
         let mut executables = module
             .registrations
@@ -2157,7 +2461,7 @@ fn script_probe_capabilities(
             .functions
             .iter()
             .filter(|function| linked.contains(&function.name))
-            .filter(|function| {
+            .filter_map(|function| {
                 let mut function_calls = BTreeSet::new();
                 let mut function_data_calls = BTreeSet::new();
                 let mut function_declared = BTreeSet::new();
@@ -2169,10 +2473,15 @@ fn script_probe_capabilities(
                     &mut function_data_calls,
                     &mut function_declared,
                 );
-                function_calls.contains("@registration-service")
+                if function_calls.contains("@registration-service") {
+                    let mut indices = BTreeSet::new();
+                    collect_positional_command_indices(&function.body, &mut indices);
+                    Some((function.name.clone(), indices))
+                } else {
+                    None
+                }
             })
-            .map(|function| function.name.clone())
-            .collect::<BTreeSet<_>>();
+            .collect::<HashMap<_, _>>();
         collect_positional_command_call_arguments(
             &module.statements,
             &positional_targets,
@@ -2205,10 +2514,11 @@ fn script_probe_capabilities(
         })
         .collect::<Vec<_>>();
     let mut derived_external = BTreeSet::new();
+    let mut global_variables = HashMap::new();
     collect_derived_external_capabilities(
         &module.statements,
         &registrations,
-        &mut HashMap::new(),
+        &mut global_variables,
         &mut derived_external,
     );
     for function in module
@@ -2216,10 +2526,11 @@ fn script_probe_capabilities(
         .iter()
         .filter(|function| linked.contains(&function.name))
     {
+        let mut variables = global_variables.clone();
         collect_derived_external_capabilities(
             &function.body,
             &registrations,
-            &mut HashMap::new(),
+            &mut variables,
             &mut derived_external,
         );
     }
@@ -2711,6 +3022,17 @@ mod tests {
 
         let module = parse_script(
             ScriptDialect::Bash,
+            "generator-options.bash",
+            "_entry() { _comp_compgen -c \"$cur\" filedir -d; _comp_compgen -v values -x apt-cache packages; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        calls.clear();
+        collect_executable_calls(&module.functions[0].body, &mut calls);
+        assert!(calls.contains("_comp_compgen_filedir"));
+        assert!(calls.contains("_comp_xfunc_apt_cache_compgen_packages"));
+
+        let module = parse_script(
+            ScriptDialect::Bash,
             "generator.bash",
             "_entry() { _comp_compgen help -c help \"$1\"; }\ncomplete -F _entry demo\n",
         )
@@ -2733,6 +3055,130 @@ mod tests {
             &mut derived,
         );
         assert_eq!(derived, BTreeSet::from(["rustup".to_owned()]));
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "compgen-dispatch.bash",
+            "_comp_compgen() { local _generator=(\"_comp_compgen_$1\"); \"${_generator[@]}\"; }\n",
+        )
+        .unwrap();
+        assert!(
+            dynamic_function_targets(
+                &module,
+                &BTreeSet::from(["_comp_compgen".to_owned()]),
+                ["_comp_compgen_filedir".to_owned()].iter(),
+            )
+            .is_empty(),
+            "the specialized call-site collector, not a global prefix, resolves compgen generators"
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "redirect-capability.bash",
+            "_entry() { read value <<<\"$(\"$1\" --help)\"; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(&module, &BTreeSet::from(["_entry".to_owned()])),
+            ["demo".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "help-capability.bash",
+            "_comp_compgen_help__get_help_lines() { local help_cmd=(\"${REPLY:-false}\" \"$@\"); \"${help_cmd[@]}\"; }\n_entry() { _comp_compgen_help__get_help_lines; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(
+                &module,
+                &BTreeSet::from([
+                    "_comp_compgen_help__get_help_lines".to_owned(),
+                    "_entry".to_owned(),
+                ]),
+            ),
+            ["demo".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "argv-capability.bash",
+            "_entry() { command \"${words[@]::cword}\"; }\ncomplete -F _entry qdbus dcop\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(&module, &BTreeSet::from(["_entry".to_owned()])),
+            ["dcop".to_owned(), "qdbus".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "array-capability.bash",
+            "_entry() { local compcmd=(\"${words[@]:0:cword}\"); compcmd+=(--complete); \"${compcmd[@]}\"; }\ncomplete -F _entry sops\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(&module, &BTreeSet::from(["_entry".to_owned()])),
+            ["sops".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "dequote-capability.bash",
+            "_run() { local REPLY; _comp_dequote \"${comp_args[0]-}\"; \"${REPLY[0]}\" \"$@\"; }\n_entry() { _run -h; }\ncomplete -F _entry tmux\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(
+                &module,
+                &BTreeSet::from(["_entry".to_owned(), "_run".to_owned()]),
+            ),
+            ["tmux".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "global-capability.bash",
+            "tool=myprobe\n_entry() { \"$tool\" --list; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(&module, &BTreeSet::from(["_entry".to_owned()])),
+            ["myprobe".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "local-capability.bash",
+            "_entry() { local tool=myprobe; \"$tool\" --list; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(&module, &BTreeSet::from(["_entry".to_owned()])),
+            ["myprobe".to_owned()]
+        );
+
+        let module = parse_script(
+            ScriptDialect::Bash,
+            "positional-capability.bash",
+            "_run() { \"$2\" --list; }\n_run_all() { \"$@\"; }\n_entry() { _run ignored myprobe; _run_all otherprobe --list; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script_probe_capabilities(
+                &module,
+                &BTreeSet::from([
+                    "_entry".to_owned(),
+                    "_run".to_owned(),
+                    "_run_all".to_owned(),
+                ]),
+            ),
+            [
+                "demo".to_owned(),
+                "myprobe".to_owned(),
+                "otherprobe".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -2911,6 +3357,46 @@ mod tests {
                 .any(|function| function.name == "_small_one")
         );
         assert!(script_probe_capabilities(&module, &reachable).contains(&"probe-tool".to_owned()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_external_commands_do_not_load_command_named_completion_modules() {
+        let root =
+            std::env::temp_dir().join(format!("bashlume-bash-module-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("find.bash"),
+            "_comp_cmd_find() { unrelated-probe; }\ncomplete -F _comp_cmd_find find\n",
+        )
+        .unwrap();
+        let mut library = SupportLibrary {
+            dialect: ScriptDialect::Bash,
+            files: HashMap::new(),
+            functions: HashMap::new(),
+            loaded_files: BTreeSet::new(),
+            zsh_function_roots: Vec::new(),
+            zsh_preloaded_functions: Vec::new(),
+            zsh_preloaded_function_table_size: 0,
+        };
+        library.index_root(&root).unwrap();
+        let mut module = parse_script(
+            ScriptDialect::Bash,
+            "demo.bash",
+            "_entry() { find . -type f; }\ncomplete -F _entry demo\n",
+        )
+        .unwrap();
+        let reachable = library.link(&mut module, &root.join("demo.bash")).unwrap();
+        assert!(
+            !module
+                .functions
+                .iter()
+                .any(|function| { function.name == "find" || function.name == "_comp_cmd_find" })
+        );
+        assert!(
+            !script_probe_capabilities(&module, &reachable).contains(&"unrelated-probe".into())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
