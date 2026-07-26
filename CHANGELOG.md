@@ -12,8 +12,8 @@
 - Replay filesystem tests, globs, regular-file input, nested completion, accounts, hosts, processes, interfaces, signals, commands, functions, and variables from explicit bounded asynchronous snapshots.
 - Preserve native candidate order, descriptions, kinds, spacing, path policy, completion status, quoting, wrappers/services, and provider attribution through strict and full-baseline native differential gates.
 - Harden source/context/regex/arithmetic/pattern/redirection/probe limits, terminal candidate validation, host/include traversal, shell/history snapshots, SIGCHLD coordination, and all hot-path filesystem access.
-- Bound Bash support linking to reachable generators, preserve indirect capabilities through global, argv, dequote, and positional-call dataflow, and reject command-named completion modules as external helper functions.
-- Move probe resource limits into a pre-exec `bashlume-probe` trampoline, close inherited nonstandard descriptors, and confine descendants to a supervisor-owned process group that is killed before leader reaping.
+- Bound Bash support linking to reachable generators, preserve indirect capabilities through global, argv, dequote, and positional-call dataflow, declare every VM external fallback, and reject command-named completion modules as external helper functions.
+- Move probe resource limits into a pre-exec `bashlume-probe` trampoline, preserve sixteen process slots above the caller's real-UID task baseline, close inherited nonstandard descriptors, and confine descendants to a supervisor-owned process group that is killed before leader reaping.
 
 ## 0.1.5 — 2026-07-23
 

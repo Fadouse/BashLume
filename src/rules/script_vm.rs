@@ -2024,6 +2024,7 @@ impl<'a> Machine<'a> {
             "awk" => self.awk_builtin(arguments, input),
             "sed" => sed_builtin(arguments, input),
             "cat" => self.cat_builtin(arguments, input),
+            _ if shell_vm_primitive(name) => Ok(CommandResult::status(127)),
             _ => self.external(name, arguments),
         }
     }
@@ -11499,10 +11500,18 @@ fn zsh_compadd_option_taking_next(value: &str) -> Option<char> {
 mod tests {
     use super::{
         Arithmetic, bounded_fish_regex, bounded_regex, expand_braces, shell_pattern_dialect,
-        zsh_hash_scan_indices, zsh_regex_first_actions,
+        shell_vm_primitive, zsh_hash_scan_indices, zsh_regex_first_actions,
     };
     use crate::rules::script::ScriptDialect;
     use std::collections::HashMap;
+
+    #[test]
+    fn external_fallback_commands_are_not_linker_primitives() {
+        assert!(!shell_vm_primitive("getent"));
+        assert!(!shell_vm_primitive("realpath"));
+        assert!(shell_vm_primitive("kill"));
+        assert!(shell_vm_primitive("zparseopts"));
+    }
 
     #[test]
     fn zsh_runtime_patterns_support_bare_alternation() {
@@ -12007,6 +12016,174 @@ fn bash_compgen_variable_name(name: &str) -> bool {
     !matches!(name, "@" | "*" | "argv" | "_result" | "OPTARG")
         && !name.bytes().all(|byte| byte.is_ascii_digit())
         && !name.starts_with("__bashlume")
+}
+
+/// Commands implemented as VM primitives or shell syntax. Any invocation that
+/// reaches the final dispatcher fallback is rejected rather than converted
+/// into an undeclared external probe.
+pub fn shell_vm_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "" | ":"
+            | "."
+            | "!"
+            | "_alternative"
+            | "_arguments"
+            | "_call_function"
+            | "_call_program"
+            | "_comp_xfunc"
+            | "_default"
+            | "_describe"
+            | "_description"
+            | "_directories"
+            | "_files"
+            | "_message"
+            | "_path_files"
+            | "_regex_arguments"
+            | "_values"
+            | "["
+            | "[["
+            | "(("
+            | "alias"
+            | "always"
+            | "and"
+            | "argparse"
+            | "autoload"
+            | "basename"
+            | "begin"
+            | "bg"
+            | "bind"
+            | "block"
+            | "break"
+            | "breakpoint"
+            | "builtin"
+            | "caller"
+            | "case"
+            | "cd"
+            | "command"
+            | "commandline"
+            | "comparguments"
+            | "compadd"
+            | "compcall"
+            | "compdescribe"
+            | "compfiles"
+            | "compgroups"
+            | "compquote"
+            | "comptags"
+            | "comptry"
+            | "compvalues"
+            | "compdef"
+            | "compgen"
+            | "complete"
+            | "compopt"
+            | "compset"
+            | "contains"
+            | "continue"
+            | "coproc"
+            | "count"
+            | "cut"
+            | "declare"
+            | "dirs"
+            | "dirname"
+            | "disown"
+            | "echo"
+            | "elif"
+            | "else"
+            | "emit"
+            | "emulate"
+            | "enable"
+            | "end"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "false"
+            | "fc"
+            | "fg"
+            | "fi"
+            | "fish_indent"
+            | "fish_key_reader"
+            | "for"
+            | "foreach"
+            | "functions"
+            | "getopts"
+            | "grep"
+            | "hash"
+            | "head"
+            | "help"
+            | "history"
+            | "if"
+            | "integer"
+            | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "math"
+            | "noglob"
+            | "not"
+            | "or"
+            | "path"
+            | "popd"
+            | "print"
+            | "printf"
+            | "pushd"
+            | "pwd"
+            | "random"
+            | "read"
+            | "readarray"
+            | "readonly"
+            | "repeat"
+            | "return"
+            | "sed"
+            | "seq"
+            | "select"
+            | "set"
+            | "set_color"
+            | "setopt"
+            | "shift"
+            | "shopt"
+            | "sort"
+            | "source"
+            | "status"
+            | "strftime"
+            | "string"
+            | "suspend"
+            | "switch"
+            | "tail"
+            | "test"
+            | "then"
+            | "time"
+            | "times"
+            | "trap"
+            | "tr"
+            | "true"
+            | "type"
+            | "typeset"
+            | "ulimit"
+            | "umask"
+            | "unalias"
+            | "unfunction"
+            | "uniq"
+            | "unset"
+            | "unsetopt"
+            | "wait"
+            | "while"
+            | "whence"
+            | "zdelattr"
+            | "zformat"
+            | "zftp"
+            | "zf_ln"
+            | "zgetattr"
+            | "zle"
+            | "zlistattr"
+            | "zmodload"
+            | "zparseopts"
+            | "zsetattr"
+            | "zstat"
+            | "zstyle"
+    )
 }
 
 pub(crate) fn fish_builtin_available(name: &str) -> bool {

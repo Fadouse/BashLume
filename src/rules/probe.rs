@@ -27,6 +27,7 @@ const MAX_PROBE_ENVIRONMENT: usize = 256;
 const MAX_PROBE_ENVIRONMENT_BYTES: usize = 256 * 1024;
 const MAX_PROBE_PATH_BYTES: usize = 64 * 1024;
 const PROBE_HELPER_PROTOCOL: &str = "--bashlume-probe-v1";
+const MAX_PROBE_DESCENDANT_TASKS: u64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct ProbeOutcome {
@@ -881,14 +882,19 @@ fn install_probe_process_filter() -> io::Result<()> {
 
 fn apply_probe_resource_limits(pid: libc::pid_t, timeout_ms: u32) -> io::Result<()> {
     let cpu_seconds = u64::from(timeout_ms).div_ceil(1000).saturating_add(1);
-    let limits = [
+    let mut limits = vec![
         (libc::RLIMIT_CORE, 0_u64, 0_u64),
         (libc::RLIMIT_CPU, cpu_seconds, cpu_seconds),
         (libc::RLIMIT_FSIZE, 8 * 1024 * 1024, 8 * 1024 * 1024),
         (libc::RLIMIT_NOFILE, 64, 64),
-        (libc::RLIMIT_NPROC, 16, 16),
         (libc::RLIMIT_AS, 256 * 1024 * 1024, 256 * 1024 * 1024),
     ];
+    // RLIMIT_NPROC is charged against the real UID, not this process group.
+    // Preserve room for the user's already-running session while limiting the
+    // probe to a small amount of additional process/thread pressure.
+    let tasks = current_uid_task_count()?;
+    let limit = tasks.saturating_add(MAX_PROBE_DESCENDANT_TASKS);
+    limits.push((libc::RLIMIT_NPROC, limit, limit));
     for (resource, soft, hard) in limits {
         let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         let result =
@@ -909,6 +915,41 @@ fn apply_probe_resource_limits(pid: libc::pid_t, timeout_ms: u32) -> io::Result<
         }
     }
     Ok(())
+}
+
+fn current_uid_task_count() -> io::Result<u64> {
+    let uid = unsafe { libc::getuid() };
+    let mut tasks = 0_u64;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry.file_name().as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        let process_tasks = match fs::read_dir(entry.path().join("task")) {
+            Ok(process_tasks) => process_tasks,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for task in process_tasks {
+            let task = match task {
+                Ok(task) => task,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if task.file_name().as_bytes().iter().all(u8::is_ascii_digit) {
+                tasks = tasks.saturating_add(1);
+            }
+        }
+    }
+    Ok(tasks.max(1))
 }
 
 struct SpawnActionsGuard(libc::posix_spawn_file_actions_t);

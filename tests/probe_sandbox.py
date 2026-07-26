@@ -34,6 +34,12 @@ try:
 except OSError as error:
     escape_errno = error.errno
 
+child = os.fork()
+if child == 0:
+    os._exit(0)
+_, child_status = os.waitpid(child, 0)
+fork_succeeded = os.waitstatus_to_exitcode(child_status) == 0
+
 status = {}
 with open("/proc/self/status", encoding="ascii") as source:
     for line in source:
@@ -43,6 +49,7 @@ with open("/proc/self/status", encoding="ascii") as source:
 
 print(json.dumps({
     "escape_errno": escape_errno,
+    "fork_succeeded": fork_succeeded,
     "inherited_closed": inherited_closed,
     "nofile": resource.getrlimit(resource.RLIMIT_NOFILE),
     "nproc": resource.getrlimit(resource.RLIMIT_NPROC),
@@ -76,9 +83,10 @@ print(json.dumps({
         os.close(inherited_peer)
     result = json.loads(completed.stdout)
     assert result["escape_errno"] == 1, result
+    assert result["fork_succeeded"], result
     assert result["inherited_closed"], result
     assert result["nofile"][0] <= 64 and result["nofile"][1] <= 64, result
-    assert result["nproc"][0] <= 16 and result["nproc"][1] <= 16, result
+    assert 0 < result["nproc"][0] <= result["nproc"][1] != -1, result
     assert result["address_space"][0] <= 256 * 1024 * 1024, result
     assert result["address_space"][1] <= 256 * 1024 * 1024, result
     assert result["core"] == [0, 0], result
