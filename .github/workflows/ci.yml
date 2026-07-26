@@ -35,10 +35,19 @@ jobs:
             tests/fixtures/rules/test-signing-key.hex
           target/release/bashlume-pack verify /tmp/bashlume-demo.blp \
             tests/fixtures/rules/test-verifying-key.hex
+      - name: Extract a Bash 5.0 compatibility binary
+        run: |
+          docker run --rm -v "${RUNNER_TEMP}:/out" ubuntu:20.04 \
+            sh -euxc 'cp /bin/bash /out/bash-5.0 && chmod 755 /out/bash-5.0'
+          "${RUNNER_TEMP}/bash-5.0" --version | grep -q 'version 5\.0'
       - name: PTY, tmux, and resource regressions
         run: |
           shellcheck shell/bashlume.bash scripts/check.sh
           python3 tests/pty_smoke.py target/release/libbashlume.so \
+            --rule-pack /tmp/bashlume-demo.blp \
+            --trusted-key tests/fixtures/rules/test-verifying-key.hex
+          python3 tests/pty_smoke.py target/release/libbashlume.so \
+            --bash "${RUNNER_TEMP}/bash-5.0" \
             --rule-pack /tmp/bashlume-demo.blp \
             --trusted-key tests/fixtures/rules/test-verifying-key.hex
           python3 tests/tmux_bottom.py target/release/libbashlume.so

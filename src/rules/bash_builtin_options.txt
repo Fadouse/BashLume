@@ -1,0 +1,77 @@
+!	
+%	
+(( ... ))	
+.	-p
+:	
+[	
+[[ ... ]]	
+alias	-p
+bg	
+bind	-l -p -s -v -P -S -V -X -m -f -q -u -r -x
+break	
+builtin	
+caller	
+case	
+cd	-L -e
+command	-p -V -v
+compgen	-V -a -b -c -d -e -f -g -j -k -s -u -v -o -A -G -W -F -C -X -P -S
+complete	-a -b -c -d -e -f -g -j -k -s -u -v -p -r -D -E -I -o -A -G -W -F -C -X -P -S
+compopt	-o -D -E -I
+continue	
+coproc	
+declare	-a -A -f -F -g -i -I -l -n -r -t -u -x -p
+dirs	-c -l -p -v -N
+disown	-h -a -r
+echo	-n -e -E
+enable	-a -d -n -p -s -f
+eval	
+exec	-c -l -a
+exit	
+export	-f -n -p
+false	
+fc	-e -l -n -r -s
+fg	
+for	
+for ((	
+function	
+getopts	
+hash	-l -r -p -d -t
+help	-d -m -s
+history	-c -d -a -n -r -w -p -s
+if	
+jobs	-l -n -p -r -s -x
+kill	-s -n -i -g -p -e -c -l
+let	
+local	
+logout	
+mapfile	-d -n -O -s -t -u -C -c
+popd	-n -N
+printf	-v
+pushd	-n -N
+pwd	-L -P
+read	-E -e -r -s -a -d -i -n -N -p -t -u
+readarray	-d -n -O -s -t -u -C -c
+readonly	-a -A -f -p
+return	
+select	
+set	-a -b -e -f -h -k -m -n -p -t -u -v -x -B -C -E -H -P -T -o --
+shift	
+shopt	-p -q -s -u -o
+source	-p
+suspend	-f
+test	
+time	-p
+times	
+trap	-P -l -p
+true	
+type	-a -f -p -t -P
+typeset	-a -A -f -F -g -i -I -l -n -r -t -u -x -p
+ulimit	-S -H -a -b -c -d -e -f -i -k -l -m -n -p -q -r -s -t -u -v -x -P -R -T
+umask	-p -S
+unalias	-a
+unset	-f -v -n
+until	
+variables	
+wait	-f -n -p
+while	
+{ ... }	

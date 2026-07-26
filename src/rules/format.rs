@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ir::{CommandProgram, IrError, MAX_COMMAND_BLOCK_BYTES};
+use super::script::{ScriptDialect, registration_matches};
 
 pub const PACK_MAGIC: &[u8; 4] = b"BLPK";
 pub const FORMAT_MAJOR: u16 = 1;
@@ -141,6 +144,38 @@ struct BlockEntry {
     hash: [u8; 32],
 }
 
+fn immutable_pack_mapping(path: &Path) -> Result<Mmap, PackError> {
+    let source = File::open(path)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() < HEADER_SIZE as u64 || metadata.len() > MAX_PACK_BYTES
+    {
+        return Err(PackError::Limit("pack file size"));
+    }
+    let descriptor = unsafe {
+        libc::memfd_create(
+            c"bashlume-pack".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut immutable = unsafe { File::from_raw_fd(descriptor) };
+    let copied = std::io::copy(
+        &mut source.take(MAX_PACK_BYTES.saturating_add(1)),
+        &mut immutable,
+    )?;
+    if copied != metadata.len() {
+        return Err(PackError::Integrity("pack changed while opening"));
+    }
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(immutable.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mapping = unsafe { MmapOptions::new().map(&immutable)? };
+    Ok(mapping)
+}
+
 pub struct PackFile {
     path: PathBuf,
     mapping: Mmap,
@@ -160,16 +195,10 @@ pub struct PackFile {
 impl PackFile {
     pub fn open(path: impl AsRef<Path>, trusted_keys: &TrustedKeys) -> Result<Self, PackError> {
         let path = path.as_ref().to_owned();
-        let file = File::open(&path)?;
-        let metadata = file.metadata()?;
-        if metadata.len() < HEADER_SIZE as u64 || metadata.len() > MAX_PACK_BYTES {
-            return Err(PackError::Limit("pack file size"));
-        }
-        // SAFETY: the mapping is read-only and retained for no longer than the
-        // owning PackFile. A pack installed in an immutable store cannot be
-        // concurrently truncated; malformed mutable files still fail bounds
-        // checks before any indexed access.
-        let mapping = unsafe { MmapOptions::new().map(&file)? };
+        // Copy into a sealed anonymous file before mapping. This keeps lazy,
+        // file-backed block access while making concurrent replacement or
+        // truncation of a mutable installation path unable to SIGBUS Bash.
+        let mapping = immutable_pack_mapping(&path)?;
         let header = mapping.get(..HEADER_SIZE).ok_or(PackError::Truncated)?;
         if header.get(..4) != Some(PACK_MAGIC.as_slice()) {
             return Err(PackError::Invalid("invalid pack magic"));
@@ -328,7 +357,7 @@ impl PackFile {
     }
 
     pub fn contains_command(&self, command: &str) -> bool {
-        self.find_block(command).is_some()
+        !self.matching_block_ids(command).is_empty()
     }
 
     pub fn command_names(&self) -> impl Iterator<Item = &str> {
@@ -339,6 +368,17 @@ impl PackFile {
         let Some(block_id) = self.find_block(command) else {
             return Ok(None);
         };
+        self.load_block(block_id).map(Some)
+    }
+
+    pub fn load_matching_commands(&self, command: &str) -> Result<Vec<CommandProgram>, PackError> {
+        self.matching_block_ids(command)
+            .into_iter()
+            .map(|block_id| self.load_block(block_id))
+            .collect()
+    }
+
+    fn load_block(&self, block_id: u32) -> Result<CommandProgram, PackError> {
         let block = self
             .blocks
             .get(block_id as usize)
@@ -366,12 +406,38 @@ impl PackFile {
                 .probe_capabilities
                 .iter()
                 .any(|capability| capability == &probe.executable)
+        }) || program.scripts.iter().any(|module| {
+            module.probe_capabilities.iter().any(|capability| {
+                !self
+                    .manifest
+                    .probe_capabilities
+                    .iter()
+                    .any(|declared| declared == capability)
+            })
         }) {
             return Err(PackError::Invalid(
                 "command block requests an undeclared probe capability",
             ));
         }
-        Ok(Some(program))
+        Ok(program)
+    }
+
+    fn matching_block_ids(&self, command: &str) -> Vec<u32> {
+        let dialect = match self.source_kind() {
+            SourceKind::Bash => ScriptDialect::Bash,
+            SourceKind::Zsh => ScriptDialect::Zsh,
+            SourceKind::Fish => ScriptDialect::Fish,
+            SourceKind::User => ScriptDialect::Bash,
+        };
+        let mut blocks = self
+            .names
+            .iter()
+            .filter(|entry| registration_matches(dialect, &entry.name, command))
+            .map(|entry| entry.block_id)
+            .collect::<Vec<_>>();
+        blocks.sort_unstable();
+        blocks.dedup();
+        blocks
     }
 
     fn find_block(&self, command: &str) -> Option<u32> {
@@ -866,11 +932,15 @@ impl From<serde_json::Error> for PackError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::rules::ir::{
         AppendPolicy, CandidateTemplate, PathCompletion, PredicateOp, RuleCandidateKind, StaticRule,
     };
+    use crate::rules::script::ScriptDialect;
+    use crate::rules::script_parser::parse_script;
+    use crate::rules::vm::{EvaluationContext, EvaluationMode, evaluate};
 
     fn command(name: &str) -> CommandProgram {
         CommandProgram {
@@ -892,6 +962,7 @@ mod tests {
                 }],
             }],
             probes: Vec::new(),
+            scripts: Vec::new(),
         }
     }
 
@@ -918,10 +989,12 @@ mod tests {
     }
 
     fn temporary_pack(bytes: &[u8]) -> PathBuf {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "bashlume-pack-{}-{}.blp",
+            "bashlume-pack-{}-{}-{}.blp",
             std::process::id(),
-            Sha256::digest(bytes)[0]
+            Sha256::digest(bytes)[0],
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::write(&path, bytes).unwrap();
         path
@@ -958,6 +1031,92 @@ mod tests {
     }
 
     #[test]
+    fn signed_script_capability_is_authorized_only_by_a_trusted_key() {
+        let mut spec = spec();
+        let mut module = parse_script(
+            ScriptDialect::Bash,
+            "completions/demo.bash",
+            "_demo() { COMPREPLY=( $(probe-tool --items) ); }\ncomplete -F _demo git\n",
+        )
+        .unwrap();
+        module.probe_capabilities = vec!["probe-tool".into()];
+        spec.manifest.probe_capabilities = vec!["probe-tool".into()];
+        spec.commands[0].scripts.push(module);
+        let signing = SigningKey::from_bytes(&[9; 32]);
+        let bytes = PackBuilder::new(spec).build(Some(&signing)).unwrap();
+        let path = temporary_pack(&bytes);
+        let words = vec!["git".into(), String::new()];
+        let environment = std::collections::HashMap::new();
+        let context = EvaluationContext {
+            current_word: "",
+            words: &words,
+            word_index: 1,
+            command_path: &words[..1],
+            environment: &environment,
+            working_directory: Path::new("/tmp"),
+            available_commands: None,
+            shell_commands: None,
+            shell_functions: None,
+            shell_variables: None,
+            shell_variable_values: None,
+            users: None,
+            groups: None,
+            hosts: None,
+            process_ids: None,
+            process_names: None,
+            network_interfaces: None,
+            signals: None,
+            passwd_records: None,
+            group_records: None,
+            effective_user_id: 1000,
+        };
+
+        let untrusted = PackFile::open(&path, &TrustedKeys::default()).unwrap();
+        let program = untrusted.load_command("git").unwrap().unwrap();
+        let denied = evaluate(
+            &program,
+            &context,
+            SourceKind::Bash,
+            untrusted.trust(),
+            EvaluationMode::ExplicitTab,
+            128,
+        )
+        .unwrap();
+        assert!(denied.probes.is_empty());
+        assert_eq!(denied.denied_probe_count, 1);
+
+        let mut keys = TrustedKeys::default();
+        keys.insert(signing.verifying_key());
+        let trusted = PackFile::open(&path, &keys).unwrap();
+        let program = trusted.load_command("git").unwrap().unwrap();
+        let authorized = evaluate(
+            &program,
+            &context,
+            SourceKind::Bash,
+            trusted.trust(),
+            EvaluationMode::ExplicitTab,
+            128,
+        )
+        .unwrap();
+        assert_eq!(authorized.probes.len(), 1);
+        assert_eq!(authorized.probes[0].key.executable, "probe-tool");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opened_pack_is_immutable_against_path_truncation() {
+        let bytes = PackBuilder::new(spec()).build(None).unwrap();
+        let path = temporary_pack(&bytes);
+        let pack = PackFile::open(&path, &TrustedKeys::default()).unwrap();
+        fs::write(&path, []).unwrap();
+        assert_eq!(
+            pack.load_command("git").unwrap().unwrap().canonical_name,
+            "git"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn metadata_and_command_corruption_are_detected() {
         let bytes = PackBuilder::new(spec()).build(None).unwrap();
         let mut metadata_corrupt = bytes.clone();
@@ -978,6 +1137,61 @@ mod tests {
         assert!(matches!(
             pack.load_command("git"),
             Err(PackError::Integrity(_))
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_pack_mutations_never_panic() {
+        let bytes = PackBuilder::new(spec()).build(None).unwrap();
+        let stride = (bytes.len() / 32).max(1);
+        for index in (0..bytes.len()).step_by(stride).take(32) {
+            let mut mutated = bytes.clone();
+            mutated[index] ^= 0xa5;
+            let path = temporary_pack(&mutated);
+            let outcome = std::panic::catch_unwind(|| {
+                if let Ok(pack) = PackFile::open(&path, &TrustedKeys::default()) {
+                    let _ = pack.load_command("git");
+                }
+            });
+            assert!(outcome.is_ok(), "mutation at byte {index} panicked");
+            fs::remove_file(path).unwrap();
+        }
+        for end in [0, 1, HEADER_SIZE / 2, HEADER_SIZE, bytes.len() / 2] {
+            let path = temporary_pack(&bytes[..end]);
+            let outcome = std::panic::catch_unwind(|| {
+                let _ = PackFile::open(&path, &TrustedKeys::default());
+            });
+            assert!(outcome.is_ok(), "truncation at byte {end} panicked");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn undeclared_probe_capability_is_rejected_when_block_is_loaded() {
+        let mut spec = spec();
+        spec.commands[0].probes.push(crate::rules::ir::ProbeSpec {
+            id: "dynamic".into(),
+            when: vec![PredicateOp::True],
+            executable: "printf".into(),
+            arguments: vec!["value".into()],
+            environment: Vec::new(),
+            parser: crate::rules::ir::ProbeParser::Lines,
+            candidate_kind: RuleCandidateKind::Value,
+            append: AppendPolicy::Space,
+            timeout_ms: 100,
+            output_limit: 1024,
+            cache_ttl_ms: 1000,
+            description: None,
+        });
+        let bytes = PackBuilder::new(spec).build(None).unwrap();
+        let path = temporary_pack(&bytes);
+        let pack = PackFile::open(&path, &TrustedKeys::default()).unwrap();
+        assert!(matches!(
+            pack.load_command("git"),
+            Err(PackError::Invalid(
+                "command block requests an undeclared probe capability"
+            ))
         ));
         fs::remove_file(path).unwrap();
     }

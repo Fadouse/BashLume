@@ -4,9 +4,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::script::ScriptModule;
+
 pub const COMMAND_BLOCK_MAGIC: &[u8; 4] = b"BLIR";
-pub const COMMAND_BLOCK_VERSION: u16 = 2;
-pub const PREVIOUS_COMMAND_BLOCK_VERSION: u16 = 1;
+pub const COMMAND_BLOCK_VERSION: u16 = 4;
+pub const PREVIOUS_COMMAND_BLOCK_VERSION: u16 = 3;
+pub const LEGACY_COMMAND_BLOCK_VERSION: u16 = 1;
 pub const MAX_COMMAND_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_REGISTRATIONS: usize = 4096;
 pub const MAX_RULES: usize = 65_536;
@@ -264,6 +267,8 @@ pub struct CommandProgram {
     pub static_rules: Vec<StaticRule>,
     #[serde(default)]
     pub probes: Vec<ProbeSpec>,
+    #[serde(default)]
+    pub scripts: Vec<ScriptModule>,
 }
 
 impl CommandProgram {
@@ -279,6 +284,11 @@ impl CommandProgram {
         }
         if self.probes.len() > MAX_PROBES {
             return Err(IrError::Limit("dynamic probes"));
+        }
+        for script in &self.scripts {
+            script
+                .validate()
+                .map_err(|_| IrError::Invalid("invalid shell script IR"))?;
         }
         let mut string_bytes = self
             .canonical_name
@@ -371,9 +381,13 @@ impl CommandProgram {
 
     fn encode_version(&self, block_version: u16) -> Result<Vec<u8>, IrError> {
         self.validate()?;
-        if block_version != COMMAND_BLOCK_VERSION && block_version != PREVIOUS_COMMAND_BLOCK_VERSION
-        {
+        if !(LEGACY_COMMAND_BLOCK_VERSION..=COMMAND_BLOCK_VERSION).contains(&block_version) {
             return Err(IrError::Invalid("unsupported command block version"));
+        }
+        if block_version < 4 && self.scripts.iter().any(ScriptModule::requires_block_v4) {
+            return Err(IrError::Invalid(
+                "script feature requires command block version 4",
+            ));
         }
         let mut encoder = Encoder::new();
         encoder.bytes.extend_from_slice(COMMAND_BLOCK_MAGIC);
@@ -415,6 +429,11 @@ impl CommandProgram {
             encoder.u32(probe.cache_ttl_ms);
             encoder.optional_string(probe.description.as_deref())?;
         }
+        if block_version >= 3 {
+            let scripts = serde_json::to_vec(&self.scripts)
+                .map_err(|_| IrError::Invalid("script serialization failed"))?;
+            encoder.blob(&scripts)?;
+        }
         if encoder.bytes.len() > MAX_COMMAND_BLOCK_BYTES {
             return Err(IrError::Limit("encoded command block"));
         }
@@ -430,8 +449,7 @@ impl CommandProgram {
             return Err(IrError::Invalid("invalid command block magic"));
         }
         let block_version = decoder.u16()?;
-        if block_version != COMMAND_BLOCK_VERSION && block_version != PREVIOUS_COMMAND_BLOCK_VERSION
-        {
+        if !(LEGACY_COMMAND_BLOCK_VERSION..=COMMAND_BLOCK_VERSION).contains(&block_version) {
             return Err(IrError::Invalid("unsupported command block version"));
         }
         if decoder.u16()? != 0 {
@@ -499,6 +517,24 @@ impl CommandProgram {
                 description,
             });
         }
+        let scripts = if block_version >= 3 {
+            let bytes = decoder.blob(MAX_COMMAND_BLOCK_BYTES)?;
+            let scripts: Vec<ScriptModule> = serde_json::from_slice(bytes)
+                .map_err(|_| IrError::Invalid("invalid script encoding"))?;
+            for script in &scripts {
+                script
+                    .validate()
+                    .map_err(|_| IrError::Invalid("invalid shell script IR"))?;
+            }
+            if block_version < 4 && scripts.iter().any(ScriptModule::requires_block_v4) {
+                return Err(IrError::Invalid(
+                    "script feature requires command block version 4",
+                ));
+            }
+            scripts
+        } else {
+            Vec::new()
+        };
         if !decoder.remaining().is_empty() {
             return Err(IrError::Invalid("trailing command block bytes"));
         }
@@ -510,6 +546,7 @@ impl CommandProgram {
             license,
             static_rules,
             probes,
+            scripts,
         };
         program.validate()?;
         Ok(program)
@@ -519,7 +556,7 @@ impl CommandProgram {
 fn validate_executable(value: &str) -> Result<(), IrError> {
     validate_string(value)?;
     if value.is_empty()
-        || value.contains('\0')
+        || value.contains(['/', '\0'])
         || value.contains(char::is_whitespace)
         || matches!(value, "sh" | "bash" | "dash" | "zsh" | "fish")
         || value.ends_with("/sh")
@@ -541,6 +578,15 @@ fn validate_candidate(candidate: &CandidateTemplate) -> Result<(), IrError> {
     }
     if candidate.value.is_empty() {
         return Err(IrError::Invalid("candidate insertion value is empty"));
+    }
+    if candidate.value.chars().any(char::is_control)
+        || candidate.display.chars().any(char::is_control)
+        || candidate
+            .description
+            .as_ref()
+            .is_some_and(|description| description.chars().any(char::is_control))
+    {
+        return Err(IrError::Invalid("candidate contains a control character"));
     }
     Ok(())
 }
@@ -765,6 +811,12 @@ impl Encoder {
         Ok(())
     }
 
+    fn blob(&mut self, value: &[u8]) -> Result<(), IrError> {
+        self.count(value.len())?;
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
     fn string(&mut self, value: &str) -> Result<(), IrError> {
         validate_string(value)?;
         self.count(value.len())?;
@@ -846,6 +898,11 @@ impl<'a> Decoder<'a> {
             return Err(IrError::Limit("decoded count"));
         }
         Ok(value)
+    }
+
+    fn blob(&mut self, maximum: usize) -> Result<&'a [u8], IrError> {
+        let length = self.count(maximum)?;
+        self.take(length)
     }
 
     fn string(&mut self) -> Result<String, IrError> {
@@ -937,6 +994,7 @@ mod tests {
                 cache_ttl_ms: 1000,
                 description: Some("Git ref".into()),
             }],
+            scripts: Vec::new(),
         }
     }
 
@@ -948,14 +1006,70 @@ mod tests {
     }
 
     #[test]
-    fn previous_command_block_version_remains_decodable() {
+    fn static_candidate_control_characters_are_rejected() {
+        let mut program = fixture();
+        program.static_rules[0].candidates[0].display = "unsafe\nrow".into();
+        assert!(matches!(program.validate(), Err(IrError::Invalid(_))));
+    }
+
+    #[test]
+    fn previous_command_block_versions_remain_decodable() {
         let program = fixture();
         let bytes = program
             .encode_version(PREVIOUS_COMMAND_BLOCK_VERSION)
             .unwrap();
-        let mut expected = program;
-        expected.static_rules[0].path_completion = PathCompletion::Inherit;
-        assert_eq!(CommandProgram::decode(&bytes).unwrap(), expected);
+        assert_eq!(CommandProgram::decode(&bytes).unwrap(), program);
+
+        let bytes = program.encode_version(2).unwrap();
+        assert_eq!(CommandProgram::decode(&bytes).unwrap(), program);
+
+        let bytes = program
+            .encode_version(LEGACY_COMMAND_BLOCK_VERSION)
+            .unwrap();
+        let mut legacy_expected = program;
+        legacy_expected.static_rules[0].path_completion = PathCompletion::Inherit;
+        assert_eq!(CommandProgram::decode(&bytes).unwrap(), legacy_expected);
+    }
+
+    #[test]
+    fn compound_redirection_requires_command_block_version_four() {
+        let mut program = fixture();
+        program.scripts.push(
+            crate::rules::script_parser::parse_script(
+                crate::rules::script::ScriptDialect::Bash,
+                "redirected.bash",
+                "while read value; do :; done <<< input\n",
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            program.encode_version(PREVIOUS_COMMAND_BLOCK_VERSION),
+            Err(IrError::Invalid(
+                "script feature requires command block version 4"
+            ))
+        ));
+        let bytes = program.encode().unwrap();
+        let decoded = CommandProgram::decode(&bytes).unwrap();
+        assert_eq!(decoded.canonical_name, program.canonical_name);
+        assert!(matches!(
+            decoded.scripts[0].statements[0],
+            crate::rules::script::ScriptStatement::Redirected { .. }
+        ));
+
+        program.scripts = vec![
+            crate::rules::script_parser::parse_script(
+                crate::rules::script::ScriptDialect::Zsh,
+                "dynamic.zsh",
+                "define() { local name=$1; eval \"$name () { true; }\"; }\n",
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            program.encode_version(PREVIOUS_COMMAND_BLOCK_VERSION),
+            Err(IrError::Invalid(
+                "script feature requires command block version 4"
+            ))
+        ));
     }
 
     #[test]

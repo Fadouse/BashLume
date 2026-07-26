@@ -25,6 +25,7 @@ dependencies = [
  "hex",
  "libc",
  "memmap2",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

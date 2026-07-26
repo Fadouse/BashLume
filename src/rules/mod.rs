@@ -9,4 +9,7 @@ pub mod format;
 pub mod ir;
 pub mod loader;
 pub mod probe;
+pub mod script;
+pub mod script_parser;
+pub mod script_vm;
 pub mod vm;

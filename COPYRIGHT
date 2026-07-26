@@ -10,3 +10,8 @@ BashLume is distributed in the hope that it will be useful, but WITHOUT
 ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE. See LICENSE for the full GNU General
 Public License.
+
+The files src/rules/bash_help_topics.txt, bash_builtin_options.txt, and
+readline_binding_names.txt contain only independently reduced public interface
+names and option tokens used for compatibility. They do not contain GNU Bash
+or GNU Readline implementation source or descriptive help prose.

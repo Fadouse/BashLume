@@ -76,9 +76,30 @@ class Session:
 
     def close(self) -> None:
         try:
-            self.send(b"exit\n", 0.2)
+            self.send(b"\x07\x15exit\n", 0.2)
         except OSError:
             pass
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                waited, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if waited == self.pid:
+                return
+            time.sleep(0.02)
+        for signal in (15, 9):
+            try:
+                os.kill(self.pid, signal)
+            except ProcessLookupError:
+                return
+            try:
+                waited, _ = os.waitpid(self.pid, os.WNOHANG)
+                if waited == self.pid:
+                    return
+            except ChildProcessError:
+                return
+            time.sleep(0.1)
         try:
             os.waitpid(self.pid, 0)
         except ChildProcessError:

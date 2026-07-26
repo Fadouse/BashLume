@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::VerifyingKey;
 
 use super::format::{PackFile, SourceKind, TrustStatus, TrustedKeys};
 use super::ir::CommandProgram;
+use super::script::{
+    ScriptDialect, ScriptModule, ScriptStatement, ScriptWord, ScriptWordPart, registration_matches,
+};
 
 pub const MAX_DISCOVERED_PACKS: usize = 128;
 pub const MAX_TRUSTED_KEYS: usize = 64;
@@ -37,6 +41,7 @@ pub struct LoadedProgram {
     pub pack_version: String,
     pub source: SourceKind,
     pub trust: TrustStatus,
+    pub required_commands: Vec<String>,
     pub program: CommandProgram,
 }
 
@@ -118,26 +123,191 @@ impl RuleStore {
             if !pack.contains_command(command) {
                 continue;
             }
-            match pack.load_command(command) {
-                Ok(Some(program)) if program.registrations.iter().any(|name| name == command) => {
-                    programs.push(LoadedProgram {
-                        pack_id: pack.pack_id(),
-                        pack_name: pack.manifest().pack_id.clone(),
-                        pack_version: pack.manifest().pack_version.clone(),
-                        source: pack.source_kind(),
-                        trust: pack.trust(),
-                        program,
-                    });
+            let dialect = match pack.source_kind() {
+                SourceKind::Bash => ScriptDialect::Bash,
+                SourceKind::Zsh => ScriptDialect::Zsh,
+                SourceKind::Fish => ScriptDialect::Fish,
+                SourceKind::User => ScriptDialect::Bash,
+            };
+            match pack.load_matching_commands(command) {
+                Ok(matches) => {
+                    for program in matches {
+                        if !program
+                            .registrations
+                            .iter()
+                            .any(|name| registration_matches(dialect, name, command))
+                        {
+                            errors.push(format!(
+                                "{}: command block does not register {command}",
+                                pack.path().display()
+                            ));
+                            continue;
+                        }
+                        let required_commands = required_commands(&program);
+                        programs.push(LoadedProgram {
+                            pack_id: pack.pack_id(),
+                            pack_name: pack.manifest().pack_id.clone(),
+                            pack_version: pack.manifest().pack_version.clone(),
+                            source: pack.source_kind(),
+                            trust: pack.trust(),
+                            required_commands,
+                            program,
+                        });
+                    }
                 }
-                Ok(Some(_)) => errors.push(format!(
-                    "{}: command block does not register {command}",
-                    pack.path().display()
-                )),
-                Ok(None) => {}
                 Err(error) => errors.push(format!("{}: {error}", pack.path().display())),
             }
         }
         (programs, errors)
+    }
+}
+
+fn required_commands(program: &CommandProgram) -> Vec<String> {
+    let mut commands = BTreeSet::new();
+    for module in &program.scripts {
+        let mut module_commands = BTreeSet::new();
+        if module.dialect == ScriptDialect::Fish {
+            module_commands.extend(
+                module
+                    .registrations
+                    .iter()
+                    .filter_map(|registration| registration.service.clone()),
+            );
+        }
+        collect_required_commands(module, &mut module_commands);
+        for function in &module.functions {
+            module_commands.remove(&function.name);
+        }
+        if module.dialect == ScriptDialect::Fish {
+            module_commands.retain(|name| !super::script_vm::fish_builtin_available(name));
+        }
+        commands.extend(module_commands);
+    }
+    commands.into_iter().collect()
+}
+
+fn collect_required_commands(module: &ScriptModule, commands: &mut BTreeSet<String>) {
+    collect_statement_requirements(&module.statements, commands);
+    for function in &module.functions {
+        collect_statement_requirements(&function.body, commands);
+    }
+}
+
+fn collect_statement_requirements(statements: &[ScriptStatement], commands: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            ScriptStatement::Command { command } => {
+                let name = command
+                    .words
+                    .first()
+                    .and_then(ScriptWord::as_unquoted_plain_literal);
+                if let Some(name) =
+                    name.filter(|name| super::script_vm::emulated_external_command(name))
+                {
+                    commands.insert(name.to_owned());
+                }
+                if matches!(name, Some("command" | "type" | "whence" | "which")) {
+                    for target in command
+                        .words
+                        .iter()
+                        .skip(1)
+                        .filter_map(ScriptWord::as_unquoted_plain_literal)
+                        .filter(|argument| !argument.starts_with('-'))
+                    {
+                        commands.insert(target.to_owned());
+                    }
+                }
+                for word in &command.words {
+                    collect_word_requirements(word, commands);
+                }
+                for assignment in &command.assignments {
+                    collect_word_requirements(&assignment.value, commands);
+                    if let Some(index) = &assignment.index {
+                        collect_word_requirements(index, commands);
+                    }
+                }
+                for redirection in &command.redirections {
+                    collect_word_requirements(&redirection.target, commands);
+                }
+            }
+            ScriptStatement::AndOr { first, rest } => {
+                collect_statement_requirements(std::slice::from_ref(first), commands);
+                for arm in rest {
+                    collect_statement_requirements(std::slice::from_ref(&arm.statement), commands);
+                }
+            }
+            ScriptStatement::Pipeline {
+                commands: pipeline, ..
+            } => collect_statement_requirements(pipeline, commands),
+            ScriptStatement::If {
+                branches,
+                otherwise,
+            } => {
+                for branch in branches {
+                    collect_statement_requirements(&branch.condition, commands);
+                    collect_statement_requirements(&branch.body, commands);
+                }
+                collect_statement_requirements(otherwise, commands);
+            }
+            ScriptStatement::While {
+                condition, body, ..
+            } => {
+                collect_statement_requirements(condition, commands);
+                collect_statement_requirements(body, commands);
+            }
+            ScriptStatement::For { words, body, .. } => {
+                for word in words {
+                    collect_word_requirements(word, commands);
+                }
+                collect_statement_requirements(body, commands);
+            }
+            ScriptStatement::Case { word, arms } => {
+                collect_word_requirements(word, commands);
+                for arm in arms {
+                    for pattern in &arm.patterns {
+                        collect_word_requirements(pattern, commands);
+                    }
+                    collect_statement_requirements(&arm.body, commands);
+                }
+            }
+            ScriptStatement::Function { function } => {
+                collect_statement_requirements(&function.body, commands)
+            }
+            ScriptStatement::Group { body, .. } => collect_statement_requirements(body, commands),
+            ScriptStatement::Return {
+                status: Some(status),
+            } => collect_word_requirements(status, commands),
+            _ => {}
+        }
+    }
+}
+
+fn collect_word_requirements(word: &ScriptWord, commands: &mut BTreeSet<String>) {
+    for part in &word.parts {
+        match part {
+            ScriptWordPart::CommandSubstitution { statements, .. } => {
+                collect_statement_requirements(statements, commands)
+            }
+            ScriptWordPart::DeferredScript {
+                statements, words, ..
+            } => {
+                collect_statement_requirements(statements, commands);
+                for word in words {
+                    collect_word_requirements(word, commands);
+                }
+            }
+            ScriptWordPart::BraceExpansion { alternatives, .. } => {
+                for alternative in alternatives {
+                    collect_word_requirements(alternative, commands);
+                }
+            }
+            ScriptWordPart::Array { elements } => {
+                for element in elements {
+                    collect_word_requirements(element, commands);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -178,12 +348,20 @@ fn discover_files(paths: &[PathBuf]) -> Vec<PathBuf> {
         let Ok(directory) = fs::read_dir(&normalized) else {
             continue;
         };
-        let mut children = directory
+        let mut children = Vec::new();
+        for child in directory
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.is_file() && is_pack(path))
-            .collect::<Vec<_>>();
+        {
+            children.push(child);
+            if children.len() >= MAX_DISCOVERED_PACKS * 2 {
+                children.sort_unstable();
+                children.truncate(MAX_DISCOVERED_PACKS);
+            }
+        }
         children.sort_unstable();
+        children.truncate(MAX_DISCOVERED_PACKS);
         for child in children {
             if files.len() >= MAX_DISCOVERED_PACKS {
                 break;
@@ -215,7 +393,8 @@ fn load_trusted_keys(paths: &[PathBuf]) -> (TrustedKeys, Vec<String>) {
         let Ok(directory) = fs::read_dir(&normalized) else {
             continue;
         };
-        let mut children = directory
+        let mut children = Vec::new();
+        for child in directory
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
@@ -224,8 +403,15 @@ fn load_trusted_keys(paths: &[PathBuf]) -> (TrustedKeys, Vec<String>) {
                         extension == "pub" || extension == "hex" || extension == "key"
                     })
             })
-            .collect::<Vec<_>>();
+        {
+            children.push(child);
+            if children.len() >= MAX_TRUSTED_KEYS * 2 {
+                children.sort_unstable();
+                children.truncate(MAX_TRUSTED_KEYS);
+            }
+        }
         children.sort_unstable();
+        children.truncate(MAX_TRUSTED_KEYS);
         for child in children {
             if key_files.len() >= MAX_TRUSTED_KEYS {
                 break;
@@ -241,7 +427,16 @@ fn load_trusted_keys(paths: &[PathBuf]) -> (TrustedKeys, Vec<String>) {
     let mut errors = Vec::new();
     for path in key_files {
         let result = (|| {
-            let text = fs::read_to_string(&path)?;
+            let mut text = Vec::new();
+            fs::File::open(&path)?.take(4097).read_to_end(&mut text)?;
+            if text.len() > 4096 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "verifying key file exceeds 4096 bytes",
+                ));
+            }
+            let text = String::from_utf8(text)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             let bytes = hex::decode(text.trim()).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;

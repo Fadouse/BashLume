@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::ir::ProbeParser;
@@ -14,31 +15,58 @@ pub const MAX_CONCURRENT_PROBES: usize = 2;
 pub const MAX_QUEUED_PROBES: usize = 128;
 pub const MAX_PARSED_PROBE_VALUES: usize = 4096;
 pub const MAX_PROBE_VALUE_BYTES: usize = 64 * 1024;
+const MAX_PROBE_ARGUMENTS: usize = 1024;
+const MAX_PROBE_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_PROBE_ENVIRONMENT: usize = 256;
+const MAX_PROBE_ENVIRONMENT_BYTES: usize = 256 * 1024;
+const MAX_PROBE_PATH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ProbeOutcome {
     pub request: ProbeRequest,
+    pub status: i32,
     pub values: Vec<String>,
+    pub truncated: bool,
     pub error: Option<String>,
     pub completed_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProbeIdentity {
+    key: ProbeKey,
+    timeout_ms: u32,
+    output_limit: u32,
+    cache_ttl_ms: u32,
+}
+
+impl From<&ProbeRequest> for ProbeIdentity {
+    fn from(request: &ProbeRequest) -> Self {
+        Self {
+            key: request.key.clone(),
+            timeout_ms: request.timeout_ms,
+            output_limit: request.output_limit,
+            cache_ttl_ms: request.cache_ttl_ms,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct ProbeSupervisor {
     queued: VecDeque<ProbeRequest>,
     active: Vec<ActiveProbe>,
-    known: HashSet<ProbeKey>,
+    known: HashSet<ProbeIdentity>,
 }
 
 impl ProbeSupervisor {
     pub fn submit(&mut self, request: ProbeRequest) -> bool {
+        let identity = ProbeIdentity::from(&request);
         if !request.dynamic_authorized
-            || self.known.contains(&request.key)
+            || self.known.contains(&identity)
             || self.known.len() >= MAX_QUEUED_PROBES + MAX_CONCURRENT_PROBES
         {
             return false;
         }
-        self.known.insert(request.key.clone());
+        self.known.insert(identity);
         self.queued.push_back(request);
         self.start_ready();
         true
@@ -56,12 +84,19 @@ impl ProbeSupervisor {
             let result = self.active[index].poll(now);
             match result {
                 ProbePoll::Pending => index += 1,
-                ProbePoll::Complete { values, error } => {
+                ProbePoll::Complete {
+                    status,
+                    values,
+                    truncated,
+                    error,
+                } => {
                     let active = self.active.swap_remove(index);
-                    self.known.remove(&active.request.key);
+                    self.known.remove(&ProbeIdentity::from(&active.request));
                     outcomes.push(ProbeOutcome {
                         request: active.request.clone(),
+                        status,
                         values,
+                        truncated,
                         error,
                         completed_at: Instant::now(),
                     });
@@ -77,12 +112,20 @@ impl ProbeSupervisor {
         for active in &mut self.active {
             active.terminate();
         }
-        while !self.active.is_empty() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !self.active.is_empty() && Instant::now() < deadline {
             for active in &mut self.active {
-                let _ = active.poll(Instant::now());
+                active.reap();
             }
             self.active.retain(|active| !active.reaped);
+            if !self.active.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+        // A process stuck in uninterruptible sleep must not wedge Bash. The
+        // main thread keeps SIGCHLD blocked until cancellation is acknowledged;
+        // after these records are dropped, Bash may reap any late exits.
+        self.active.clear();
         self.known.clear();
     }
 
@@ -94,7 +137,7 @@ impl ProbeSupervisor {
             match ActiveProbe::spawn(request.clone()) {
                 Ok(active) => self.active.push(active),
                 Err(error) => {
-                    self.known.remove(&request.key);
+                    self.known.remove(&ProbeIdentity::from(&request));
                     // Preserve a completed synthetic probe so the ordinary
                     // poll path can deliver the spawn failure without adding
                     // another response channel to this small supervisor.
@@ -203,6 +246,14 @@ impl ActiveProbe {
             }
         }
         self.reap();
+        if self.terminated && self.failure.is_some() && !self.reaped {
+            return ProbePoll::Complete {
+                status: 1,
+                values: Vec::new(),
+                truncated: false,
+                error: self.failure.clone(),
+            };
+        }
         if self.reaped {
             self.read_available();
             if !self.eof {
@@ -211,19 +262,24 @@ impl ActiveProbe {
                 // draining the private pipe until EOF before publishing it.
                 return ProbePoll::Pending;
             }
-            let success = self.status.map_or(self.failure.is_none(), |status| {
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            let status = self.status.map_or(1, |status| {
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    1
+                }
             });
-            if !success && self.failure.is_none() {
-                self.failure = Some("probe exited unsuccessfully".into());
-            }
-            let values = if self.failure.is_none() {
+            let (values, truncated) = if self.failure.is_none() {
                 parse_output(&self.output, self.request.key.parser)
             } else {
-                Vec::new()
+                (Vec::new(), false)
             };
             return ProbePoll::Complete {
+                status,
                 values,
+                truncated,
                 error: self.failure.clone(),
             };
         }
@@ -293,15 +349,18 @@ impl ActiveProbe {
     }
 
     fn terminate(&mut self) {
-        if self.terminated || self.pid <= 0 {
-            return;
+        if !self.terminated && self.pid > 0 {
+            self.terminated = true;
+            // The child is placed in a fresh process group whose ID equals pid.
+            // SAFETY: a negative pid targets only that process group.
+            unsafe {
+                libc::kill(-self.pid, libc::SIGKILL);
+            }
         }
-        self.terminated = true;
-        // The child is placed in a fresh process group whose ID equals pid.
-        // SAFETY: a negative pid targets only that process group.
-        unsafe {
-            libc::kill(-self.pid, libc::SIGKILL);
-        }
+        // Completion after a resource failure never depends on descendants
+        // closing inherited descriptors; escaped pipe holders are ignored.
+        self.eof = true;
+        self.close_stdout();
     }
 
     fn close_stdout(&mut self) {
@@ -316,13 +375,7 @@ impl Drop for ActiveProbe {
     fn drop(&mut self) {
         if !self.reaped {
             self.terminate();
-        }
-        if !self.reaped && self.pid > 0 {
-            let mut status = 0;
-            unsafe {
-                libc::waitpid(self.pid, &mut status, 0);
-            }
-            self.reaped = true;
+            self.reap();
         }
         self.close_stdout();
     }
@@ -331,7 +384,9 @@ impl Drop for ActiveProbe {
 enum ProbePoll {
     Pending,
     Complete {
+        status: i32,
         values: Vec<String>,
+        truncated: bool,
         error: Option<String>,
     },
 }
@@ -343,19 +398,33 @@ fn validate_request(request: &ProbeRequest) -> io::Result<()> {
             "dynamic probe is not authorized",
         ));
     }
-    let executable = request
+    let executable = request.key.executable.as_str();
+    let argument_bytes = request
         .key
-        .executable
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-    if is_shell(executable)
+        .arguments
+        .iter()
+        .map(String::len)
+        .fold(0_usize, usize::saturating_add);
+    let environment_bytes = request
+        .key
+        .environment
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .fold(0_usize, usize::saturating_add);
+    if request.key.arguments.len() > MAX_PROBE_ARGUMENTS
+        || argument_bytes > MAX_PROBE_ARGUMENT_BYTES
+        || request.key.environment.len() > MAX_PROBE_ENVIRONMENT
+        || environment_bytes > MAX_PROBE_ENVIRONMENT_BYTES
+        || executable.is_empty()
+        || executable.len() > MAX_PROBE_VALUE_BYTES
+        || executable.contains(['/', '\0'])
+        || request.key.working_directory.len() > MAX_PROBE_PATH_BYTES
+        || is_shell(executable)
         || request
             .key
             .arguments
             .iter()
             .any(|argument| argument.contains('\0'))
-        || request.key.executable.contains('\0')
         || request.key.working_directory.contains('\0')
     {
         return Err(io::Error::new(
@@ -363,16 +432,26 @@ fn validate_request(request: &ProbeRequest) -> io::Result<()> {
             "probe attempts forbidden shell execution or contains NUL",
         ));
     }
-    if matches!(executable, "env" | "xargs" | "find")
-        && request
-            .key
-            .arguments
-            .iter()
-            .any(|argument| is_shell(argument.rsplit('/').next().unwrap_or_default()))
+    if matches!(
+        executable,
+        "env"
+            | "busybox"
+            | "toybox"
+            | "xargs"
+            | "find"
+            | "nice"
+            | "nohup"
+            | "timeout"
+            | "setsid"
+            | "stdbuf"
+            | "sudo"
+            | "doas"
+            | "chroot"
+    ) && !matches!(request.key.arguments.as_slice(), [option] if matches!(option.as_str(), "--help" | "--version"))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "probe wrapper attempts to launch a shell",
+            "probe executable may forward or detach another process",
         ));
     }
     Ok(())
@@ -421,13 +500,21 @@ fn spawn_with_pipe(
             libc::O_RDONLY,
             0,
         ))?;
-        check_spawn(libc::posix_spawn_file_actions_addopen(
-            &mut actions.0,
-            libc::STDERR_FILENO,
-            c"/dev/null".as_ptr(),
-            libc::O_WRONLY,
-            0,
-        ))?;
+        if request.key.include_stderr {
+            check_spawn(libc::posix_spawn_file_actions_adddup2(
+                &mut actions.0,
+                write_fd,
+                libc::STDERR_FILENO,
+            ))?;
+        } else {
+            check_spawn(libc::posix_spawn_file_actions_addopen(
+                &mut actions.0,
+                libc::STDERR_FILENO,
+                c"/dev/null".as_ptr(),
+                libc::O_WRONLY,
+                0,
+            ))?;
+        }
         check_spawn(libc::posix_spawn_file_actions_adddup2(
             &mut actions.0,
             write_fd,
@@ -448,9 +535,18 @@ fn spawn_with_pipe(
 
         check_spawn(libc::posix_spawnattr_init(attributes.as_mut_ptr()))?;
         let mut attributes = SpawnAttributesGuard(attributes.assume_init());
+        let mut child_mask = MaybeUninit::<libc::sigset_t>::uninit();
+        if libc::sigemptyset(child_mask.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let child_mask = child_mask.assume_init();
+        check_spawn(libc::posix_spawnattr_setsigmask(
+            &mut attributes.0,
+            &child_mask,
+        ))?;
         check_spawn(libc::posix_spawnattr_setflags(
             &mut attributes.0,
-            libc::POSIX_SPAWN_SETPGROUP as libc::c_short,
+            (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_SETSIGMASK) as libc::c_short,
         ))?;
         check_spawn(libc::posix_spawnattr_setpgroup(&mut attributes.0, 0))?;
 
@@ -463,8 +559,46 @@ fn spawn_with_pipe(
             argv.as_ptr(),
             envp.as_ptr(),
         ))?;
+        if let Err(error) = apply_probe_resource_limits(pid, request.timeout_ms) {
+            libc::kill(-pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, libc::WNOHANG);
+            return Err(error);
+        }
         Ok(pid)
     }
+}
+
+fn apply_probe_resource_limits(pid: libc::pid_t, timeout_ms: u32) -> io::Result<()> {
+    let cpu_seconds = u64::from(timeout_ms).div_ceil(1000).saturating_add(1);
+    let limits = [
+        (libc::RLIMIT_CORE, 0_u64, 0_u64),
+        (libc::RLIMIT_CPU, cpu_seconds, cpu_seconds),
+        (libc::RLIMIT_FSIZE, 8 * 1024 * 1024, 8 * 1024 * 1024),
+        (libc::RLIMIT_NOFILE, 64, 64),
+        (libc::RLIMIT_NPROC, 16, 16),
+        (libc::RLIMIT_AS, 256 * 1024 * 1024, 256 * 1024 * 1024),
+    ];
+    for (resource, soft, hard) in limits {
+        let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let result =
+            unsafe { libc::prlimit(pid, resource, std::ptr::null(), inherited.as_mut_ptr()) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let inherited = unsafe { inherited.assume_init() };
+        let hard = (hard as libc::rlim_t).min(inherited.rlim_max);
+        let soft = (soft as libc::rlim_t).min(inherited.rlim_cur).min(hard);
+        let limit = libc::rlimit {
+            rlim_cur: soft,
+            rlim_max: hard,
+        };
+        let result = unsafe { libc::prlimit(pid, resource, &limit, std::ptr::null_mut()) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 struct SpawnActionsGuard(libc::posix_spawn_file_actions_t);
@@ -499,11 +633,19 @@ fn sanitized_environment(overrides: &[(String, String)]) -> io::Result<Vec<CStri
     let mut environment = Vec::new();
     for name in ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM"] {
         if let Ok(value) = std::env::var(name) {
+            if name == "PATH" && !safe_probe_path(&value) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "probe PATH must contain only bounded absolute directories",
+                ));
+            }
             environment.push((name.to_owned(), value));
         }
     }
     for (name, value) in overrides {
         if name.is_empty()
+            || forbidden_probe_environment(name)
+            || name == "PATH" && std::env::var("PATH").ok().as_deref() != Some(value)
             || !name.bytes().enumerate().all(|(index, byte)| {
                 byte == b'_' || byte.is_ascii_alphabetic() || index > 0 && byte.is_ascii_digit()
             })
@@ -528,7 +670,48 @@ fn sanitized_environment(overrides: &[(String, String)]) -> io::Result<Vec<CStri
         .collect()
 }
 
-fn parse_output(output: &[u8], parser: ProbeParser) -> Vec<String> {
+fn safe_probe_path(value: &str) -> bool {
+    let mut count = 0_usize;
+    value.split(':').all(|directory| {
+        count = count.saturating_add(1);
+        count <= 256 && !directory.is_empty() && Path::new(directory).is_absolute()
+    })
+}
+
+fn forbidden_probe_environment(name: &str) -> bool {
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || name.starts_with("_RLD_")
+        || name.starts_with("LDR_")
+        || name.starts_with("GIT_CONFIG_")
+        || matches!(
+            name,
+            "LIBPATH"
+                | "SHLIB_PATH"
+                | "BASH_ENV"
+                | "ENV"
+                | "ZDOTDIR"
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "PYTHONSTARTUP"
+                | "PYTHONINSPECT"
+                | "PERL5LIB"
+                | "PERLLIB"
+                | "PERL5OPT"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "GIT_EXEC_PATH"
+                | "GIT_ASKPASS"
+                | "SSH_ASKPASS"
+                | "LESSOPEN"
+                | "LESSCLOSE"
+                | "IFS"
+        )
+}
+
+fn parse_output(output: &[u8], parser: ProbeParser) -> (Vec<String>, bool) {
     let text = String::from_utf8_lossy(output);
     let values: Box<dyn Iterator<Item = &str>> = match parser {
         ProbeParser::Lines => Box::new(text.lines()),
@@ -544,19 +727,22 @@ fn parse_output(output: &[u8], parser: ProbeParser) -> Vec<String> {
         ),
     };
     let mut result = Vec::new();
-    let mut seen = HashSet::new();
+    let mut truncated = false;
     for value in values {
         let value = value.trim_end_matches('\r');
-        if value.is_empty() || value.len() > MAX_PROBE_VALUE_BYTES || !seen.insert(value.to_owned())
+        if value.is_empty()
+            || value.len() > MAX_PROBE_VALUE_BYTES
+            || value.chars().any(char::is_control)
         {
             continue;
         }
-        result.push(value.to_owned());
         if result.len() >= MAX_PARSED_PROBE_VALUES {
+            truncated = true;
             break;
         }
+        result.push(value.to_owned());
     }
-    result
+    (result, truncated)
 }
 
 #[cfg(test)]
@@ -575,6 +761,7 @@ mod tests {
                 environment: Vec::new(),
                 working_directory: Path::new("/tmp").to_string_lossy().into_owned(),
                 parser: ProbeParser::Lines,
+                include_stderr: false,
             },
             probe_id: "test".into(),
             candidate_kind: RuleCandidateKind::Value,
@@ -596,7 +783,38 @@ mod tests {
         loop {
             let outcomes = supervisor.poll();
             if let Some(outcome) = outcomes.into_iter().next() {
-                assert_eq!(outcome.values, ["alpha", "beta"]);
+                assert_eq!(outcome.status, 0);
+                assert_eq!(outcome.values, ["alpha", "beta", "alpha"]);
+                assert!(!outcome.truncated);
+                assert!(outcome.error.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn parser_marks_candidate_count_truncation_without_deduplicating() {
+        let output = "same\n".repeat(MAX_PARSED_PROBE_VALUES + 1);
+        let (values, truncated) = parse_output(output.as_bytes(), ProbeParser::Lines);
+        assert_eq!(values.len(), MAX_PARSED_PROBE_VALUES);
+        assert!(values.iter().all(|value| value == "same"));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn unsuccessful_process_preserves_bounded_output_and_status() {
+        let mut supervisor = ProbeSupervisor::default();
+        let mut unsuccessful = request("ls", &["/bashlume-definitely-missing"]);
+        unsuccessful.key.include_stderr = true;
+        assert!(supervisor.submit(unsuccessful));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let outcomes = supervisor.poll();
+            if let Some(outcome) = outcomes.into_iter().next() {
+                assert_ne!(outcome.status, 0);
+                assert!(!outcome.values.is_empty());
                 assert!(outcome.error.is_none());
                 break;
             }
@@ -608,5 +826,109 @@ mod tests {
     #[test]
     fn shell_probe_is_rejected() {
         assert!(validate_request(&request("bash", &["-c", "echo owned"])).is_err());
+        assert!(validate_request(&request("env", &["bash", "-c", "echo owned"])).is_err());
+        assert!(validate_request(&request("env", &["printf", "owned"])).is_err());
+        assert!(validate_request(&request("env", &["--help"])).is_ok());
+        assert!(validate_request(&request("nice", &["/bin/bash", "-c", "echo owned"])).is_err());
+        assert!(validate_request(&request("setsid", &["printf", "owned"])).is_err());
+        assert!(validate_request(&request("busybox", &["sh", "-c", "echo owned"])).is_err());
+        assert!(validate_request(&request("/usr/bin/printf", &["owned"])).is_err());
+    }
+
+    #[test]
+    fn probe_environment_rejects_loader_and_startup_hooks() {
+        assert!(safe_probe_path("/usr/bin:/bin"));
+        assert!(!safe_probe_path(".:/usr/bin"));
+        assert!(!safe_probe_path(":/usr/bin"));
+        for name in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "PYTHONPATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "NODE_OPTIONS",
+            "GIT_CONFIG_COUNT",
+            "SSH_ASKPASS",
+            "LESSOPEN",
+        ] {
+            assert!(sanitized_environment(&[(name.into(), "payload".into())]).is_err());
+        }
+    }
+
+    #[test]
+    fn oversized_probe_arguments_are_rejected_before_spawn() {
+        let oversized = "x".repeat(MAX_PROBE_ARGUMENT_BYTES + 1);
+        assert!(validate_request(&request("printf", &[&oversized])).is_err());
+    }
+
+    #[test]
+    fn unauthorized_requests_never_enter_the_supervisor() {
+        let mut supervisor = ProbeSupervisor::default();
+        let mut denied = request("printf", &["owned"]);
+        denied.dynamic_authorized = false;
+        assert!(!supervisor.submit(denied));
+        assert!(!supervisor.has_work());
+    }
+
+    #[test]
+    fn supervisor_starts_at_most_two_children() {
+        let mut supervisor = ProbeSupervisor::default();
+        assert!(supervisor.submit(request("sleep", &["0.1"])));
+        assert!(supervisor.submit(request("sleep", &["0.2"])));
+        assert!(supervisor.submit(request("sleep", &["0.3"])));
+        assert_eq!(supervisor.active.len(), MAX_CONCURRENT_PROBES);
+        assert_eq!(supervisor.queued.len(), 1);
+        supervisor.cancel_all();
+    }
+
+    #[test]
+    fn timeout_completion_does_not_wait_for_inherited_pipe_eof() {
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        assert_ne!(
+            unsafe { libc::fcntl(descriptors[0], libc::F_SETFL, libc::O_NONBLOCK) },
+            -1
+        );
+        let mut active = ActiveProbe {
+            request: request("printf", &["unused"]),
+            pid: -1,
+            stdout: descriptors[0],
+            output: Vec::new(),
+            started: Instant::now() - Duration::from_secs(2),
+            eof: false,
+            reaped: false,
+            status: None,
+            failure: None,
+            terminated: true,
+        };
+        assert!(matches!(
+            active.poll(Instant::now()),
+            ProbePoll::Complete { error: Some(_), .. }
+        ));
+        assert!(active.eof);
+        assert_eq!(active.stdout, -1);
+        unsafe { libc::close(descriptors[1]) };
+    }
+
+    #[test]
+    fn excessive_output_is_terminated_and_not_replayed() {
+        let mut supervisor = ProbeSupervisor::default();
+        let mut oversized = request("printf", &["0123456789"]);
+        oversized.output_limit = 4;
+        assert!(supervisor.submit(oversized));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(outcome) = supervisor.poll().into_iter().next() {
+                assert!(outcome.values.is_empty());
+                assert_eq!(
+                    outcome.error.as_deref(),
+                    Some("probe output limit exceeded")
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

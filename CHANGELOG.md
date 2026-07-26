@@ -7,7 +7,11 @@
 - Discover rule packs asynchronously, mmap their indexes, decode command blocks lazily, and expose pack status through `bashlume rules`.
 - Evaluate static rules in a bounded Rust VM and merge candidates from every installed source with description preservation, conservative spacing, and source agreement metadata.
 - Add signed, capability-declared, Tab-only dynamic probes supervised through `posix_spawnp` with concurrency, timeout, output, cache, and shell-execution limits.
-- Add Completion IR block version 2 and pack format 1.1 path policies so matched rules can suppress files, request directories, or force file completion while version-1 blocks remain readable.
+- Add Completion IR block versions 2–4 and pack format 1.1 path policies, pure-data Script IR, compound redirections, build-time heredocs/deferred actions, and backward decoding of earlier blocks.
+- Add first-party bounded Bash, Fish, and Zsh lexers/parsers, call-graph support-library linking, and a deterministic dialect VM; runtime never parses, sources, or executes upstream completion text.
+- Replay filesystem tests, globs, regular-file input, nested completion, accounts, hosts, processes, interfaces, signals, commands, functions, and variables from explicit bounded asynchronous snapshots.
+- Preserve native candidate order, descriptions, kinds, spacing, path policy, completion status, quoting, wrappers/services, and provider attribution through strict and full-baseline native differential gates.
+- Harden source/context/regex/arithmetic/pattern/redirection/probe limits, terminal candidate validation, host/include traversal, shell/history snapshots, SIGCHLD coordination, and all hot-path filesystem access.
 
 ## 0.1.5 — 2026-07-23
 

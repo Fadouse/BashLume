@@ -4,6 +4,12 @@ use std::path::PathBuf;
 
 use crate::ffi;
 
+const MAX_SNAPSHOT_ITEMS: usize = 4096;
+const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_SCALAR_BYTES: usize = 64 * 1024;
+const MAX_HISTORY_ITEMS: usize = 8192;
+const MAX_HISTORY_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KnownCommand {
     Alias,
@@ -17,11 +23,13 @@ pub struct ShellSnapshot {
     pub functions: HashSet<String>,
     pub builtins: HashSet<String>,
     pub variables: Vec<String>,
+    pub variable_values: HashMap<String, Vec<String>>,
     pub command_frequency: HashMap<String, (u32, usize)>,
     pub environment: HashMap<String, String>,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     pub path: String,
+    pub effective_user_id: u32,
 }
 
 impl ShellSnapshot {
@@ -34,13 +42,15 @@ impl ShellSnapshot {
         self.functions = unsafe { functions() };
         self.builtins = unsafe { builtins() };
         self.variables = unsafe { variables() };
+        self.variable_values = unsafe { scalar_variable_values(&self.variables) };
         self.cwd = unsafe { shell_variable("PWD") }
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         self.home = unsafe { shell_variable("HOME") }.map(PathBuf::from);
         self.path = unsafe { shell_variable("PATH") }.unwrap_or_default();
         self.command_frequency = unsafe { command_frequency() };
-        self.environment = std::env::vars().take(4096).collect();
+        self.environment = environment_snapshot();
+        self.effective_user_id = unsafe { libc::geteuid() };
     }
 
     pub fn known_shell_command(&self, name: &str) -> Option<KnownCommand> {
@@ -67,18 +77,17 @@ impl ShellSnapshot {
 /// # Safety
 /// Readline's history list must not be mutated during this call.
 pub unsafe fn history_suggestion(prefix: &str) -> Option<String> {
-    if prefix.is_empty() {
+    if prefix.is_empty() || prefix.len() > MAX_SCALAR_BYTES {
         return None;
     }
     let list = unsafe { ffi::history_list() };
     if list.is_null() {
         return None;
     }
-    let mut count = 0_usize;
-    while !unsafe { *list.add(count) }.is_null() {
-        count += 1;
-    }
-    for index in (0..count).rev() {
+    let count = usize::try_from(unsafe { ffi::history_length }.max(0)).unwrap_or(0);
+    let start = count.saturating_sub(MAX_HISTORY_ITEMS);
+    let mut inspected_bytes = 0_usize;
+    for index in (start..count).rev() {
         let entry = unsafe { *list.add(index) };
         if entry.is_null() {
             continue;
@@ -87,7 +96,14 @@ pub unsafe fn history_suggestion(prefix: &str) -> Option<String> {
         if line.is_null() {
             continue;
         }
-        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
+        let line = unsafe { CStr::from_ptr(line) };
+        if line.to_bytes().len() > MAX_SCALAR_BYTES
+            || inspected_bytes.saturating_add(line.to_bytes().len()) > MAX_HISTORY_BYTES
+        {
+            break;
+        }
+        inspected_bytes = inspected_bytes.saturating_add(line.to_bytes().len());
+        let line = line.to_string_lossy();
         if line.len() > prefix.len() && line.starts_with(prefix) {
             return Some(line.into_owned());
         }
@@ -105,15 +121,33 @@ pub unsafe fn shell_variable(name: &str) -> Option<String> {
     if variable.is_null() {
         return None;
     }
+    const NON_SCALAR_ATTRIBUTES: i32 = 0x0000_0004 | 0x0000_0008 | 0x0000_0040 | 0x0000_1000;
+    if unsafe { (*variable).attributes } & NON_SCALAR_ATTRIBUTES != 0 {
+        return None;
+    }
     let value = unsafe { (*variable).value };
     if value.is_null() {
         return None;
     }
-    Some(
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    let value = unsafe { CStr::from_ptr(value) };
+    (value.to_bytes().len() <= MAX_SCALAR_BYTES).then(|| value.to_string_lossy().into_owned())
+}
+
+fn environment_snapshot() -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let mut bytes = 0_usize;
+    for (name, value) in std::env::vars_os().take(MAX_SNAPSHOT_ITEMS) {
+        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+            continue;
+        };
+        let item_bytes = name.len().saturating_add(value.len());
+        if item_bytes > MAX_SCALAR_BYTES || bytes.saturating_add(item_bytes) > MAX_SNAPSHOT_BYTES {
+            continue;
+        }
+        bytes = bytes.saturating_add(item_bytes);
+        result.insert(name, value);
+    }
+    result
 }
 
 unsafe fn aliases() -> HashSet<String> {
@@ -123,18 +157,21 @@ unsafe fn aliases() -> HashSet<String> {
         return result;
     }
     let mut index = 0_usize;
-    loop {
+    let mut bytes = 0_usize;
+    while index < MAX_SNAPSHOT_ITEMS {
         let alias = unsafe { *values.add(index) };
         if alias.is_null() {
             break;
         }
         let name = unsafe { (*alias).name };
         if !name.is_null() {
-            result.insert(
-                unsafe { CStr::from_ptr(name) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let name = unsafe { CStr::from_ptr(name) };
+            if name.to_bytes().len() <= MAX_SCALAR_BYTES
+                && bytes.saturating_add(name.to_bytes().len()) <= MAX_SNAPSHOT_BYTES
+            {
+                bytes = bytes.saturating_add(name.to_bytes().len());
+                result.insert(name.to_string_lossy().into_owned());
+            }
         }
         index += 1;
     }
@@ -149,22 +186,43 @@ unsafe fn functions() -> HashSet<String> {
         return result;
     }
     let mut index = 0_usize;
-    loop {
+    let mut bytes = 0_usize;
+    while index < MAX_SNAPSHOT_ITEMS {
         let function = unsafe { *values.add(index) };
         if function.is_null() {
             break;
         }
         let name = unsafe { (*function).name };
         if !name.is_null() {
-            result.insert(
-                unsafe { CStr::from_ptr(name) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let name = unsafe { CStr::from_ptr(name) };
+            if name.to_bytes().len() <= MAX_SCALAR_BYTES
+                && bytes.saturating_add(name.to_bytes().len()) <= MAX_SNAPSHOT_BYTES
+            {
+                bytes = bytes.saturating_add(name.to_bytes().len());
+                result.insert(name.to_string_lossy().into_owned());
+            }
         }
         index += 1;
     }
     unsafe { ffi::free(values.cast()) };
+    result
+}
+
+unsafe fn scalar_variable_values(names: &[String]) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    let mut total = 0_usize;
+    for name in names.iter().take(MAX_SNAPSHOT_ITEMS) {
+        let Some(value) = (unsafe { shell_variable(name) }) else {
+            continue;
+        };
+        if value.len() > MAX_SCALAR_BYTES
+            || total.saturating_add(name.len()).saturating_add(value.len()) > MAX_SNAPSHOT_BYTES
+        {
+            continue;
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        result.insert(name.clone(), vec![value]);
+    }
     result
 }
 
@@ -175,16 +233,19 @@ unsafe fn variables() -> Vec<String> {
     }
     let mut result = Vec::new();
     let mut index = 0_usize;
-    loop {
+    let mut bytes = 0_usize;
+    while index < MAX_SNAPSHOT_ITEMS {
         let value = unsafe { *values.add(index) };
         if value.is_null() {
             break;
         }
-        result.push(
-            unsafe { CStr::from_ptr(value) }
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let value = unsafe { CStr::from_ptr(value) };
+        if value.to_bytes().len() <= MAX_SCALAR_BYTES
+            && bytes.saturating_add(value.to_bytes().len()) <= MAX_SNAPSHOT_BYTES
+        {
+            bytes = bytes.saturating_add(value.to_bytes().len());
+            result.push(value.to_string_lossy().into_owned());
+        }
         index += 1;
     }
     unsafe { ffi::strvec_dispose(values) };
@@ -198,16 +259,19 @@ unsafe fn builtins() -> HashSet<String> {
     if values.is_null() {
         return result;
     }
-    for index in 0..count {
+    let mut bytes = 0_usize;
+    for index in 0..count.min(MAX_SNAPSHOT_ITEMS) {
         let builtin = unsafe { &*values.add(index) };
         if builtin.name.is_null() || builtin.flags & ffi::BUILTIN_ENABLED == 0 {
             continue;
         }
-        result.insert(
-            unsafe { CStr::from_ptr(builtin.name) }
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let name = unsafe { CStr::from_ptr(builtin.name) };
+        if name.to_bytes().len() <= MAX_SCALAR_BYTES
+            && bytes.saturating_add(name.to_bytes().len()) <= MAX_SNAPSHOT_BYTES
+        {
+            bytes = bytes.saturating_add(name.to_bytes().len());
+            result.insert(name.to_string_lossy().into_owned());
+        }
     }
     result
 }
@@ -218,22 +282,30 @@ unsafe fn command_frequency() -> HashMap<String, (u32, usize)> {
     if list.is_null() {
         return result;
     }
-    let mut index = 0_usize;
-    loop {
+    let count = usize::try_from(unsafe { ffi::history_length }.max(0)).unwrap_or(0);
+    let start = count.saturating_sub(MAX_HISTORY_ITEMS);
+    let mut inspected_bytes = 0_usize;
+    for (recency, index) in (start..count).rev().enumerate() {
         let entry = unsafe { *list.add(index) };
         if entry.is_null() {
-            break;
+            continue;
         }
         let line = unsafe { (*entry).line };
         if !line.is_null() {
-            let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
+            let line = unsafe { CStr::from_ptr(line) };
+            if line.to_bytes().len() > MAX_SCALAR_BYTES
+                || inspected_bytes.saturating_add(line.to_bytes().len()) > MAX_HISTORY_BYTES
+            {
+                break;
+            }
+            inspected_bytes = inspected_bytes.saturating_add(line.to_bytes().len());
+            let line = line.to_string_lossy();
             if let Some(command) = first_command_word(&line) {
                 let item = result.entry(command.to_owned()).or_insert((0_u32, 0_usize));
                 item.0 = item.0.saturating_add(1);
-                item.1 = index;
+                item.1 = item.1.max(MAX_HISTORY_ITEMS.saturating_sub(recency));
             }
         }
-        index += 1;
     }
     result
 }

@@ -18,6 +18,7 @@ static ORIGINAL_STARTUP: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_EVENT: AtomicUsize = AtomicUsize::new(0);
 static MARK_ACTIVE_FUNCTION: AtomicUsize = AtomicUsize::new(0);
 static FORKED_CHILD: AtomicBool = AtomicBool::new(false);
+static ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
@@ -41,9 +42,16 @@ struct SavedBinding {
 
 struct MenuState {
     line: String,
+    point: usize,
     candidates: Vec<Candidate>,
     selected: usize,
     pending: bool,
+}
+
+impl MenuState {
+    fn matches_context(&self, line: &str, point: usize) -> bool {
+        self.line == line && self.point == point
+    }
 }
 
 struct PluginState {
@@ -56,6 +64,7 @@ struct PluginState {
     bindings: Vec<SavedBinding>,
     menu: Option<MenuState>,
     last_ghost: Option<GhostSuggestion>,
+    last_dynamic_context: Option<(String, usize)>,
     diagnostic_due: Option<Instant>,
 }
 
@@ -80,6 +89,7 @@ impl PluginState {
             bindings: Vec::new(),
             menu: None,
             last_ghost: None,
+            last_dynamic_context: None,
             diagnostic_due: None,
         })
     }
@@ -90,6 +100,7 @@ impl PluginState {
         self.completion.refresh(&self.shell);
         self.menu = None;
         self.last_ghost = None;
+        self.last_dynamic_context = None;
         self.diagnostic_due = None;
         unsafe { self.sync_event_hook() };
     }
@@ -127,13 +138,14 @@ impl PluginState {
             })
             .unwrap_or(0);
         let changed = self.menu.as_ref().is_none_or(|menu| {
-            menu.line != line
+            !menu.matches_context(line, context.point)
                 || menu.selected != selected
                 || menu.pending != result.pending
                 || menu.candidates != result.candidates
         });
         self.menu = Some(MenuState {
             line: line.to_owned(),
+            point: context.point,
             candidates: result.candidates,
             selected,
             pending: result.pending,
@@ -153,9 +165,10 @@ impl PluginState {
     }
 
     unsafe fn sync_event_hook(&self) {
-        let required = self.enabled
-            && (self.menu.as_ref().is_some_and(|menu| menu.pending)
-                || self.diagnostic_due.is_some());
+        let required = self.completion.background_pending()
+            || self.enabled
+                && (self.menu.as_ref().is_some_and(|menu| menu.pending)
+                    || self.diagnostic_due.is_some());
         unsafe { configure_event_hook(required) };
     }
 
@@ -167,20 +180,21 @@ impl PluginState {
             return;
         };
         let context = CompletionContext::analyze(&line, point);
+        let dynamic_context = (line.clone(), point);
+        if self.last_dynamic_context.as_ref() != Some(&dynamic_context) {
+            self.completion.cancel_dynamic();
+            self.last_dynamic_context = Some(dynamic_context);
+        }
         let vi_command_mode = unsafe { in_vi_command_mode() };
         if vi_command_mode {
             self.menu = None;
             self.last_ghost = None;
         }
 
-        let menu_line_changed = self.menu.as_ref().is_some_and(|menu| menu.line != line);
-        if menu_line_changed {
-            self.completion.cancel_dynamic();
-        }
         let refresh_menu = self
             .menu
             .as_ref()
-            .is_some_and(|menu| menu.line != line || menu.pending);
+            .is_some_and(|menu| !menu.matches_context(&line, point) || menu.pending);
         if refresh_menu {
             self.refresh_menu(&line, &context);
         }
@@ -272,6 +286,15 @@ impl PluginState {
             };
         }
 
+        let stale_menu = self.menu.as_ref().is_some_and(|menu| {
+            unsafe { readline_line() }
+                .is_none_or(|(line, point)| !menu.matches_context(&line, point))
+        });
+        if stale_menu {
+            self.completion.cancel_dynamic();
+            self.menu = None;
+        }
+
         if self
             .menu
             .as_ref()
@@ -307,6 +330,11 @@ impl PluginState {
                 )
             };
         };
+        let dynamic_context = (line.clone(), point);
+        if self.last_dynamic_context.as_ref() != Some(&dynamic_context) {
+            self.completion.cancel_dynamic();
+            self.last_dynamic_context = Some(dynamic_context);
+        }
         let mut context = CompletionContext::analyze(&line, point);
         let mut result =
             self.completion
@@ -317,6 +345,7 @@ impl PluginState {
             }
             self.menu = Some(MenuState {
                 line,
+                point,
                 candidates: result.candidates,
                 selected: 0,
                 pending: result.pending,
@@ -330,6 +359,7 @@ impl PluginState {
             // longer prefix candidate arrives from another PATH directory.
             self.menu = Some(MenuState {
                 line,
+                point,
                 candidates: result.candidates,
                 selected: 0,
                 pending: true,
@@ -354,6 +384,11 @@ impl PluginState {
                     partial.append_space = false;
                     unsafe { apply_candidate(&context, &partial) };
                     if let Some((new_line, new_point)) = unsafe { readline_line() } {
+                        let dynamic_context = (new_line.clone(), new_point);
+                        if self.last_dynamic_context.as_ref() != Some(&dynamic_context) {
+                            self.completion.cancel_dynamic();
+                            self.last_dynamic_context = Some(dynamic_context);
+                        }
                         context = CompletionContext::analyze(&new_line, new_point);
                         result = self.completion.complete_explicit(
                             &context,
@@ -365,11 +400,10 @@ impl PluginState {
             }
         }
 
-        let current_line = unsafe { readline_line() }
-            .map(|(line, _)| line)
-            .unwrap_or(line);
+        let (current_line, current_point) = unsafe { readline_line() }.unwrap_or((line, point));
         self.menu = Some(MenuState {
             line: current_line,
+            point: current_point,
             candidates: result.candidates,
             selected: 0,
             pending: result.pending,
@@ -414,7 +448,9 @@ impl PluginState {
         if self.enabled {
             if let Some(menu) = self.menu.take() {
                 if let Some(candidate) = menu.candidates.get(menu.selected) {
-                    if let Some((line, point)) = unsafe { readline_line() } {
+                    if let Some((line, point)) = unsafe { readline_line() }
+                        && menu.matches_context(&line, point)
+                    {
                         let context = CompletionContext::analyze(&line, point);
                         unsafe { apply_candidate(&context, candidate) };
                         self.last_ghost = None;
@@ -493,6 +529,16 @@ pub unsafe fn load() -> Result<(), String> {
         original_event.map_or(0, |function| function as usize),
         Ordering::Release,
     );
+    if !ATFORK_REGISTERED.load(Ordering::Acquire) {
+        let atfork_status = unsafe { libc::pthread_atfork(None, None, Some(mark_forked_child)) };
+        if atfork_status != 0 {
+            return Err(format!(
+                "could not register fork-safety handler: {}",
+                std::io::Error::from_raw_os_error(atfork_status)
+            ));
+        }
+        ATFORK_REGISTERED.store(true, Ordering::Release);
+    }
 
     unsafe { install_bindings(&mut state) };
     unsafe {
@@ -503,9 +549,6 @@ pub unsafe fn load() -> Result<(), String> {
     let mark_active = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"rl_mark_active_p".as_ptr()) };
     MARK_ACTIVE_FUNCTION.store(mark_active as usize, Ordering::Release);
     FORKED_CHILD.store(false, Ordering::Release);
-    unsafe {
-        libc::pthread_atfork(None, None, Some(mark_forked_child));
-    }
     *guard = Some(state);
     Ok(())
 }
@@ -671,14 +714,21 @@ unsafe extern "C" fn event_callback() -> i32 {
 
     let should_redraw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut guard = lock_state();
-        let Some(state) = guard.as_mut().filter(|state| state.enabled) else {
+        let Some(state) = guard.as_mut() else {
             return false;
         };
-        let menu_changed = unsafe { state.poll_pending_menu() };
-        let diagnostic_due = state
-            .diagnostic_due
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        menu_changed || diagnostic_due
+        state.completion.poll_background();
+        let changed = if state.enabled {
+            let menu_changed = unsafe { state.poll_pending_menu() };
+            let diagnostic_due = state
+                .diagnostic_due
+                .is_some_and(|deadline| Instant::now() >= deadline);
+            menu_changed || diagnostic_due
+        } else {
+            false
+        };
+        unsafe { state.sync_event_hook() };
+        changed
     })) {
         Ok(changed) => changed,
         Err(_) => {
@@ -1055,6 +1105,7 @@ fn write_clear_to_end() {
 }
 
 unsafe extern "C" fn mark_forked_child() {
+    unsafe { crate::completion::restore_probe_signal_mask_after_fork() };
     FORKED_CHILD.store(true, Ordering::Release);
 }
 
@@ -1062,6 +1113,20 @@ unsafe extern "C" fn mark_forked_child() {
 mod tests {
     use super::*;
     use crate::completion::matcher::{CandidateKind, MatchClass};
+
+    #[test]
+    fn menu_identity_includes_the_readline_cursor_point() {
+        let menu = MenuState {
+            line: "echo value".into(),
+            point: 10,
+            candidates: Vec::new(),
+            selected: 0,
+            pending: false,
+        };
+        assert!(menu.matches_context("echo value", 10));
+        assert!(!menu.matches_context("echo value", 5));
+        assert!(!menu.matches_context("echo other", 10));
+    }
 
     #[test]
     fn accepts_one_shell_word_from_history_suffix() {
@@ -1088,6 +1153,8 @@ mod tests {
             append_space: true,
             score: 0,
             match_class: MatchClass::Fuzzy,
+            preserve_order: false,
+            insertion_order: u64::MAX,
         };
         assert!(ghost_for_candidate(&context, &candidate).is_none());
     }

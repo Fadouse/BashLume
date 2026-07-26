@@ -107,6 +107,7 @@ unsafe extern "C" {
     pub fn all_shell_functions() -> *mut *mut ShellVar;
     pub fn all_variables_matching_prefix(prefix: *const c_char) -> *mut *mut c_char;
     pub fn history_list() -> *mut *mut HistoryEntry;
+    pub static mut history_length: c_int;
     pub fn strvec_dispose(values: *mut *mut c_char);
 
     // libc functions are declared here where their ownership role is explicit.

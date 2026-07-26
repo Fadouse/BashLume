@@ -679,6 +679,8 @@ mod tests {
                 } else {
                     MatchClass::Prefix
                 },
+                preserve_order: false,
+                insertion_order: u64::MAX,
             })
             .collect::<Vec<_>>();
         let config = Config::default();
@@ -712,6 +714,8 @@ mod tests {
             append_space: true,
             score: 0,
             match_class: MatchClass::Prefix,
+            preserve_order: false,
+            insertion_order: u64::MAX,
         }];
         let config = Config::default();
         let mut output = Vec::new();
@@ -742,6 +746,8 @@ mod tests {
             append_space: true,
             score: 0,
             match_class: MatchClass::Prefix,
+            preserve_order: false,
+            insertion_order: u64::MAX,
         }];
         let mut config = Config {
             menu_descriptions: MenuDescriptionMode::Inline,

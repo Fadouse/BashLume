@@ -92,7 +92,7 @@ Each decompressed block starts with:
 
 ```text
 bytes[4] `BLIR`
-u16 block version (2; version 1 remains readable)
+u16 block version (4; versions 1, 2, and 3 remain readable)
 u16 flags (zero)
 ```
 
@@ -107,8 +107,17 @@ The remaining order is:
 5. SPDX license expression
 6. static rule list
 7. dynamic probe list
+8. Script IR module list (block version 3 or newer)
 
-A block-version-2 static rule stores its predicate program, one path-completion byte, and its candidate list. Path completion is `inherit` (0), `suppress` (1), `directories` (2), or `files` (3). Block version 1 omitted this byte and decodes as `inherit`.
+A block-version-2-or-newer static rule stores its predicate program, one path-completion byte, and its candidate list. Path completion is `inherit` (0), `suppress` (1), `directories` (2), or `files` (3). Block version 1 omitted this byte and decodes as `inherit`. Versions 1 and 2 decode with an empty Script IR list.
+
+### Script IR
+
+A Script IR module is a validated, dialect-tagged data AST produced at pack-build time by BashLume's own Bash/Zsh/Fish lexer and parser. It contains registrations, function declarations, statements, word parts, source order, and the exact probe-capability subset required by that module. Zsh modules may additionally carry a bounded, ordered names-only `fpath` snapshot, an explicit snapshot-presence marker, and its native function-table high-water bucket count. Bootstrap declarations/removals and ordered roots are analyzed at build time without shrinking prior resize history, and runtime insertion/resizing includes the explicit shell-function snapshot; absent metadata decodes as the legacy per-module approximation. This permits complete native `${(k)functions}` membership and hash-scan order without linking unreachable function bodies. Support files are linked by the converter's static call graph; runtime evaluation never reads, parses, sources, or executes an upstream completion file.
+
+The VM implements bounded scopes, functions, control flow, arrays, parameter/arithmetic expansion, and semantic completion primitives such as Bash `compgen`/`compopt`, Fish `complete`, and Zsh `_arguments`/`compadd`. Deferred completion expressions carry typed Script IR subtrees; any retained raw spelling is metadata and is never reparsed at runtime. Any external command substitution becomes a capability-checked probe request rather than process execution inside the VM. Block version 4 adds typed trailing redirections on compound statements and build-time-compiled templates for `eval`-generated functions; versions 1–3 cannot encode those semantics. Here-strings and bounded regular-file input are replayed as pure data, while output redirections and descriptor duplication are interpreted by the VM without opening files. Dynamic function templates retain only typed statements and capture words, so evaluation never reparses generated source.
+
+Module validation limits AST nodes, nesting, functions, statements, words, strings, registrations, capability declarations, and Zsh function-table metadata before a block can execute. Evaluation additionally limits steps, calls, loops, generated values, and emitted candidates; exceeding a limit is an error and is never converted into an empty successful result.
 
 ### Predicates
 
@@ -161,7 +170,7 @@ A probe stores:
 - timeout, output limit, and cache TTL
 - optional description
 
-Template placeholders are limited to `{current}`, `{command}`, `{cwd}`, and `{word:N}`. The runtime never evaluates shell syntax. `sh`, `bash`, `dash`, `zsh`, and `fish` are forbidden probe executables. Probe execution requires a trusted signature and explicit capability declaration.
+Template placeholders are limited to `{current}`, `{command}`, `{cwd}`, and `{word:N}`. The runtime never evaluates shell syntax. `sh`, `bash`, `dash`, `zsh`, and `fish` are forbidden probe executables. Process-forwarding wrappers (`env`, `xargs`, `find`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `sudo`, `doas`, `chroot`, and multicall wrappers) are accepted only for a lone `--help` or `--version`; they cannot forward a probe target. Probe PATH entries must be nonempty absolute directories, loader/startup-hook environment variables are rejected, and the dedicated supervisor applies wall-time, output, process, address-space, CPU, descriptor, and file-size limits. Probe execution requires a trusted signature and explicit capability declaration.
 
 ## Limits
 
@@ -177,11 +186,16 @@ Current hard limits include:
 - individual string: 1 MiB
 - command string data: 8 MiB
 - parsed dynamic values: 4,096
-- dynamic value: 64 KiB
+- dynamic value and candidate field: 64 KiB
+- total retained Script-VM candidate data: 8 MiB
+- cumulative Script-VM command-output work: 8 MiB
+- parser nesting and word-expansion work: independently depth/byte/node bounded
+- Zsh tag/label state: 256 items and 16 KiB per active machine state
+- Zsh function-table metadata: at most 65,536 names / 1 MiB and validated native `7 × 4ⁿ` bucket counts
 - concurrent probe children: 2
 
 These are parser security boundaries, not recommended generation targets.
 
 ## Compatibility
 
-Format-major changes are breaking. Minor additions must remain backward compatible and be guarded by feature bits. Engine 0.2 reads container minors 1.0 and 1.1 and command-block versions 1 and 2; it writes 1.1/version 2. BashLume supports the current major and, once a second major exists, the immediately preceding major through a dedicated decoder. It must never treat an unknown major or newer minor as the current layout.
+Format-major changes are breaking. Minor additions must remain backward compatible and be guarded by feature bits. Engine 0.2 reads container minors 1.0 and 1.1 and command-block versions 1, 2, 3, and 4; it writes 1.1/version 4. BashLume supports the current major and, once a second major exists, the immediately preceding major through a dedicated decoder. It must never treat an unknown major, newer minor, or unknown command-block version as the current layout.

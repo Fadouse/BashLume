@@ -1,6 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+const MAX_CANDIDATE_TEXT_BYTES: usize = 64 * 1024;
+
+fn candidate_text_size_is_safe(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_CANDIDATE_TEXT_BYTES
+}
+
+fn candidate_text_has_control(value: &str) -> bool {
+    value.bytes().any(|byte| byte.is_ascii_control())
+        || !value.is_ascii() && value.chars().any(char::is_control)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatchClass {
     Exact,
@@ -17,6 +28,16 @@ impl MatchClass {
             // prefix matches also exist (`who` and `whoami`). Keep both in
             // the same result set while the score still sorts exact first.
             Self::Exact | Self::Prefix => 4,
+            Self::CaseInsensitivePrefix => 3,
+            Self::Substring => 2,
+            Self::Fuzzy => 1,
+        }
+    }
+
+    fn sort_tier(self) -> u8 {
+        match self {
+            Self::Exact => 5,
+            Self::Prefix => 4,
             Self::CaseInsensitivePrefix => 3,
             Self::Substring => 2,
             Self::Fuzzy => 1,
@@ -85,6 +106,8 @@ pub struct Candidate {
     pub append_space: bool,
     pub score: i64,
     pub match_class: MatchClass,
+    pub preserve_order: bool,
+    pub(crate) insertion_order: u64,
 }
 
 impl Candidate {
@@ -96,7 +119,15 @@ impl Candidate {
         append_space: bool,
         recency_bonus: i64,
     ) -> Option<Self> {
+        if !candidate_text_size_is_safe(&display) || !candidate_text_size_is_safe(&value) {
+            return None;
+        }
         let (match_class, match_score) = match_score(query, &display)?;
+        if candidate_text_has_control(&display)
+            || display != value && candidate_text_has_control(&value)
+        {
+            return None;
+        }
         Some(Self::matched(
             display,
             value,
@@ -116,7 +147,16 @@ impl Candidate {
         append_space: bool,
         recency_bonus: i64,
     ) -> Option<Self> {
+        if !candidate_text_size_is_safe(display) || !candidate_text_size_is_safe(value) {
+            return None;
+        }
         let (match_class, match_score) = match_score(query, display)?;
+        if candidate_text_has_control(display)
+            || !(std::ptr::eq(display.as_ptr(), value.as_ptr()) && display.len() == value.len())
+                && candidate_text_has_control(value)
+        {
+            return None;
+        }
         Some(Self::matched(
             display.to_owned(),
             value.to_owned(),
@@ -146,6 +186,8 @@ impl Candidate {
             append_space,
             score: match_score + kind.context_weight() + recency_bonus,
             match_class,
+            preserve_order: false,
+            insertion_order: u64::MAX,
         }
     }
 
@@ -154,8 +196,34 @@ impl Candidate {
         self
     }
 
+    pub fn with_preserve_order(mut self, preserve_order: bool) -> Self {
+        self.preserve_order = preserve_order;
+        self
+    }
+
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        let description = description.into();
+        let description = description
+            .into()
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let end = description
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= MAX_CANDIDATE_TEXT_BYTES)
+            .last()
+            .unwrap_or(0);
+        let description = if description.len() > MAX_CANDIDATE_TEXT_BYTES {
+            description[..end].trim_end().to_owned()
+        } else {
+            description
+        };
         if !description.is_empty() {
             self.description = Some(description);
         }
@@ -171,6 +239,7 @@ pub struct CandidateSink {
     limit: usize,
     best_tier: u8,
     candidates: HashMap<String, Candidate>,
+    next_insertion_order: u64,
 }
 
 impl CandidateSink {
@@ -179,6 +248,7 @@ impl CandidateSink {
             limit: limit.max(1),
             best_tier: 0,
             candidates: HashMap::with_capacity(limit.min(512)),
+            next_insertion_order: 0,
         }
     }
 
@@ -186,7 +256,11 @@ impl CandidateSink {
         self.limit.saturating_sub(self.candidates.len()).max(1)
     }
 
-    pub fn push(&mut self, candidate: Candidate) {
+    pub fn push(&mut self, mut candidate: Candidate) {
+        if candidate.preserve_order {
+            candidate.insertion_order = self.next_insertion_order;
+            self.next_insertion_order = self.next_insertion_order.saturating_add(1);
+        }
         let tier = candidate.match_class.candidate_set_tier();
         if tier < self.best_tier {
             return;
@@ -208,11 +282,15 @@ impl CandidateSink {
                     .saturating_add(i64::from(new_source && current.source_mask != 0) * 8);
                 let source_mask = current.source_mask | candidate.source_mask;
                 let append_space = current.append_space && candidate.append_space;
+                let preserve_order = current.preserve_order || candidate.preserve_order;
+                let insertion_order = current.insertion_order.min(candidate.insertion_order);
                 *current = Candidate {
                     description,
                     source_mask,
                     append_space,
                     score,
+                    preserve_order,
+                    insertion_order,
                     ..candidate
                 };
             }
@@ -226,6 +304,8 @@ impl CandidateSink {
                 }
                 current.source_mask |= candidate.source_mask;
                 current.append_space &= candidate.append_space;
+                current.preserve_order |= candidate.preserve_order;
+                current.insertion_order = current.insertion_order.min(candidate.insertion_order);
                 return;
             }
             None => {
@@ -249,15 +329,14 @@ impl CandidateSink {
         if self.candidates.len() <= self.limit {
             return;
         }
-        let mut ranked: Vec<_> = self
-            .candidates
-            .iter()
-            .map(|(key, candidate)| (key.clone(), candidate.score, candidate.display.clone()))
-            .collect();
-        ranked.sort_unstable_by(|left, right| {
-            right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2))
-        });
-        for (key, _, _) in ranked.into_iter().skip(self.limit) {
+        let mut ranked = self.candidates.values().collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| compare_candidates(left, right));
+        let remove = ranked
+            .into_iter()
+            .skip(self.limit)
+            .map(|candidate| candidate.value.clone())
+            .collect::<Vec<_>>();
+        for key in remove {
             self.candidates.remove(&key);
         }
     }
@@ -265,10 +344,19 @@ impl CandidateSink {
 
 fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
     right
-        .score
-        .cmp(&left.score)
-        .then_with(|| left.display.len().cmp(&right.display.len()))
-        .then_with(|| left.display.cmp(&right.display))
+        .match_class
+        .sort_tier()
+        .cmp(&left.match_class.sort_tier())
+        .then_with(|| match (left.preserve_order, right.preserve_order) {
+            (true, true) => left.insertion_order.cmp(&right.insertion_order),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.display.len().cmp(&right.display.len()))
+                .then_with(|| left.display.cmp(&right.display)),
+        })
 }
 
 pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
@@ -416,6 +504,22 @@ mod tests {
     }
 
     #[test]
+    fn candidates_reject_control_characters_before_matching_or_insertion() {
+        assert!(
+            Candidate::from_borrowed("", "unsafe\nrow", "unsafe", CandidateKind::Value, true, 0)
+                .is_none()
+        );
+        assert!(
+            Candidate::from_borrowed("", "safe", "unsafe\u{1b}", CandidateKind::Value, true, 0)
+                .is_none()
+        );
+        let candidate = Candidate::from_borrowed("", "safe", "safe", CandidateKind::Value, true, 0)
+            .unwrap()
+            .with_description("line\nterminal\u{1b}");
+        assert_eq!(candidate.description.as_deref(), Some("line terminal "));
+    }
+
+    #[test]
     fn sink_keeps_exact_and_longer_prefixes_but_discards_weaker_matches() {
         let mut sink = CandidateSink::new(16);
         for name in ["whoami", "somewho", "who"] {
@@ -455,6 +559,27 @@ mod tests {
         );
         assert_eq!(candidates[0].source_mask, 3);
         assert_eq!(candidates[0].score, 4_000_882);
+    }
+
+    #[test]
+    fn sink_honors_explicit_order_for_equally_ranked_candidates() {
+        let mut preserved = CandidateSink::new(4);
+        for name in ["alpha", "zz"] {
+            preserved.push(
+                Candidate::from_borrowed("", name, name, CandidateKind::Value, true, 0)
+                    .unwrap()
+                    .with_preserve_order(true),
+            );
+        }
+        assert_eq!(preserved.finish()[0].display, "alpha");
+
+        let mut ranked = CandidateSink::new(4);
+        for name in ["alpha", "zz"] {
+            ranked.push(
+                Candidate::from_borrowed("", name, name, CandidateKind::Value, true, 0).unwrap(),
+            );
+        }
+        assert_eq!(ranked.finish()[0].display, "zz");
     }
 
     #[test]

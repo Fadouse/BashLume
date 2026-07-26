@@ -68,18 +68,17 @@ No Rust panic is allowed to unwind across a C callback. Entry points use `catch_
 
 ## Threading and fork behavior
 
-Bash itself is single-threaded. The worker thread:
+Bash itself is single-threaded. Two independently bounded workers each request a 256 KiB stack. The cache worker reads directories, bounded account/host/SSH/process/network snapshots, and local rule-pack indexes/blocks; it also seals and lazily decodes authenticated packs. A separate probe supervisor owns nonblocking pipes and at most two signed-capability children, so filesystem or pack I/O cannot delay probe admission, deadlines, or cancellation. Neither worker reads or writes Bash/Readline globals, and both communicate through bounded request channels.
 
-- reads directories, `/etc/passwd`, `/etc/hosts`, SSH host files, and local rule-pack indexes/blocks
-- verifies and decompresses lazily requested command blocks
-- supervises at most two signed-capability dynamic probes through nonblocking pipes
-- never reads or writes Bash/Readline globals
-- communicates through message channels
-- has a 256 KiB requested stack
+Dynamic probes are emitted only by an explicit Tab evaluation of a trusted pack. They use direct argument vectors rather than shell command strings, reject relative/empty PATH components and loader/startup-hook environment variables, apply bounded output, wall-time, process, address-space, descriptor, CPU, and file-size controls, and publish timeout failure without waiting for inherited pipe EOF. Generation-based cancellation is out-of-band and remains polled until acknowledged. Ordinary typing and ghost evaluation never spawn processes.
 
-Dynamic probes are emitted only by an explicit Tab evaluation of a trusted pack. They use direct argument vectors rather than shell command strings, have bounded output and deadlines, and are cancelled when their menu context is abandoned. Ordinary typing and ghost evaluation never spawn processes.
+A checked `pthread_atfork` child hook restores the pre-probe SIGCHLD mask and marks the inherited plugin inactive. A forked child therefore neither inherits BashLume's temporary signal coordination nor touches channels or locks inherited while workers may have been active. A newly executed interactive Bash loads a fresh plugin instance normally.
 
-A `pthread_atfork` child hook marks the inherited plugin inactive. A forked child therefore does not touch channels or locks inherited while the worker may have been active. A newly executed interactive Bash loads a fresh plugin instance normally.
+## Rule conversion pipeline
+
+The Bash, Zsh, and Fish rule projects pin complete upstream source trees. At build time, `bashlume-pack transpile-shell` uses BashLume's own dialect-aware lexer/parser to produce a bounded Script IR data AST. A support-library index resolves statically reachable functions (including Zsh autoload functions), while registration walkers retain Bash `complete`, Fish `complete`, and Zsh `#compdef` service/pattern semantics. This is analysis of fixed source data, not invocation of the source shell.
+
+The support linker follows registered entries with a reachable call graph and scope-local constant-prefix analysis; Bash `_comp_xfunc` and `_comp_compgen` targets are resolved from their data arguments rather than by linking whole helper families. For Zsh, the converter derives a bounded names-only `fpath` snapshot and native function-hash insertion/resize state from the configured bootstrap AST and ordered roots; this preserves complete `${(k)functions}` membership and scan order without retaining unreachable function bodies. Call-scoped tag and label state models `_tags`, `_next_label`, `_wanted`, `_requested`, and `_all_labels`. The pack builder validates registrations, AST structure, resources, and the equality of manifest/module probe-capability sets before encoding command blocks. At runtime only validated `.blp` structures are decoded. No upstream completion text is loaded, parsed, sourced, or passed to a shell. External values can be requested only through the signed, explicit-Tab probe path described above. Before any mapped byte is retained, a bounded pack is copied to a Linux `memfd`, sealed against writes/growth/shrinkage, and then mapped; replacing or truncating a mutable installation path therefore cannot SIGBUS the host Bash process. Script filesystem tests, globs, and regular-file input emit bounded pure-data replay requests; the worker resolves them with type and size limits, and the Script VM never opens a path itself. Compound redirections are typed Script IR nodes rather than runtime-parsed shell text.
 
 ## Completion pipeline
 
@@ -97,7 +96,7 @@ A `pthread_atfork` child hook marks the inherited plugin inactive. A forked chil
 
 ## Filesystem cache
 
-The main thread only sends scan requests and consumes completed responses. It never calls `read_dir`, `stat`, or external programs while handling a key. Cache age starts at the worker's scan-completion timestamp rather than the later time at which an idle main thread consumes the response.
+The main thread only sends scan, typed filesystem-replay, snapshot, and probe requests and consumes completed responses. It never calls `read_dir`, `stat`, opens completion data files, or starts external programs while handling a key. Worker request FIFOs and every pending set are bounded; repeated directory generations are coalesced, and stop/cancellation have out-of-band atomic priority signals. Filesystem replay is generation-scoped to the current line and cursor, pins one coherent cache snapshot while an evaluation converges, and applies backpressure: an unscheduled request remains pending and is retried by menu polling rather than being replayed as a false empty result. Cache age starts at the worker's completion timestamp rather than the later time at which an idle main thread consumes the response. PATH directories, command names, shell names/variables, history, filesystem replay entries, processes, interfaces, accounts, and hosts all have explicit item and byte bounds.
 
 A complete result for a short prefix is reused as a lossless superset for longer prefixes. The current directory is force-refreshed at every prompt, ordinary directory entries have a short freshness window, and ghost suggestions are suppressed while a relevant refresh is pending. `cd`/`pushd` history predictions perform an asynchronous full-target directory validation. If a directory result is truncated, a refined-prefix scan streams the entire directory and retains only the highest-ranked configured number of matches.
 

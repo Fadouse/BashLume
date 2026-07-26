@@ -4,10 +4,17 @@ mod provider;
 mod worker;
 
 use crate::rules::ir::PathCompletion;
-use context::{CompletionContext, QuoteMode, existing_directory_target, quote_shell_word};
+use context::{
+    CompletionContext, MAX_COMPLETION_CONTEXT_BYTES, QuoteMode, existing_directory_target,
+    quote_shell_word,
+};
 use matcher::{Candidate, CandidateKind, CandidateSink};
 use provider::{CompletionProvider, GenericProvider, RuleProvider};
 use worker::CompletionCache;
+
+pub(crate) unsafe fn restore_probe_signal_mask_after_fork() {
+    unsafe { worker::restore_probe_signal_mask_after_fork() }
+}
 
 use crate::shell::{self, ShellSnapshot};
 
@@ -62,7 +69,7 @@ impl CompletionEngine {
         // path completion wins the worker queue at a fresh prompt.
         self.cache.refresh_directory(shell.cwd.clone());
         self.cache.refresh_path(&shell.path);
-        self.cache.load_accounts(shell.home.clone());
+        self.cache.load_snapshots(shell.home.clone());
     }
 
     pub fn complete(
@@ -91,6 +98,12 @@ impl CompletionEngine {
         mode: CompletionMode,
     ) -> CompletionResult {
         self.cache.poll();
+        if context.line.len() > MAX_COMPLETION_CONTEXT_BYTES {
+            return CompletionResult {
+                candidates: Vec::new(),
+                pending: false,
+            };
+        }
         let mut sink = CandidateSink::new(max_candidates);
         let mut pending = false;
         let mut path_completion = PathCompletion::Inherit;
@@ -105,6 +118,9 @@ impl CompletionEngine {
             );
             pending |= status.pending;
             path_completion = path_completion.merge(status.path_completion);
+        }
+        if !pending {
+            self.cache.finish_dynamic_replay();
         }
         CompletionResult {
             candidates: sink.finish(),
@@ -122,7 +138,10 @@ impl CompletionEngine {
         shell_snapshot: &ShellSnapshot,
         max_candidates: usize,
     ) -> Option<GhostSuggestion> {
-        if context.point != context.line.len() || context.line.is_empty() {
+        if context.point != context.line.len()
+            || context.line.is_empty()
+            || context.line.len() > MAX_COMPLETION_CONTEXT_BYTES
+        {
             return None;
         }
 
@@ -197,12 +216,18 @@ impl CompletionEngine {
         }))
     }
 
-    pub fn poll_background(&mut self) {
+    pub fn poll_background(&mut self) -> bool {
         self.cache.poll();
+        self.cache.background_pending()
+    }
+
+    pub fn background_pending(&self) -> bool {
+        self.cache.background_pending()
     }
 
     pub fn cancel_dynamic(&mut self) {
         self.cache.cancel_probes();
+        self.cache.cancel_filesystem_replays();
     }
 
     pub fn command_known(&self, name: &str) -> Option<bool> {
@@ -367,6 +392,7 @@ mod tests {
                         candidates,
                     }],
                     probes: Vec::new(),
+                    scripts: Vec::new(),
                 }],
             };
             let path = root.join(format!("{name}.blp"));

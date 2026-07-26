@@ -24,17 +24,18 @@ Copyright © 2026 **Fadouse**. Distributed under the GNU General Public License,
   - Bash builtins, aliases, and functions
   - files and directories
   - Bash variables
-  - users
-  - `/etc/hosts`, SSH config, and known hosts
+  - users and groups
+  - `/etc/hosts`, bounded SSH config includes, and known hosts
+  - process IDs/names, network interfaces, signals, commands, functions, and variables from bounded snapshots
   - Bash reserved words
 - Context-aware shell quoting for spaces and metacharacters
 - Readline-style, `LS_COLORS`-aware columnar completion menus with optional candidate descriptions
 - Exact candidates remain visible beside longer prefix candidates (`who`, `whoami`)
-- Bounded asynchronous filesystem scanning with silent, automatic pending-menu refresh
+- Bounded asynchronous filesystem scanning and Script-IR filesystem replay with silent, automatic pending-menu refresh
 - Native Readline Emacs and Vi keymaps remain intact
 - Safe fallback to unmodified Readline when loading fails
 
-BashLume never sources Bash, Zsh, or Fish completion scripts at runtime. Separate rule projects compile upstream definitions into validated `.blp` data; BashLume discovers local packs asynchronously and evaluates them in Rust. Source shells are permitted only in rule-project CI as conversion inputs and differential-test oracles. The complete rollout is tracked in [`docs/rule-packs-plan.md`](docs/rule-packs-plan.md), and the format is documented in [`docs/rule-pack-format.md`](docs/rule-pack-format.md).
+BashLume never sources Bash, Zsh, or Fish completion scripts at runtime. Separate rule projects use BashLume's own dialect-aware lexer/parser to compile fixed upstream source and reachable support functions into validated, pure-data Script IR inside `.blp` files; BashLume discovers local packs asynchronously and evaluates that IR in a bounded Rust VM. Source shells are permitted only in rule-project CI as differential-test oracles, never as runtime parsers or completion engines. The complete rollout is tracked in [`docs/rule-packs-plan.md`](docs/rule-packs-plan.md), and the format is documented in [`docs/rule-pack-format.md`](docs/rule-pack-format.md).
 
 ## Requirements
 

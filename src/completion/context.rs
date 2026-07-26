@@ -1,5 +1,7 @@
 use super::matcher::{Candidate, CandidateKind};
 
+pub const MAX_COMPLETION_CONTEXT_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuoteMode {
     Unquoted,
@@ -31,6 +33,21 @@ pub struct CompletionContext {
 impl CompletionContext {
     pub fn analyze(line: &str, point: usize) -> Self {
         let point = floor_char_boundary(line, point.min(line.len()));
+        if line.len() > MAX_COMPLETION_CONTEXT_BYTES {
+            return Self {
+                line: line.to_owned(),
+                point,
+                replace_start: point,
+                replace_end: point,
+                query: String::new(),
+                quote: QuoteMode::Unquoted,
+                command_position: false,
+                words: Vec::new(),
+                word_index: 0,
+                command_name: None,
+                command_path: Vec::new(),
+            };
+        }
         let tokens = lex_shell(line, point);
         let (replace_start, quote) = current_word_start_and_quote(line, point);
         let replace_end = current_word_end(line, point, quote);
@@ -99,6 +116,9 @@ impl CompletionContext {
 /// Returns the first target of `cd`/`pushd` when the line is a simple
 /// navigation command. The value is dequoted but not expanded.
 pub fn existing_directory_target(line: &str) -> Option<String> {
+    if line.len() > MAX_COMPLETION_CONTEXT_BYTES {
+        return None;
+    }
     let tokens = lex_shell(line, line.len());
     let words = tokens
         .iter()
@@ -694,6 +714,15 @@ fn utf8_char_len(first: u8) -> usize {
 mod tests {
     use super::*;
     use crate::completion::matcher::{Candidate, CandidateKind};
+
+    #[test]
+    fn oversized_lines_skip_completion_lexing() {
+        let line = "x".repeat(MAX_COMPLETION_CONTEXT_BYTES + 1);
+        let context = CompletionContext::analyze(&line, line.len());
+        assert!(context.words.is_empty());
+        assert!(context.command_name.is_none());
+        assert_eq!(context.replace_start, line.len());
+    }
 
     #[test]
     fn identifies_command_positions_across_shell_operators() {
