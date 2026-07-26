@@ -91,6 +91,22 @@ source /path/to/BashLume/shell/bashlume.bash
 
 The loader looks for `result/lib/bash/libbashlume.so` and then `target/release/libbashlume.so`. Set `BASHLUME_LIBRARY` to override the location.
 
+## Installing and migrating rule packs
+
+The Bash, Fish, and Zsh packs are separate release artifacts; the core package does not embed their differently licensed data. For each desired source, download all files listed by its release `SHA256SUMS` (including the `.blp`, matching `verifying-key.hex`, provenance, and coverage manifests), then verify and install them locally:
+
+```bash
+sha256sum -c bash.SHA256SUMS
+bashlume-pack verify bash.blp verifying-key.hex
+install -Dm644 bash.blp "$HOME/.local/share/bashlume/rules/bash.blp"
+install -Dm644 verifying-key.hex \
+  "$HOME/.config/bashlume/trusted-keys/bash-rules.pub"
+```
+
+Repeat with distinct filenames for Fish and Zsh, then start a new Bash or run `bashlume reload`. `bashlume rules` must show each pack as `Verified`, compatible, and non-stale before its dynamic providers are enabled. Unsigned or unknown-key packs remain static-only. To roll back one source, remove only its `.blp` and reload; to use a system package, leave `BASHLUME_RULE_PATH` and `BASHLUME_TRUSTED_KEY_PATHS` unset so the packaged loader can append its own `share/bashlume` directories. Existing custom paths remain supported and are colon-separated.
+
+Stable release tags, embedded pack versions, checksums, and provenance are bound to the same reviewed rule-repository commit. Rebuilding provenance additionally requires the pinned upstream and compiler commits recorded in `rules.lock`.
+
 ## Keys
 
 | Key | Normal editing | With suggestion/menu |

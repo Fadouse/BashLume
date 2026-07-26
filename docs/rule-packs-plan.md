@@ -32,6 +32,7 @@ The strict initial-baseline compiler and coverage gates now reject any regressio
 - Zsh: 8 exact cases plus 12 provider-capture invariance cases; 3,314 broad cases (`2812 equal / 484 context / 17 provider / 1 bounded resource classification`); 1,674 bounded registration evaluations.
 - Core: format, test, Clippy, release performance, PTY on Bash 5.0/5.3, tmux, dynamic-probe, and resource gates pass; five repeated standard workloads measured 3,576 KiB additional private memory (the full-gate run measured 3,664 KiB) against a 3,840 KiB cap.
 - A real Bash PTY loaded all three complete packs together and exposed source-unique `apt-cache` candidates from Bash, Fish, and Zsh while retaining the Fish description row.
+- Coverage schema 3 inventories every pinned primary/support/snapshot Git input, exact linked dependencies, symlink identity, and effective command license. Canonical provenance verification, byte-identical rebuilds, full pack-to-spec comparison, and fresh-job reconstruction all pass; the official key is exposed only to a separate pinned-core signing job.
 
 The local core and all three rule CI scripts pass. No upstream-derived Stable artifact has yet been formally release-signed or published, so the distribution/release portions of Phase H remain open.
 
@@ -652,7 +653,7 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 ### Phase A — Specification and legal boundary
 
 - [x] Relicense BashLume core to GPL-2.0-or-later.
-- [ ] Add SPDX and provenance policy.
+- [x] Add SPDX and provenance policy.
 - [x] Finalize binary format and IR specification.
 - [x] Add conformance fixture format and versioning policy.
 
@@ -690,7 +691,7 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Create and initialize Fish rule repository.
 - [x] Implement source-specific parser/compiler pipelines.
 - [x] Implement source helper semantics required by every pinned baseline file.
-- [ ] Generate deterministic packs and provenance manifests.
+- [x] Generate deterministic packs and provenance manifests.
 - [x] Reach zero unsupported/stale rules for initial baselines.
 
 ### Phase F — Differential validation
@@ -708,18 +709,18 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Add deterministic release/signing workflows.
 - [x] Add core pack-lock update PR workflow.
 - [ ] Add Nix outputs and local rule search paths.
-- [ ] Verify runtime is offline and builds are pinned/reproducible.
+- [x] Verify runtime is offline and builds are pinned/reproducible.
 
 ### Phase H — Complete release gate
 
 - [x] All three initial pinned baselines compile with zero unsupported and zero stale commands.
 - [x] Exact normalized differential suites pass.
 - [ ] Core and all pack CI/workflows pass.
-- [ ] Licensing/provenance audit passes.
+- [x] Licensing/provenance audit passes.
 - [x] Dynamic probe security tests pass.
 - [x] Performance/resource gates pass.
 - [x] Real interactive testing confirms merged Bash+Zsh+Fish candidates and descriptions.
-- [ ] Documentation and migration instructions are complete.
+- [x] Documentation and migration instructions are complete.
 
 ## 16. Definition of done
 
