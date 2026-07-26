@@ -62,6 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "inspect" => inspect(&remaining, false),
         "verify" => inspect(&remaining, true),
         "verify-spec" => verify_spec(&remaining),
+        "finalize-provenance" => finalize_provenance(&remaining),
         "key-id" => key_id(&remaining),
         "public-key" => public_key(&remaining),
         "evaluate" => evaluate_pack(&remaining),
@@ -74,7 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
     Err(
-        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify-spec SPEC.json PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex\n  bashlume-pack evaluate PACK.blp CONTEXT.json [VERIFYING_KEY.hex ...]\n  bashlume-pack parse-shell bash|zsh|fish OUTPUT.json SOURCE ...\n  bashlume-pack transpile-shell CONFIG.json OUTPUT.json COVERAGE.json SOURCE ..."
+        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify-spec SPEC.json PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack finalize-provenance PRE.json SPEC.json PACK.blp VERIFYING_KEY.hex OUTPUT.json\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex\n  bashlume-pack evaluate PACK.blp CONTEXT.json [VERIFYING_KEY.hex ...]\n  bashlume-pack parse-shell bash|zsh|fish OUTPUT.json SOURCE ...\n  bashlume-pack transpile-shell CONFIG.json OUTPUT.json COVERAGE.json SOURCE ..."
             .into(),
     )
 }
@@ -110,7 +111,17 @@ fn verify_spec(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::erro
         keys.insert(read_verifying_key(Path::new(path))?);
     }
     let pack = PackFile::open(Path::new(&arguments[1]), &keys)?;
-    if arguments.len() > 2 && !pack.trust().permits_dynamic_probes() {
+    verify_pack_specification(&pack, &spec, arguments.len() > 2)?;
+    println!("pack exactly matches build specification");
+    Ok(())
+}
+
+fn verify_pack_specification(
+    pack: &PackFile,
+    spec: &PackBuildSpec,
+    require_trust: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if require_trust && !pack.trust().permits_dynamic_probes() {
         return Err("pack is not signed by a supplied verifying key".into());
     }
     if pack.manifest() != &spec.manifest
@@ -121,31 +132,116 @@ fn verify_spec(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::erro
     {
         return Err("pack metadata does not match build specification".into());
     }
-    let expected_names = spec
-        .commands
-        .iter()
-        .flat_map(|command| command.registrations.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    if spec.commands.is_empty() {
+        return Err("build specification has no command blocks".into());
+    }
+    let mut expected_names = BTreeSet::new();
+    for command in &spec.commands {
+        command.validate()?;
+        for registration in &command.registrations {
+            if !expected_names.insert(registration.clone()) {
+                return Err(format!("duplicate command registration: {registration}").into());
+            }
+        }
+    }
     let actual_names = pack
         .command_names()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    if actual_names != expected_names || pack.command_count() != expected_names.len() {
+    if actual_names != expected_names
+        || pack.command_count() != expected_names.len()
+        || pack.block_count() != spec.commands.len()
+    {
         return Err("pack command index does not match build specification".into());
     }
     for expected in &spec.commands {
-        let actual = pack
-            .load_command(&expected.canonical_name)?
-            .ok_or_else(|| format!("missing command block: {}", expected.canonical_name))?;
-        if &actual != expected {
-            return Err(format!(
-                "command block does not match build specification: {}",
-                expected.canonical_name
-            )
-            .into());
+        for registration in &expected.registrations {
+            let actual = pack
+                .load_command(registration)?
+                .ok_or_else(|| format!("missing command registration: {registration}"))?;
+            if &actual != expected {
+                return Err(format!(
+                    "command registration does not match build specification: {registration}"
+                )
+                .into());
+            }
         }
     }
-    println!("pack exactly matches build specification");
+    Ok(())
+}
+
+fn finalize_provenance(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() != 5 {
+        return usage();
+    }
+    let provenance_bytes = read_bytes_bounded(Path::new(&arguments[0]), 128 * 1024 * 1024)?;
+    let mut provenance: serde_json::Value = serde_json::from_slice(&provenance_bytes)?;
+    let spec_bytes = read_bytes_bounded(Path::new(&arguments[1]), 512 * 1024 * 1024)?;
+    let spec: PackBuildSpec = serde_json::from_slice(&spec_bytes)?;
+    let verifying_key_bytes = read_bytes_bounded(Path::new(&arguments[3]), 4096)?;
+    let verifying_key_text = std::str::from_utf8(&verifying_key_bytes)?;
+    let verifying_key_decoded = hex::decode(verifying_key_text.trim())?;
+    let verifying_key_array: [u8; 32] = verifying_key_decoded
+        .try_into()
+        .map_err(|_| "verifying key must contain exactly 32 bytes")?;
+    let verifying_key = VerifyingKey::from_bytes(&verifying_key_array)?;
+    let mut keys = TrustedKeys::default();
+    let key_id = keys.insert(verifying_key);
+    let pack = PackFile::open(Path::new(&arguments[2]), &keys)?;
+    verify_pack_specification(&pack, &spec, true)?;
+    let spec_sha256 = hex::encode(Sha256::digest(&spec_bytes));
+    if provenance
+        .pointer("/inputs/spec_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(spec_sha256.as_str())
+    {
+        return Err("provenance specification digest is invalid".into());
+    }
+    let source_kind = serde_json::to_value(spec.manifest.source_kind)?;
+    let source_kind = source_kind
+        .as_str()
+        .ok_or("serialized source kind is not a string")?;
+    let pack_record = provenance
+        .get_mut("pack")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("provenance pack record is missing")?;
+    if pack_record.get("id").and_then(serde_json::Value::as_str)
+        != Some(spec.manifest.pack_id.as_str())
+        || pack_record
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            != Some(spec.manifest.pack_version.as_str())
+        || pack_record
+            .get("channel")
+            .and_then(serde_json::Value::as_str)
+            != Some(spec.manifest.channel.as_str())
+        || pack_record
+            .get("license_expression")
+            .and_then(serde_json::Value::as_str)
+            != Some(spec.manifest.license_expression.as_str())
+        || pack_record
+            .get("source_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_kind)
+    {
+        return Err("provenance identity does not match build specification".into());
+    }
+    pack_record.insert(
+        "sha256".into(),
+        serde_json::Value::String(hex::encode(pack.content_sha256())),
+    );
+    pack_record.insert("size".into(), serde_json::Value::from(pack.content_len()));
+    pack_record.insert(
+        "verifying_key".into(),
+        serde_json::json!({
+            "key_id": hex::encode(key_id),
+            "sha256": hex::encode(Sha256::digest(&verifying_key_bytes)),
+        }),
+    );
+    let mut encoded = serde_json::to_vec_pretty(&provenance)?;
+    encoded.push(b'\n');
+    atomic_write(Path::new(&arguments[4]), &encoded)?;
+    println!("finalized signed-pack provenance");
     Ok(())
 }
 

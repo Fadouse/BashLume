@@ -356,6 +356,18 @@ impl PackFile {
         self.names.len()
     }
 
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn content_len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    pub fn content_sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.mapping[..]).into()
+    }
+
     pub fn contains_command(&self, command: &str) -> bool {
         !self.matching_block_ids(command).is_empty()
     }
