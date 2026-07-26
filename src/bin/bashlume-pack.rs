@@ -503,17 +503,28 @@ fn collect_preloaded_zsh_functions(
     }
 }
 
+#[derive(Default)]
+struct ZshPreloadMetadata {
+    names: Vec<String>,
+    table_size: u32,
+    sources: HashMap<PathBuf, PathBuf>,
+}
+
 fn zsh_preloaded_function_names(
     config: &ShellTranspileConfig,
-) -> Result<(Vec<String>, u32), Box<dyn std::error::Error>> {
+    source_root: &Path,
+) -> Result<ZshPreloadMetadata, Box<dyn std::error::Error>> {
     if config.dialect != ScriptDialect::Zsh {
-        return Ok((Vec::new(), 0));
+        return Ok(ZshPreloadMetadata::default());
     }
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     let mut table_size = 7_u32;
+    let mut sources = HashMap::new();
     for path in &config.zsh_preload_files {
-        let path = path.canonicalize()?;
+        let path = lexical_source_path(source_root, path)?;
+        let resolved = canonical_source_path(source_root, &path)?;
+        sources.insert(path.clone(), resolved);
         let source = read_text_bounded(&path, MAX_SCRIPT_SOURCE_BYTES)?;
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             update_preloaded_function(&mut names, &mut seen, &mut table_size, name, false);
@@ -522,13 +533,55 @@ fn zsh_preloaded_function_names(
             .map_err(|error| format!("{}: {error}", path.display()))?;
         collect_preloaded_zsh_functions(&module.statements, &mut names, &mut seen, &mut table_size);
     }
-    Ok((names, table_size))
+    Ok(ZshPreloadMetadata {
+        names,
+        table_size,
+        sources,
+    })
+}
+
+fn lexical_source_path(
+    source_root: &Path,
+    path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) || path.strip_prefix(source_root).is_err()
+    {
+        return Err(format!("{} is outside source root", path.display()).into());
+    }
+    Ok(path)
+}
+
+fn canonical_source_path(
+    source_root: &Path,
+    path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let canonical = path.canonicalize()?;
+    canonical
+        .strip_prefix(source_root)
+        .map_err(|_| format!("{} resolves outside source root", path.display()))?;
+    Ok(canonical)
 }
 
 struct SupportLibrary {
     dialect: ScriptDialect,
+    source_root: PathBuf,
     files: HashMap<String, PathBuf>,
     functions: HashMap<String, ScriptFunction>,
+    function_sources: HashMap<String, PathBuf>,
+    indexed_directories: BTreeSet<PathBuf>,
+    resolved_directories: BTreeSet<PathBuf>,
+    indexed_files: BTreeSet<PathBuf>,
+    resolved_files: HashMap<PathBuf, PathBuf>,
     loaded_files: BTreeSet<PathBuf>,
     zsh_function_roots: Vec<PathBuf>,
     zsh_preloaded_functions: Vec<String>,
@@ -537,32 +590,45 @@ struct SupportLibrary {
 
 impl SupportLibrary {
     fn new(config: &ShellTranspileConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let (zsh_preloaded_functions, zsh_preloaded_function_table_size) =
-            zsh_preloaded_function_names(config)?;
+        let source_root = config.source_root.canonicalize()?;
+        let preload = zsh_preloaded_function_names(config, &source_root)?;
+        let zsh_function_roots = config
+            .zsh_function_roots
+            .iter()
+            .map(|root| lexical_source_path(&source_root, root))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut library = Self {
             dialect: config.dialect,
+            source_root,
             files: HashMap::new(),
             functions: HashMap::new(),
+            function_sources: HashMap::new(),
+            indexed_directories: BTreeSet::new(),
+            resolved_directories: BTreeSet::new(),
+            indexed_files: preload.sources.keys().cloned().collect(),
+            resolved_files: preload.sources,
             loaded_files: BTreeSet::new(),
-            zsh_function_roots: config
-                .zsh_function_roots
-                .iter()
-                .map(|root| root.canonicalize())
-                .collect::<Result<Vec<_>, _>>()?,
-            zsh_preloaded_functions,
-            zsh_preloaded_function_table_size,
+            zsh_function_roots,
+            zsh_preloaded_functions: preload.names,
+            zsh_preloaded_function_table_size: preload.table_size,
         };
+        library.check_index_limit()?;
+        for root in library.zsh_function_roots.clone() {
+            library.track_indexed_directory(&root)?;
+        }
         for root in &config.support_roots {
-            library.index_root(&root.canonicalize()?)?;
+            let root = lexical_source_path(&library.source_root, root)?;
+            library.index_root(&root)?;
         }
         for file in &config.support_files {
-            library.load_file(&file.canonicalize()?)?;
+            let file = lexical_source_path(&library.source_root, file)?;
+            library.load_file(&file)?;
         }
         Ok(library)
     }
 
     fn zsh_function_metadata(
-        &self,
+        &mut self,
         source_path: &Path,
     ) -> Result<(Vec<String>, u32), Box<dyn std::error::Error>> {
         if self.dialect != ScriptDialect::Zsh {
@@ -570,7 +636,7 @@ impl SupportLibrary {
         }
         let mut roots = Vec::new();
         if let Some(parent) = source_path.parent() {
-            roots.push(parent.canonicalize()?);
+            roots.push(lexical_source_path(&self.source_root, parent)?);
         }
         roots.extend(self.zsh_function_roots.iter().cloned());
         if self.zsh_function_roots.is_empty() {
@@ -602,11 +668,11 @@ impl SupportLibrary {
             if !seen_roots.insert(root.clone()) {
                 continue;
             }
+            self.track_indexed_directory(&root)?;
             let mut children = fs::read_dir(&root)?
-                .flatten()
-                .map(|entry| entry.path())
+                .map(|entry| entry.map(|entry| entry.path()))
                 .take(MAX_SUPPORT_LIBRARY_FILES + 1)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             if children.len() > MAX_SUPPORT_LIBRARY_FILES {
                 return Err("Zsh function index file limit exceeded".into());
             }
@@ -626,6 +692,7 @@ impl SupportLibrary {
                 {
                     continue;
                 }
+                self.track_indexed_file(&path)?;
                 name_bytes = name_bytes.saturating_add(name.len());
                 if names.len() >= MAX_SUPPORT_LIBRARY_FUNCTIONS
                     || name_bytes > MAX_ZSH_FUNCTION_NAME_BYTES
@@ -643,26 +710,24 @@ impl SupportLibrary {
 
     fn index_root(&mut self, root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut pending = vec![root.to_owned()];
-        let mut visited = 0_usize;
         while let Some(path) = pending.pop() {
-            visited = visited.saturating_add(1);
-            if visited > MAX_SUPPORT_LIBRARY_FILES {
-                return Err("support library file limit exceeded".into());
-            }
-            if path.is_dir() {
+            let resolved = canonical_source_path(&self.source_root, &path)?;
+            if resolved.is_dir() {
+                self.track_indexed_directory(&path)?;
+                if !self.resolved_directories.insert(resolved) {
+                    continue;
+                }
                 let mut children = fs::read_dir(&path)?
-                    .flatten()
-                    .map(|entry| entry.path())
+                    .map(|entry| entry.map(|entry| entry.path()))
                     .take(MAX_SUPPORT_LIBRARY_FILES + 1)
-                    .collect::<Vec<_>>();
-                if children.len() > MAX_SUPPORT_LIBRARY_FILES
-                    || pending.len().saturating_add(children.len()) > MAX_SUPPORT_LIBRARY_FILES
-                {
+                    .collect::<Result<Vec<_>, _>>()?;
+                if children.len() > MAX_SUPPORT_LIBRARY_FILES {
                     return Err("support library file limit exceeded".into());
                 }
                 children.sort();
                 pending.extend(children.into_iter().rev());
-            } else if path.is_file() {
+            } else if resolved.is_file() {
+                self.track_indexed_file(&path)?;
                 if let Some(file_name) = path.file_name().and_then(|value| value.to_str()) {
                     let stem = file_name
                         .strip_suffix(".fish")
@@ -675,7 +740,39 @@ impl SupportLibrary {
         Ok(())
     }
 
+    fn track_indexed_directory(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let resolved = canonical_source_path(&self.source_root, path)?;
+        if !resolved.is_dir() {
+            return Err(format!("{} is not a support source directory", path.display()).into());
+        }
+        self.indexed_directories.insert(path.to_owned());
+        self.check_index_limit()
+    }
+
+    fn track_indexed_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let resolved = canonical_source_path(&self.source_root, path)?;
+        if !resolved.is_file() {
+            return Err(format!("{} is not a support source file", path.display()).into());
+        }
+        self.indexed_files.insert(path.to_owned());
+        self.resolved_files.insert(path.to_owned(), resolved);
+        self.check_index_limit()
+    }
+
+    fn check_index_limit(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self
+            .indexed_directories
+            .len()
+            .saturating_add(self.indexed_files.len())
+            > MAX_SUPPORT_LIBRARY_FILES
+        {
+            return Err("support library file limit exceeded".into());
+        }
+        Ok(())
+    }
+
     fn load_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.track_indexed_file(path)?;
         if self.loaded_files.contains(path) {
             return Ok(());
         }
@@ -716,13 +813,17 @@ impl SupportLibrary {
             {
                 return Err("support library function limit exceeded".into());
             }
-            self.functions
-                .entry(name.clone())
-                .or_insert(ScriptFunction {
-                    name,
-                    arguments: Vec::new(),
-                    body: module.statements.clone(),
-                });
+            if !self.functions.contains_key(&name) {
+                self.function_sources.insert(name.clone(), path.to_owned());
+                self.functions.insert(
+                    name.clone(),
+                    ScriptFunction {
+                        name,
+                        arguments: Vec::new(),
+                        body: module.statements.clone(),
+                    },
+                );
+            }
         }
         for function in module.functions {
             if self.functions.len() >= MAX_SUPPORT_LIBRARY_FUNCTIONS
@@ -730,9 +831,11 @@ impl SupportLibrary {
             {
                 return Err("support library function limit exceeded".into());
             }
-            self.functions
-                .entry(function.name.clone())
-                .or_insert(function);
+            if !self.functions.contains_key(&function.name) {
+                self.function_sources
+                    .insert(function.name.clone(), path.to_owned());
+                self.functions.insert(function.name.clone(), function);
+            }
         }
         Ok(())
     }
@@ -774,13 +877,14 @@ impl SupportLibrary {
         &mut self,
         module: &mut ScriptModule,
         source_path: &Path,
-    ) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    ) -> Result<(BTreeSet<String>, BTreeSet<PathBuf>), Box<dyn std::error::Error>> {
         let mut known = module
             .functions
             .iter()
             .map(|function| function.name.clone())
             .collect::<BTreeSet<_>>();
         let mut analyzed = BTreeSet::new();
+        let mut linked_sources = BTreeSet::new();
         let mut pending = BTreeSet::new();
         collect_executable_calls(&module.statements, &mut pending);
         pending.extend(module.registrations.iter().filter_map(|registration| {
@@ -837,9 +941,20 @@ impl SupportLibrary {
             }
             known.insert(name.clone());
             module.functions.push(function);
+            if let Some(path) = self.function_sources.get(&name) {
+                linked_sources.insert(path.clone());
+            }
             pending.insert(name);
         }
-        Ok(analyzed)
+        Ok((analyzed, linked_sources))
+    }
+
+    fn indexed_source_files(&self) -> &BTreeSet<PathBuf> {
+        &self.indexed_files
+    }
+
+    fn resolved_source_file(&self, path: &Path) -> Option<&Path> {
+        self.resolved_files.get(path).map(PathBuf::as_path)
     }
 }
 
@@ -2584,6 +2699,7 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
     let mut support = SupportLibrary::new(&config)?;
     let mut groups = Vec::<ScriptGroup>::new();
     let mut report_files = Vec::new();
+    let mut primary_paths = BTreeSet::new();
     let mut all_registrations = BTreeSet::new();
     let mut all_probe_capabilities = BTreeSet::new();
     for source_path in &arguments[3..] {
@@ -2602,7 +2718,7 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
         module.zsh_function_snapshot = config.dialect == ScriptDialect::Zsh;
         module.zsh_function_table_size = zsh_function_table_size;
         module.zsh_function_names = zsh_function_names;
-        let reachable_functions = support.link(&mut module, &source_path)?;
+        let (reachable_functions, linked_sources) = support.link(&mut module, &source_path)?;
         module.probe_capabilities = script_probe_capabilities(&module, &reachable_functions);
         module
             .validate()
@@ -2625,19 +2741,39 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
         );
         all_registrations.extend(grouping_registrations.iter().cloned());
         let license = source_license(&source, &config.default_license);
+        let dependency_licenses = linked_sources
+            .iter()
+            .map(|path| {
+                read_text_bounded(path, MAX_SCRIPT_SOURCE_BYTES)
+                    .map(|source| source_license(&source, &config.default_license))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
         let digest = hex::encode(Sha256::digest(source.as_bytes()));
+        let dependencies = linked_sources
+            .into_iter()
+            .filter(|path| path != &source_path)
+            .map(|path| {
+                path.strip_prefix(&source_root)
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .map_err(|_| format!("{} is outside source root", path.display()))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        primary_paths.insert(relative.clone());
         report_files.push(serde_json::json!({
             "path": relative,
             "sha256": digest,
             "registrations": registrations,
             "license": license,
+            "dependencies": dependencies,
             "unsupported": [],
         }));
 
+        let mut licenses = dependency_licenses;
+        licenses.insert(license);
         let mut group = ScriptGroup {
             registrations: grouping_registrations,
             scripts: vec![module],
-            licenses: BTreeSet::from([license]),
+            licenses,
             source_paths: BTreeSet::from([relative]),
         };
         let mut index = 0;
@@ -2686,7 +2822,7 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
                 registrations,
                 source_path: group.source_paths.into_iter().collect::<Vec<_>>().join(";"),
                 source_commit: config.manifest.source_commit.clone(),
-                license: group.licenses.into_iter().collect::<Vec<_>>().join(" AND "),
+                license: combined_license_expression(group.licenses),
                 static_rules: Vec::new(),
                 probes: Vec::new(),
                 scripts: group.scripts,
@@ -2699,16 +2835,46 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
     }
 
     report_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    let mut report_support_files = Vec::new();
+    for path in support.indexed_source_files() {
+        let relative = path
+            .strip_prefix(&source_root)
+            .map_err(|_| format!("{} is outside source root", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if primary_paths.contains(&relative) {
+            continue;
+        }
+        let resolved = support
+            .resolved_source_file(path)
+            .ok_or_else(|| format!("{} has no validated source identity", path.display()))?;
+        let resolved_relative = resolved
+            .strip_prefix(&source_root)
+            .map_err(|_| format!("{} is outside source root", resolved.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = read_bytes_bounded(path, MAX_SCRIPT_SOURCE_BYTES)?;
+        let source = String::from_utf8_lossy(&bytes);
+        report_support_files.push(serde_json::json!({
+            "path": relative,
+            "resolved_path": (resolved != path).then_some(resolved_relative),
+            "sha256": hex::encode(Sha256::digest(&bytes)),
+            "license": source_license(&source, &config.default_license),
+        }));
+    }
+    report_support_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
     let report = serde_json::json!({
-        "schema": 2,
+        "schema": 3,
         "source_commit": config.manifest.source_commit,
         "source_files": report_files.len(),
         "compiled_files": report_files.len(),
+        "support_files": report_support_files.len(),
         "command_blocks": commands.len(),
         "registrations": all_registrations.len(),
         "unsupported_files": 0,
         "stale_registrations": 0,
         "files": report_files,
+        "support": report_support_files,
     });
     config.manifest.probe_capabilities = all_probe_capabilities.into_iter().collect();
     let spec = PackBuildSpec {
@@ -2730,6 +2896,20 @@ fn transpile_shell(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
         all_registrations.len()
     );
     Ok(())
+}
+
+fn combined_license_expression(licenses: BTreeSet<String>) -> String {
+    licenses
+        .into_iter()
+        .map(|license| {
+            if license.contains(" OR ") {
+                format!("({license})")
+            } else {
+                license
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn source_license(source: &str, default_license: &str) -> String {
@@ -3149,6 +3329,17 @@ mod tests {
     }
 
     #[test]
+    fn mixed_dependency_licenses_are_parenthesized_in_command_provenance() {
+        assert_eq!(
+            combined_license_expression(BTreeSet::from([
+                "GPL-2.0-or-later".to_owned(),
+                "GPL-2.0-or-later OR ISC".to_owned(),
+            ])),
+            "GPL-2.0-or-later AND (GPL-2.0-or-later OR ISC)"
+        );
+    }
+
+    #[test]
     fn zsh_preload_removal_does_not_shrink_function_table_history() {
         let mut names = Vec::new();
         let mut seen = HashSet::new();
@@ -3180,8 +3371,14 @@ mod tests {
         .unwrap();
         let mut library = SupportLibrary {
             dialect: ScriptDialect::Bash,
+            source_root: root.canonicalize().unwrap(),
             files: HashMap::new(),
             functions: HashMap::new(),
+            function_sources: HashMap::new(),
+            indexed_directories: BTreeSet::new(),
+            resolved_directories: BTreeSet::new(),
+            indexed_files: BTreeSet::new(),
+            resolved_files: HashMap::new(),
             loaded_files: BTreeSet::new(),
             zsh_function_roots: Vec::new(),
             zsh_preloaded_functions: Vec::new(),
@@ -3194,13 +3391,14 @@ mod tests {
             "target=_small\n_entry() { $target; }\ncomplete -F _entry demo\n",
         )
         .unwrap();
-        let reachable = library.link(&mut module, &root.join("demo.bash")).unwrap();
+        let (reachable, dependencies) = library.link(&mut module, &root.join("demo.bash")).unwrap();
         assert!(
             module
                 .functions
                 .iter()
                 .any(|function| function.name == "_small_one")
         );
+        assert_eq!(dependencies, BTreeSet::from([root.join("_small_one")]));
         assert!(script_probe_capabilities(&module, &reachable).contains(&"probe-tool".to_owned()));
         fs::remove_dir_all(root).unwrap();
     }
@@ -3218,8 +3416,14 @@ mod tests {
         .unwrap();
         let mut library = SupportLibrary {
             dialect: ScriptDialect::Bash,
+            source_root: root.canonicalize().unwrap(),
             files: HashMap::new(),
             functions: HashMap::new(),
+            function_sources: HashMap::new(),
+            indexed_directories: BTreeSet::new(),
+            resolved_directories: BTreeSet::new(),
+            indexed_files: BTreeSet::new(),
+            resolved_files: HashMap::new(),
             loaded_files: BTreeSet::new(),
             zsh_function_roots: Vec::new(),
             zsh_preloaded_functions: Vec::new(),
@@ -3232,16 +3436,90 @@ mod tests {
             "_entry() { find . -type f; }\ncomplete -F _entry demo\n",
         )
         .unwrap();
-        let reachable = library.link(&mut module, &root.join("demo.bash")).unwrap();
+        let (reachable, dependencies) = library.link(&mut module, &root.join("demo.bash")).unwrap();
         assert!(
             !module
                 .functions
                 .iter()
                 .any(|function| { function.name == "find" || function.name == "_comp_cmd_find" })
         );
+        assert!(dependencies.is_empty());
         assert!(
             !script_probe_capabilities(&module, &reachable).contains(&"unrelated-probe".into())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn support_symlinks_cannot_escape_the_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary =
+            std::env::temp_dir().join(format!("bashlume-support-boundary-{}", std::process::id()));
+        let root = temporary.join("root");
+        let outside = temporary.join("outside");
+        let _ = fs::remove_dir_all(&temporary);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "_outside() { :; }\n").unwrap();
+        symlink(&outside, root.join("_outside")).unwrap();
+        let mut library = SupportLibrary {
+            dialect: ScriptDialect::Bash,
+            source_root: root.canonicalize().unwrap(),
+            files: HashMap::new(),
+            functions: HashMap::new(),
+            function_sources: HashMap::new(),
+            indexed_directories: BTreeSet::new(),
+            resolved_directories: BTreeSet::new(),
+            indexed_files: BTreeSet::new(),
+            resolved_files: HashMap::new(),
+            loaded_files: BTreeSet::new(),
+            zsh_function_roots: Vec::new(),
+            zsh_preloaded_functions: Vec::new(),
+            zsh_preloaded_function_table_size: 0,
+        };
+        assert!(library.index_root(&root).is_err());
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn configured_support_symlinks_preserve_implicit_names_and_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("bashlume-support-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let implementation = root.join("_implementation");
+        let alias = root.join("_alias");
+        let directory_alias = root.join("alias-root");
+        fs::write(&implementation, "print value\n").unwrap();
+        symlink(&implementation, &alias).unwrap();
+        symlink(&root, &directory_alias).unwrap();
+        let mut library = SupportLibrary {
+            dialect: ScriptDialect::Zsh,
+            source_root: root.canonicalize().unwrap(),
+            files: HashMap::new(),
+            functions: HashMap::new(),
+            function_sources: HashMap::new(),
+            indexed_directories: BTreeSet::new(),
+            resolved_directories: BTreeSet::new(),
+            indexed_files: BTreeSet::new(),
+            resolved_files: HashMap::new(),
+            loaded_files: BTreeSet::new(),
+            zsh_function_roots: Vec::new(),
+            zsh_preloaded_functions: Vec::new(),
+            zsh_preloaded_function_table_size: 0,
+        };
+        library.load_file(&alias).unwrap();
+        library.track_indexed_directory(&root).unwrap();
+        library.track_indexed_directory(&directory_alias).unwrap();
+        assert!(library.functions.contains_key("_alias"));
+        assert_eq!(
+            library.resolved_source_file(&alias),
+            Some(implementation.as_path())
+        );
+        assert_eq!(library.indexed_directories.len(), 2);
+        fs::remove_file(directory_alias).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
