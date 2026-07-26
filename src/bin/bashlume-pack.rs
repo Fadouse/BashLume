@@ -61,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "build" => build(&remaining),
         "inspect" => inspect(&remaining, false),
         "verify" => inspect(&remaining, true),
+        "verify-spec" => verify_spec(&remaining),
         "key-id" => key_id(&remaining),
         "public-key" => public_key(&remaining),
         "evaluate" => evaluate_pack(&remaining),
@@ -73,7 +74,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage<T>() -> Result<T, Box<dyn std::error::Error>> {
     Err(
-        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex\n  bashlume-pack evaluate PACK.blp CONTEXT.json [VERIFYING_KEY.hex ...]\n  bashlume-pack parse-shell bash|zsh|fish OUTPUT.json SOURCE ...\n  bashlume-pack transpile-shell CONFIG.json OUTPUT.json COVERAGE.json SOURCE ..."
+        "usage:\n  bashlume-pack build SPEC.json OUTPUT.blp [SIGNING_KEY.hex]\n  bashlume-pack inspect PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack verify-spec SPEC.json PACK.blp [VERIFYING_KEY.hex ...]\n  bashlume-pack key-id VERIFYING_KEY.hex\n  bashlume-pack public-key SIGNING_KEY.hex\n  bashlume-pack evaluate PACK.blp CONTEXT.json [VERIFYING_KEY.hex ...]\n  bashlume-pack parse-shell bash|zsh|fish OUTPUT.json SOURCE ...\n  bashlume-pack transpile-shell CONFIG.json OUTPUT.json COVERAGE.json SOURCE ..."
             .into(),
     )
 }
@@ -93,6 +94,58 @@ fn build(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Err
     let bytes = PackBuilder::new(spec).build(signing_key.as_ref())?;
     atomic_write(output, &bytes)?;
     println!("wrote {} bytes to {}", bytes.len(), output.display());
+    Ok(())
+}
+
+fn verify_spec(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() < 2 {
+        return usage();
+    }
+    let spec: PackBuildSpec = serde_json::from_slice(&read_bytes_bounded(
+        Path::new(&arguments[0]),
+        512 * 1024 * 1024,
+    )?)?;
+    let mut keys = TrustedKeys::default();
+    for path in &arguments[2..] {
+        keys.insert(read_verifying_key(Path::new(path))?);
+    }
+    let pack = PackFile::open(Path::new(&arguments[1]), &keys)?;
+    if arguments.len() > 2 && !pack.trust().permits_dynamic_probes() {
+        return Err("pack is not signed by a supplied verifying key".into());
+    }
+    if pack.manifest() != &spec.manifest
+        || pack.source_kind() != spec.manifest.source_kind
+        || pack.minimum_engine() != spec.minimum_engine
+        || pack.required_opcodes() != spec.required_opcodes
+        || pack.optional_features() != spec.optional_features
+    {
+        return Err("pack metadata does not match build specification".into());
+    }
+    let expected_names = spec
+        .commands
+        .iter()
+        .flat_map(|command| command.registrations.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let actual_names = pack
+        .command_names()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if actual_names != expected_names || pack.command_count() != expected_names.len() {
+        return Err("pack command index does not match build specification".into());
+    }
+    for expected in &spec.commands {
+        let actual = pack
+            .load_command(&expected.canonical_name)?
+            .ok_or_else(|| format!("missing command block: {}", expected.canonical_name))?;
+        if &actual != expected {
+            return Err(format!(
+                "command block does not match build specification: {}",
+                expected.canonical_name
+            )
+            .into());
+        }
+    }
+    println!("pack exactly matches build specification");
     Ok(())
 }
 

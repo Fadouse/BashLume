@@ -15,6 +15,9 @@ trap 'rm -f -- "$rule_pack"' EXIT
 target/release/bashlume-pack build \
   tests/fixtures/rules/demo.json "$rule_pack" \
   tests/fixtures/rules/test-signing-key.hex
+target/release/bashlume-pack verify-spec \
+  tests/fixtures/rules/demo.json "$rule_pack" \
+  tests/fixtures/rules/test-verifying-key.hex
 rule_arguments=(
   --rule-pack "$rule_pack"
   --trusted-key tests/fixtures/rules/test-verifying-key.hex

@@ -8,7 +8,7 @@
 - Evaluate static rules in a bounded Rust VM and merge candidates from every installed source with description preservation, conservative spacing, and source agreement metadata.
 - Add signed, capability-declared, Tab-only dynamic probes supervised through `posix_spawnp` with concurrency, timeout, output, cache, and shell-execution limits.
 - Add Completion IR block versions 2–4 and pack format 1.1 path policies, pure-data Script IR, compound redirections, build-time heredocs/deferred actions, and backward decoding of earlier blocks.
-- Add first-party bounded Bash, Fish, and Zsh lexers/parsers, call-graph support-library linking, exact primary/support dependency provenance, and a deterministic dialect VM; runtime never parses, sources, or executes upstream completion text.
+- Add first-party bounded Bash, Fish, and Zsh lexers/parsers, call-graph support-library linking, exact primary/support dependency provenance, full pack-to-spec verification, and a deterministic dialect VM; runtime never parses, sources, or executes upstream completion text.
 - Replay filesystem tests, globs, regular-file input, nested completion, accounts, hosts, processes, interfaces, signals, commands, functions, and variables from explicit bounded asynchronous snapshots.
 - Preserve native candidate order, descriptions, kinds, spacing, path policy, completion status, quoting, wrappers/services, and provider attribution through strict and full-baseline native differential gates.
 - Harden source/context/regex/arithmetic/pattern/redirection/probe limits, terminal candidate validation, host/include traversal, shell/history snapshots, SIGCHLD coordination, and all hot-path filesystem access.

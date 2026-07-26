@@ -199,3 +199,5 @@ These are parser security boundaries, not recommended generation targets.
 ## Compatibility
 
 Format-major changes are breaking. Minor additions must remain backward compatible and be guarded by feature bits. Engine 0.2 reads container minors 1.0 and 1.1 and command-block versions 1, 2, 3, and 4; it writes 1.1/version 4. BashLume supports the current major and, once a second major exists, the immediately preceding major through a dedicated decoder. It must never treat an unknown major, newer minor, or unknown command-block version as the current layout.
+
+Release provenance must bind the artifact to its build specification with `bashlume-pack verify-spec SPEC.json PACK.blp [VERIFYING_KEY ...]`. This command compares the complete decoded manifest, feature/version fields, command index, and every command block with the supplied specification; ordinary `verify` checks container integrity but does not make that external provenance claim.
