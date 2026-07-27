@@ -391,18 +391,42 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
 }
 
 pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
-    if query == candidate {
-        return Some((MatchClass::Exact, 5_000_000));
-    }
-    if candidate.starts_with(query) {
-        let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
-        return Some((MatchClass::Prefix, 4_000_000 - length_penalty));
-    }
     if query.is_ascii() {
         let query_bytes = query.as_bytes();
         let candidate_bytes = candidate.as_bytes();
-        if candidate_bytes.len() >= query_bytes.len()
-            && candidate_bytes[..query_bytes.len()].eq_ignore_ascii_case(query_bytes)
+        if let Some(prefix) = candidate_bytes.get(..query_bytes.len()) {
+            if prefix.eq_ignore_ascii_case(query_bytes) {
+                let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
+                return if prefix == query_bytes {
+                    if candidate.len() == query.len() {
+                        Some((MatchClass::Exact, 5_000_000))
+                    } else {
+                        Some((MatchClass::Prefix, 4_000_000 - length_penalty))
+                    }
+                } else {
+                    Some((
+                        MatchClass::CaseInsensitivePrefix,
+                        3_000_000 - length_penalty,
+                    ))
+                };
+            }
+        }
+        let (candidate_is_ascii, score) =
+            match_ascii_substring_and_fuzzy(query_bytes, candidate_bytes);
+        if candidate_is_ascii {
+            return score;
+        }
+    } else {
+        if candidate.starts_with(query) {
+            if candidate.len() == query.len() {
+                return Some((MatchClass::Exact, 5_000_000));
+            }
+            let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
+            return Some((MatchClass::Prefix, 4_000_000 - length_penalty));
+        }
+        if candidate
+            .get(..query.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
         {
             let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
             return Some((
@@ -410,20 +434,6 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
                 3_000_000 - length_penalty,
             ));
         }
-        let (candidate_is_ascii, score) =
-            match_ascii_substring_and_fuzzy(query_bytes, candidate_bytes);
-        if candidate_is_ascii {
-            return score;
-        }
-    } else if candidate
-        .get(..query.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
-    {
-        let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
-        return Some((
-            MatchClass::CaseInsensitivePrefix,
-            3_000_000 - length_penalty,
-        ));
     }
 
     let query_lower = query.to_lowercase();
@@ -460,7 +470,13 @@ fn match_ascii_substring_and_fuzzy(
     for (index, &character) in candidate.iter().enumerate() {
         candidate_is_ascii &= character.is_ascii();
         let folded = character.to_ascii_lowercase();
-        if substring_position.is_none() && !substring_search_deferred && folded == first {
+        // Position zero was already rejected by the prefix comparison in
+        // `match_score`; do not compare the same window a second time.
+        if index != 0
+            && substring_position.is_none()
+            && !substring_search_deferred
+            && folded == first
+        {
             if query.len() > substring_work_remaining {
                 substring_search_deferred = true;
             } else {
@@ -579,6 +595,20 @@ mod tests {
         let fuzzy = match_score("gt", "git").unwrap().1;
         assert!(exact > prefix && prefix > insensitive && insensitive > substring);
         assert!(substring > fuzzy);
+    }
+
+    #[test]
+    fn empty_and_unicode_queries_preserve_exact_and_prefix_classes() {
+        assert_eq!(match_score("", ""), Some((MatchClass::Exact, 5_000_000)));
+        assert_eq!(
+            match_score("", "é"),
+            Some((MatchClass::Prefix, 4_000_000 - "é".len() as i64))
+        );
+        assert_eq!(match_score("é", "é"), Some((MatchClass::Exact, 5_000_000)));
+        assert_eq!(
+            match_score("é", "éclair"),
+            Some((MatchClass::Prefix, 4_000_000 - "clair".len() as i64))
+        );
     }
 
     #[test]
