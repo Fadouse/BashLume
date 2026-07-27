@@ -1,7 +1,10 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 const MAX_CANDIDATE_TEXT_BYTES: usize = 64 * 1024;
+const MAX_ASCII_SUBSTRING_COMPARISONS: usize = 64 * 1024;
 
 fn candidate_text_size_is_safe(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_CANDIDATE_TEXT_BYTES
@@ -235,10 +238,32 @@ impl Candidate {
     }
 }
 
+struct CandidateEntry(Candidate);
+
+impl Borrow<str> for CandidateEntry {
+    fn borrow(&self) -> &str {
+        &self.0.value
+    }
+}
+
+impl PartialEq for CandidateEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.value == other.0.value
+    }
+}
+
+impl Eq for CandidateEntry {}
+
+impl Hash for CandidateEntry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.value.hash(state);
+    }
+}
+
 pub struct CandidateSink {
     limit: usize,
     best_tier: u8,
-    candidates: HashMap<String, Candidate>,
+    candidates: HashSet<CandidateEntry>,
     next_insertion_order: u64,
 }
 
@@ -247,7 +272,7 @@ impl CandidateSink {
         Self {
             limit: limit.max(1),
             best_tier: 0,
-            candidates: HashMap::with_capacity(limit.min(512)),
+            candidates: HashSet::with_capacity(limit.min(512)),
             next_insertion_order: 0,
         }
     }
@@ -270,8 +295,8 @@ impl CandidateSink {
             self.best_tier = tier;
         }
 
-        match self.candidates.get_mut(&candidate.value) {
-            Some(current) if candidate.score > current.score => {
+        match self.candidates.take(candidate.value.as_str()) {
+            Some(CandidateEntry(current)) if candidate.score > current.score => {
                 let description = candidate
                     .description
                     .clone()
@@ -284,7 +309,7 @@ impl CandidateSink {
                 let append_space = current.append_space && candidate.append_space;
                 let preserve_order = current.preserve_order || candidate.preserve_order;
                 let insertion_order = current.insertion_order.min(candidate.insertion_order);
-                *current = Candidate {
+                self.candidates.insert(CandidateEntry(Candidate {
                     description,
                     source_mask,
                     append_space,
@@ -292,9 +317,9 @@ impl CandidateSink {
                     preserve_order,
                     insertion_order,
                     ..candidate
-                };
+                }));
             }
-            Some(current) => {
+            Some(CandidateEntry(mut current)) => {
                 if current.description.is_none() {
                     current.description = candidate.description;
                 }
@@ -306,10 +331,11 @@ impl CandidateSink {
                 current.append_space &= candidate.append_space;
                 current.preserve_order |= candidate.preserve_order;
                 current.insertion_order = current.insertion_order.min(candidate.insertion_order);
+                self.candidates.insert(CandidateEntry(current));
                 return;
             }
             None => {
-                self.candidates.insert(candidate.value.clone(), candidate);
+                self.candidates.insert(CandidateEntry(candidate));
             }
         }
 
@@ -320,7 +346,11 @@ impl CandidateSink {
 
     pub fn finish(mut self) -> Vec<Candidate> {
         self.truncate();
-        let mut values: Vec<_> = self.candidates.into_values().collect();
+        let mut values = self
+            .candidates
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>();
         values.sort_unstable_by(compare_candidates);
         values
     }
@@ -329,15 +359,15 @@ impl CandidateSink {
         if self.candidates.len() <= self.limit {
             return;
         }
-        let mut ranked = self.candidates.values().collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| compare_candidates(left, right));
+        let mut ranked = self.candidates.iter().collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| compare_candidates(&left.0, &right.0));
         let remove = ranked
             .into_iter()
             .skip(self.limit)
-            .map(|candidate| candidate.value.clone())
+            .map(|entry| entry.0.value.clone())
             .collect::<Vec<_>>();
         for key in remove {
-            self.candidates.remove(&key);
+            self.candidates.remove(key.as_str());
         }
     }
 }
@@ -355,7 +385,8 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
                 .score
                 .cmp(&left.score)
                 .then_with(|| left.display.len().cmp(&right.display.len()))
-                .then_with(|| left.display.cmp(&right.display)),
+                .then_with(|| left.display.cmp(&right.display))
+                .then_with(|| left.value.cmp(&right.value)),
         })
 }
 
@@ -367,7 +398,7 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
         let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
         return Some((MatchClass::Prefix, 4_000_000 - length_penalty));
     }
-    if query.is_ascii() && candidate.is_ascii() {
+    if query.is_ascii() {
         let query_bytes = query.as_bytes();
         let candidate_bytes = candidate.as_bytes();
         if candidate_bytes.len() >= query_bytes.len()
@@ -379,51 +410,70 @@ pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
                 3_000_000 - length_penalty,
             ));
         }
-        if let Some(position) = candidate_bytes
-            .windows(query_bytes.len())
-            .position(|window| window.eq_ignore_ascii_case(query_bytes))
-        {
-            return Some((
-                MatchClass::Substring,
-                2_000_000 - (position as i64 * 32) - candidate.len() as i64,
-            ));
+        let (candidate_is_ascii, score) =
+            match_ascii_substring_and_fuzzy(query_bytes, candidate_bytes);
+        if candidate_is_ascii {
+            return score;
         }
-        return fuzzy_score_ascii(query_bytes, candidate_bytes)
-            .map(|score| (MatchClass::Fuzzy, 1_000_000 + score));
-    } else {
-        if candidate
-            .get(..query.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
-        {
-            let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
-            return Some((
-                MatchClass::CaseInsensitivePrefix,
-                3_000_000 - length_penalty,
-            ));
-        }
-        let query_lower = query.to_lowercase();
-        let candidate_lower = candidate.to_lowercase();
-        if let Some(position) = candidate_lower.find(&query_lower) {
-            return Some((
-                MatchClass::Substring,
-                2_000_000 - (position as i64 * 32) - candidate.len() as i64,
-            ));
-        }
+    } else if candidate
+        .get(..query.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+    {
+        let length_penalty = candidate.len().saturating_sub(query.len()) as i64;
+        return Some((
+            MatchClass::CaseInsensitivePrefix,
+            3_000_000 - length_penalty,
+        ));
     }
 
+    let query_lower = query.to_lowercase();
+    let candidate_lower = candidate.to_lowercase();
+    if let Some(position) = candidate_lower.find(&query_lower) {
+        return Some((
+            MatchClass::Substring,
+            2_000_000 - (position as i64 * 32) - candidate.len() as i64,
+        ));
+    }
     fuzzy_score(query, candidate).map(|score| (MatchClass::Fuzzy, 1_000_000 + score))
 }
 
-fn fuzzy_score_ascii(query: &[u8], candidate: &[u8]) -> Option<i64> {
-    let (&first, _) = query.split_first()?;
+fn match_ascii_substring_and_fuzzy(
+    query: &[u8],
+    candidate: &[u8],
+) -> (bool, Option<(MatchClass, i64)>) {
+    let Some((&first, _)) = query.split_first() else {
+        return (candidate.is_ascii(), None);
+    };
+    let first = first.to_ascii_lowercase();
+    let mut candidate_is_ascii = true;
+    let mut substring_position = None;
+    let mut substring_work_remaining = MAX_ASCII_SUBSTRING_COMPARISONS;
+    let mut substring_search_deferred = false;
     let mut query_index = 1_usize;
-    let mut current = first.to_ascii_lowercase();
+    let mut current = first;
     let mut matched = 0_i64;
     let mut gap_penalty = 0_i64;
     let mut consecutive = 0_i64;
     let mut previous_match = None;
+    let mut fuzzy = None;
+
     for (index, &character) in candidate.iter().enumerate() {
-        if character.to_ascii_lowercase() != current {
+        candidate_is_ascii &= character.is_ascii();
+        let folded = character.to_ascii_lowercase();
+        if substring_position.is_none() && !substring_search_deferred && folded == first {
+            if query.len() > substring_work_remaining {
+                substring_search_deferred = true;
+            } else {
+                substring_work_remaining -= query.len();
+                if candidate
+                    .get(index..index.saturating_add(query.len()))
+                    .is_some_and(|window| window.eq_ignore_ascii_case(query))
+                {
+                    substring_position = Some(index);
+                }
+            }
+        }
+        if fuzzy.is_some() || folded != current {
             continue;
         }
         matched += 1;
@@ -436,14 +486,42 @@ fn fuzzy_score_ascii(query: &[u8], candidate: &[u8]) -> Option<i64> {
         }
         previous_match = Some(index);
         if query_index == query.len() {
-            return Some(
-                matched * 100 + consecutive * 25 - gap_penalty * 10 - candidate.len() as i64,
-            );
+            fuzzy =
+                Some(matched * 100 + consecutive * 25 - gap_penalty * 10 - candidate.len() as i64);
+        } else {
+            current = query[query_index].to_ascii_lowercase();
+            query_index += 1;
         }
-        current = query[query_index].to_ascii_lowercase();
-        query_index += 1;
     }
-    None
+
+    if !candidate_is_ascii {
+        return (false, None);
+    }
+    if substring_position.is_none() && substring_search_deferred {
+        // The short-query path above avoids allocations for command names. For
+        // adversarial long repeated prefixes, defer to str's bounded two-way
+        // search after folding the already-proven ASCII inputs once.
+        let query_lower = std::str::from_utf8(query)
+            .expect("ASCII query bytes are valid UTF-8")
+            .to_ascii_lowercase();
+        let candidate_lower = std::str::from_utf8(candidate)
+            .expect("ASCII candidate bytes are valid UTF-8")
+            .to_ascii_lowercase();
+        substring_position = candidate_lower.find(&query_lower);
+    }
+    if let Some(position) = substring_position {
+        return (
+            true,
+            Some((
+                MatchClass::Substring,
+                2_000_000 - (position as i64 * 32) - candidate.len() as i64,
+            )),
+        );
+    }
+    (
+        true,
+        fuzzy.map(|score| (MatchClass::Fuzzy, 1_000_000 + score)),
+    )
 }
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
@@ -501,6 +579,25 @@ mod tests {
         let fuzzy = match_score("gt", "git").unwrap().1;
         assert!(exact > prefix && prefix > insensitive && insensitive > substring);
         assert!(substring > fuzzy);
+    }
+
+    #[test]
+    fn ascii_queries_preserve_unicode_fallback_scoring() {
+        assert_eq!(
+            match_score("k", "Kelvin"),
+            Some((MatchClass::Substring, 2_000_000 - "Kelvin".len() as i64))
+        );
+        assert_eq!(
+            match_score("ab", "éa-b"),
+            Some((MatchClass::Fuzzy, 1_000_176))
+        );
+    }
+
+    #[test]
+    fn repeated_ascii_prefixes_use_the_bounded_substring_path() {
+        let query = format!("{}b", "a".repeat(1023));
+        let candidate = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        assert_eq!(match_score(&query, &candidate), None);
     }
 
     #[test]
@@ -580,6 +677,25 @@ mod tests {
             );
         }
         assert_eq!(ranked.finish()[0].display, "zz");
+    }
+
+    #[test]
+    fn sink_breaks_display_ties_by_insertion_value() {
+        let mut sink = CandidateSink::new(1);
+        for value in ["beta", "alpha"] {
+            sink.push(
+                Candidate::new(
+                    "",
+                    "same".into(),
+                    value.into(),
+                    CandidateKind::Value,
+                    true,
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(sink.finish()[0].value, "alpha");
     }
 
     #[test]

@@ -3669,6 +3669,65 @@ _generated
     }
 
     #[test]
+    fn zsh_arguments_literal_plus_precedes_repeatable_options() {
+        let program = script_program(
+            ScriptDialect::Zsh,
+            "_demo",
+            "demo",
+            "#compdef demo\n_arguments - list '+[list values]' - others '-a[plain]' '-o+[repeatable]'\n",
+        );
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Zsh,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["-a", "+", "-o"]
+        );
+    }
+
+    #[test]
+    fn zsh_arguments_literal_plus_consumes_its_argument() {
+        let program = script_program(
+            ScriptDialect::Zsh,
+            "_demo",
+            "demo",
+            "#compdef demo\n_arguments '+[mode]:mode:(one two)' '*:file:_files'\n",
+        );
+        let words = vec!["demo".into(), "+".into(), String::new()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Zsh,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(result.path_completion, PathCompletion::Inherit);
+    }
+
+    #[test]
     fn zsh_negated_prefix_condition_selects_non_option_completion() {
         let program = script_program(
             ScriptDialect::Zsh,

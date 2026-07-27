@@ -5961,7 +5961,12 @@ impl<'a> Machine<'a> {
             .iter()
             .take(current_index)
             .skip(1)
-            .filter(|word| !word.starts_with('-'))
+            .filter(|word| {
+                !word.starts_with('-')
+                    && !specifications
+                        .iter()
+                        .any(|specification| zsh_word_uses_spec(word, specification))
+            })
             .count();
         let prior_option_terminator = active_words
             .iter()
@@ -6149,16 +6154,7 @@ impl<'a> Machine<'a> {
         if previous.is_empty() {
             return false;
         }
-        zsh_spec_options(specification).iter().any(|option| {
-            let option = option.trim_end_matches(['+', '-']);
-            !option.is_empty()
-                && (previous == option
-                    || option.ends_with('=') && previous.starts_with(option)
-                    || specification.contains(':')
-                        && !option.ends_with('=')
-                        && previous.starts_with(option)
-                        && previous.len() > option.len())
-        })
+        zsh_word_uses_spec(previous, specification)
     }
 
     fn execute_zsh_argument_action(
@@ -7364,7 +7360,7 @@ impl<'a> Machine<'a> {
                     record_no_space.push(
                         raw_option != "--" && raw_option.ends_with('-') && !literal_trailing_hyphen,
                     );
-                    record_repeated.push(raw_option.ends_with('+'));
+                    record_repeated.push(raw_option.len() > 1 && raw_option.ends_with('+'));
                 }
             }
         }
@@ -10113,6 +10109,23 @@ fn zsh_spec_options(specification: &str) -> Vec<String> {
             )
         })
         .collect()
+}
+
+fn zsh_word_uses_spec(word: &str, specification: &str) -> bool {
+    zsh_spec_options(specification).iter().any(|raw_option| {
+        let option = if raw_option.len() > 1 {
+            raw_option.trim_end_matches(['+', '-'])
+        } else {
+            raw_option.as_str()
+        };
+        !option.is_empty()
+            && (word == option
+                || option.ends_with('=') && word.starts_with(option)
+                || specification.contains(':')
+                    && !option.ends_with('=')
+                    && word.starts_with(option)
+                    && word.len() > option.len())
+    })
 }
 
 fn zsh_spec_description(specification: &str) -> Option<String> {
