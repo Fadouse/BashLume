@@ -28,6 +28,7 @@ enum Action {
     AcceptWord,
     EndOrAccept,
     Enter,
+    OperateAndGetNext,
     Cancel,
 }
 
@@ -458,12 +459,21 @@ impl PluginState {
                     }
                 }
             }
+        }
+        unsafe { self.accept_command(Action::Enter, count, key) }
+    }
+
+    unsafe fn accept_command(&mut self, fallback: Action, count: i32, key: i32) -> i32 {
+        if self.enabled {
+            self.menu = None;
             if let Some((line, point)) = unsafe { readline_line() } {
                 unsafe { self.renderer.clear_extras(&line, point) };
             }
             self.last_ghost = None;
+            self.completion.quiesce_dynamic_before_command();
+            unsafe { self.sync_event_hook() };
         }
-        unsafe { self.call_fallback(Action::Enter, count, key) }
+        unsafe { self.call_fallback(fallback, count, key) }
     }
 
     unsafe fn cancel(&mut self, count: i32, key: i32) -> i32 {
@@ -493,6 +503,7 @@ impl PluginState {
             Action::AcceptWord => c"forward-word",
             Action::EndOrAccept => c"end-of-line",
             Action::Enter => c"accept-line",
+            Action::OperateAndGetNext => c"operate-and-get-next",
             Action::Cancel => c"abort",
         };
         let function = unsafe { ffi::rl_named_function(name.as_ptr()) };
@@ -806,6 +817,16 @@ unsafe extern "C" fn enter(count: i32, key: i32) -> i32 {
     )
 }
 
+unsafe extern "C" fn operate_and_get_next(count: i32, key: i32) -> i32 {
+    callback_or(
+        0,
+        |state| unsafe { state.accept_command(Action::OperateAndGetNext, count, key) },
+        count,
+        key,
+        Action::OperateAndGetNext,
+    )
+}
+
 unsafe extern "C" fn cancel(count: i32, key: i32) -> i32 {
     callback_or(
         0,
@@ -843,6 +864,35 @@ fn callback_or(
     .unwrap_or(default)
 }
 
+unsafe fn install_binding(
+    state: &mut PluginState,
+    map: ffi::Keymap,
+    sequence: &[u8],
+    replacement: ReadlineCommand,
+    action: Action,
+) {
+    if map.is_null() {
+        return;
+    }
+    let Ok(sequence_c) = CString::new(sequence) else {
+        return;
+    };
+    let mut kind = ffi::ISFUNC;
+    let original = unsafe {
+        ffi::rl_function_of_keyseq_len(sequence.as_ptr().cast(), sequence.len(), map, &mut kind)
+    };
+    let original = (kind == ffi::ISFUNC).then_some(original).flatten();
+    if unsafe { ffi::rl_bind_keyseq_in_map(sequence_c.as_ptr(), Some(replacement), map) } == 0 {
+        state.bindings.push(SavedBinding {
+            map: map as usize,
+            sequence: sequence.to_vec(),
+            original,
+            replacement,
+            action,
+        });
+    }
+}
+
 unsafe fn install_bindings(state: &mut PluginState) {
     let definitions: &[(&CStr, ReadlineCommand)] = &[
         (c"bashlume-complete", complete_forward),
@@ -851,14 +901,14 @@ unsafe fn install_bindings(state: &mut PluginState) {
         (c"bashlume-accept-word", accept_word),
         (c"bashlume-end-or-accept", end_or_accept),
         (c"bashlume-enter", enter),
+        (c"bashlume-operate-and-get-next", operate_and_get_next),
         (c"bashlume-cancel", cancel),
     ];
     for (name, function) in definitions {
         unsafe { ffi::rl_add_defun(name.as_ptr(), Some(*function), -1) };
     }
 
-    let maps = [c"emacs-standard", c"vi-insertion"];
-    let bindings: &[(&[u8], ReadlineCommand, Action)] = &[
+    let editing_bindings: &[(&[u8], ReadlineCommand, Action)] = &[
         (b"\t", complete_forward, Action::CompleteForward),
         (b"\x1b[Z", complete_backward, Action::CompleteBackward),
         (b"\x1b[C", accept_all, Action::AcceptAll),
@@ -868,41 +918,31 @@ unsafe fn install_bindings(state: &mut PluginState) {
         (b"\x1b[1;3C", accept_word, Action::AcceptWord),
         (b"\x1b\x1b[C", accept_word, Action::AcceptWord),
         (b"\r", enter, Action::Enter),
+        (b"\n", enter, Action::Enter),
         (b"\x07", cancel, Action::Cancel),
     ];
-
-    for map_name in maps {
+    for map_name in [c"emacs-standard", c"vi-insert"] {
         let map = unsafe { ffi::rl_get_keymap_by_name(map_name.as_ptr()) };
-        if map.is_null() {
-            continue;
-        }
-        for &(sequence, replacement, action) in bindings {
-            let Ok(sequence_c) = CString::new(sequence) else {
-                continue;
-            };
-            let mut kind = ffi::ISFUNC;
-            let original = unsafe {
-                ffi::rl_function_of_keyseq_len(
-                    sequence.as_ptr().cast(),
-                    sequence.len(),
-                    map,
-                    &mut kind,
-                )
-            };
-            let original = (kind == ffi::ISFUNC).then_some(original).flatten();
-            if unsafe { ffi::rl_bind_keyseq_in_map(sequence_c.as_ptr(), Some(replacement), map) }
-                == 0
-            {
-                state.bindings.push(SavedBinding {
-                    map: map as usize,
-                    sequence: sequence.to_vec(),
-                    original,
-                    replacement,
-                    action,
-                });
-            }
+        for &(sequence, replacement, action) in editing_bindings {
+            unsafe { install_binding(state, map, sequence, replacement, action) };
         }
     }
+
+    let vi_movement = unsafe { ffi::rl_get_keymap_by_name(c"vi-move".as_ptr()) };
+    for sequence in [b"\r".as_slice(), b"\n".as_slice()] {
+        unsafe { install_binding(state, vi_movement, sequence, enter, Action::Enter) };
+    }
+
+    let emacs = unsafe { ffi::rl_get_keymap_by_name(c"emacs-standard".as_ptr()) };
+    unsafe {
+        install_binding(
+            state,
+            emacs,
+            b"\x0f",
+            operate_and_get_next,
+            Action::OperateAndGetNext,
+        )
+    };
 }
 
 unsafe fn restore_bindings(bindings: &[SavedBinding]) {
@@ -1004,7 +1044,7 @@ fn next_shell_word_length(suffix: &str) -> usize {
 }
 
 unsafe fn in_vi_command_mode() -> bool {
-    let movement = unsafe { ffi::rl_get_keymap_by_name(c"vi-movement".as_ptr()) };
+    let movement = unsafe { ffi::rl_get_keymap_by_name(c"vi-move".as_ptr()) };
     !movement.is_null() && unsafe { ffi::rl_get_keymap() } == movement
 }
 

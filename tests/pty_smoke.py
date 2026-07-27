@@ -9,6 +9,7 @@ import os
 import pathlib
 import pty
 import select
+import shlex
 import shutil
 import sys
 import tempfile
@@ -18,14 +19,25 @@ import time
 class Session:
     def __init__(
         self,
-        library: pathlib.Path,
+        library: pathlib.Path | None,
         bash: pathlib.Path,
         rule_pack: pathlib.Path | None,
         trusted_key: pathlib.Path | None,
+        *,
+        loader: pathlib.Path | None = None,
     ) -> None:
+        if (library is None) == (loader is None):
+            raise ValueError("exactly one of library or loader is required")
         pid, fd = pty.fork()
         if pid == 0:
             environment = os.environ.copy()
+            for name in (
+                "BASHLUME_DISABLE",
+                "BASHLUME_LIBRARY",
+                "BASHLUME_RULE_PATH",
+                "BASHLUME_TRUSTED_KEY_PATHS",
+            ):
+                environment.pop(name, None)
             environment.update(
                 TERM="xterm-256color",
                 PS1="BASHLUME_TEST> ",
@@ -46,7 +58,11 @@ class Session:
         self.output = bytearray()
         os.set_blocking(fd, False)
         self.read_for(0.2)
-        self.send(f"enable -f {library} bashlume\n".encode(), 0.5)
+        if loader is not None:
+            self.send(f"source {shlex.quote(str(loader))}\n".encode(), 0.5)
+        else:
+            assert library is not None
+            self.send(f"enable -f {library} bashlume\n".encode(), 0.5)
 
     def read_for(self, seconds: float) -> bytes:
         start = len(self.output)
@@ -113,6 +129,13 @@ def require(condition: bool, message: str, output: bytes) -> None:
     raise AssertionError(f"{message}\n--- PTY transcript ---\n{rendered}")
 
 
+def signal_mask(pid: int) -> int:
+    for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("SigBlk:"):
+            return int(line.split()[1], 16)
+    raise AssertionError("/proc status omitted SigBlk")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -146,7 +169,16 @@ def main() -> int:
     if trusted_key is not None and not trusted_key.is_file():
         parser.error(f"trusted rule key not found: {trusted_key}")
 
-    session = Session(library, bash, rule_pack, trusted_key)
+    temporary_rules = None
+    active_rule_path = rule_pack
+    mutable_rule_pack = None
+    if rule_pack is not None:
+        temporary_rules = tempfile.TemporaryDirectory(prefix="bashlume-rules-reload-")
+        active_rule_path = pathlib.Path(temporary_rules.name)
+        mutable_rule_pack = active_rule_path / "test.blp"
+        shutil.copy2(rule_pack, mutable_rule_pack)
+
+    session = Session(library, bash, active_rule_path, trusted_key)
     try:
         status = session.send(b"bashlume status\n", 0.3)
         require(b"bashlume: enabled" in status, "loadable builtin did not initialize", session.output)
@@ -181,6 +213,88 @@ def main() -> int:
             )
             session.send(b"\x07", 0.1)
             session.send(b"\x15", 0.1)
+
+            session.send(
+                b"bl-mask() { while read -r name value rest; do "
+                b"if [[ $name == SigBlk: ]]; then "
+                b"printf 'SIGCHLD_MASK:<%d>\\n' \"$((16#$value & 65536))\"; "
+                b"return; fi; done < /proc/$$/status; }\n",
+                0.2,
+            )
+            for accept_key, key_name in (
+                (b"\r", "Enter"),
+                (b"\n", "Ctrl-J"),
+                (b"\x0f", "Ctrl-O"),
+            ):
+                session.send(b"bl-mask ", 0.1)
+                session.send(b"\t", 0.03)
+                mask_deadline = time.monotonic() + 2
+                while (
+                    signal_mask(session.pid) & 65536 == 0
+                    and time.monotonic() < mask_deadline
+                ):
+                    session.read_for(0.02)
+                require(
+                    signal_mask(session.pid) & 65536 != 0,
+                    "slow completion did not establish the probe SIGCHLD mask",
+                    session.output,
+                )
+                mask_during_command = session.send(accept_key, 0.7)
+                require(
+                    b"SIGCHLD_MASK:<0>" in mask_during_command,
+                    f"{key_name} command inherited the active probe SIGCHLD mask",
+                    session.output,
+                )
+                session.send(b"\x15", 0.1)
+
+            session.send(b"set -o vi\n", 0.3)
+            session.send(b"bl-mask ", 0.1)
+            session.send(b"\t", 0.03)
+            mask_deadline = time.monotonic() + 2
+            while (
+                signal_mask(session.pid) & 65536 == 0
+                and time.monotonic() < mask_deadline
+            ):
+                session.read_for(0.02)
+            require(
+                signal_mask(session.pid) & 65536 != 0,
+                "Vi completion did not establish the probe SIGCHLD mask",
+                session.output,
+            )
+            session.send(b"\x1b", 0.1)
+            vi_mask_during_command = session.send(b"\r", 0.2)
+            if b"SIGCHLD_MASK:<0>" not in vi_mask_during_command:
+                vi_mask_during_command += session.send(b"\r", 0.7)
+            require(
+                b"SIGCHLD_MASK:<0>" in vi_mask_during_command,
+                "Vi command-mode Enter inherited the active probe SIGCHLD mask",
+                session.output,
+            )
+            session.send(b"set -o emacs\n", 0.3)
+
+            assert mutable_rule_pack is not None
+            mutable_rule_pack.unlink()
+            session.send(b"bashlume reload\n", 0.3)
+            removed_rules = session.send(b"bashlume rules\n", 0.5)
+            require(
+                b"org.bashlume.rules.test" not in removed_rules,
+                "reload retained a rule pack removed from an unchanged path",
+                session.output,
+            )
+            shutil.copy2(rule_pack, mutable_rule_pack)
+            session.send(b"bashlume reload\n", 0.3)
+            restored_rules = bytearray()
+            deadline = time.monotonic() + 3
+            while (
+                b"org.bashlume.rules.test" not in restored_rules
+                and time.monotonic() < deadline
+            ):
+                restored_rules.extend(session.send(b"bashlume rules\n", 0.2))
+            require(
+                b"org.bashlume.rules.test" in restored_rules,
+                "reload did not restore a rule pack added to an unchanged path",
+                session.output,
+            )
 
         valid = session.send(b"echo BASHLUME_VALID_SYNTAX", 0.2)
         require(
@@ -353,6 +467,8 @@ def main() -> int:
         require(b"BASHLUME_UNLOAD_OK" in unloaded, "unload did not restore Readline", session.output)
     finally:
         session.close()
+        if temporary_rules is not None:
+            temporary_rules.cleanup()
 
     print("PTY smoke test passed")
     return 0

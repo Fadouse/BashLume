@@ -230,6 +230,11 @@ impl CompletionEngine {
         self.cache.cancel_filesystem_replays();
     }
 
+    pub fn quiesce_dynamic_before_command(&mut self) {
+        self.cache.quiesce_probes();
+        self.cache.cancel_filesystem_replays();
+    }
+
     pub fn command_known(&self, name: &str) -> Option<bool> {
         self.cache.command_known(name)
     }

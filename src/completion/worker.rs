@@ -27,6 +27,7 @@ const MAX_WORKER_REQUESTS: usize = 512;
 const MAX_PENDING_SCANS: usize = 512;
 const MAX_PENDING_RULE_REQUESTS: usize = 512;
 const MAX_PROBE_WORKER_REQUESTS: usize = 8;
+const PROBE_CANCELLATION_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 static MAIN_PROBE_MASK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MAIN_PROBE_SIGCHLD_WAS_BLOCKED: AtomicBool = AtomicBool::new(false);
@@ -691,9 +692,8 @@ impl CompletionCache {
 
     pub fn configure_rules(&mut self, paths: Vec<PathBuf>, trusted_key_paths: Vec<PathBuf>) {
         let configuration = (paths, trusted_key_paths);
-        if self.rule_configuration.as_ref() == Some(&configuration) {
-            return;
-        }
+        // Configuration is also the explicit reload boundary. The paths can
+        // stay unchanged while packs are installed, removed, or replaced.
         self.rule_configuration = Some(configuration.clone());
         let (paths, trusted_key_paths) = configuration;
         self.rule_generation = self.rule_generation.wrapping_add(1);
@@ -827,6 +827,44 @@ impl CompletionCache {
             self.probe_cancel_pending = None;
             self.probe_signal_mask.take();
         }
+    }
+
+    pub fn quiesce_probes(&mut self) {
+        self.cancel_probes();
+        let deadline = Instant::now() + PROBE_CANCELLATION_ACK_TIMEOUT;
+        while self.probe_cancel_pending.is_some() {
+            self.poll_probe_responses();
+            if self.probe_cancel_pending.is_none() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if self.probe_cancel_pending.is_none() {
+            return;
+        }
+
+        // Never enter Bash command execution with its SIGCHLD handling still
+        // masked. A missing acknowledgement is fail-closed: join the bounded
+        // supervisor, which kills/reaps its process groups, before restoring
+        // the main thread's original mask and starting a fresh supervisor.
+        if let Some(mut worker) = self.probe_worker.take() {
+            worker.stop();
+        }
+        self.probe_pending.clear();
+        self.probe_pins.clear();
+        self.probe_fresh.clear();
+        self.probe_cancel_pending = None;
+        self.probe_signal_mask.take();
+        self.probe_generation = 0;
+        self.probe_errors
+            .push("probe cancellation acknowledgement timed out; supervisor restarted".into());
+        if self.probe_errors.len() > 128 {
+            self.probe_errors.drain(..self.probe_errors.len() - 128);
+        }
+        self.probe_worker = ProbeClient::start().ok();
     }
 
     pub fn probe_outcome(&mut self, request: &ProbeRequest) -> (Option<ProbeResult>, bool) {
@@ -2441,6 +2479,20 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_rule_paths_are_rediscovered_on_explicit_configuration() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        let paths = vec![PathBuf::from("/tmp/bashlume-rules")];
+        let trusted_keys = vec![PathBuf::from("/tmp/bashlume-rule-keys")];
+
+        cache.configure_rules(paths.clone(), trusted_keys.clone());
+        let first_generation = cache.rule_generation;
+        cache.configure_rules(paths, trusted_keys);
+
+        assert_eq!(cache.rule_generation, first_generation.wrapping_add(1));
+        assert!(!cache.rule_catalog_ready);
+    }
+
+    #[test]
     fn path_snapshot_has_a_fixed_directory_bound() {
         let mut cache = CompletionCache::new(1024 * 1024, 128);
         let path = (0..(MAX_PATH_DIRECTORIES + 32))
@@ -2825,6 +2877,53 @@ mod tests {
         }
         assert!(cache.probe_signal_mask.is_none());
         assert!(cache.probe_entries.is_empty());
+    }
+
+    #[test]
+    fn probe_quiescence_restores_sigchld_before_command_execution() {
+        let sigchld_is_blocked = || {
+            let mut current = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), current.as_mut_ptr())
+            };
+            assert_eq!(result, 0);
+            unsafe { libc::sigismember(&current.assume_init(), libc::SIGCHLD) == 1 }
+        };
+        let originally_blocked = sigchld_is_blocked();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "sleep".into(),
+                arguments: vec!["1".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:quiesce".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1500,
+            output_limit: 4096,
+            cache_ttl_ms: 10_000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        assert!(cache.probe_values(&request).1);
+        assert!(cache.probe_signal_mask.is_some());
+        assert!(sigchld_is_blocked());
+        thread::sleep(Duration::from_millis(25));
+
+        let started = Instant::now();
+        cache.quiesce_probes();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(cache.probe_cancel_pending.is_none());
+        assert!(cache.probe_pending.is_empty());
+        assert!(cache.probe_signal_mask.is_none());
+        assert_eq!(sigchld_is_blocked(), originally_blocked);
+        assert!(cache.probe_worker.is_some());
     }
 
     #[test]

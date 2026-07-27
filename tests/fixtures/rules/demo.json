@@ -10,7 +10,7 @@
     "compiler_version": "0.1.0",
     "generated_at": "1970-01-01T00:00:00Z",
     "stale_commands": [],
-    "probe_capabilities": ["printf"]
+    "probe_capabilities": ["printf", "sleep"]
   },
   "minimum_engine": [0, 2, 0],
   "required_opcodes": 0,
@@ -66,6 +66,36 @@
           "output_limit": 65536,
           "cache_ttl_ms": 10000,
           "description": "Generated asynchronously"
+        }
+      ]
+    },
+    {
+      "canonical_name": "bl-mask",
+      "registrations": ["bl-mask"],
+      "source_path": "tests/bl-mask",
+      "source_commit": "0000000000000000000000000000000000000000",
+      "license": "GPL-2.0-or-later",
+      "static_rules": [
+        {
+          "when": [{"op": "true"}],
+          "path_completion": "suppress",
+          "candidates": []
+        }
+      ],
+      "probes": [
+        {
+          "id": "slow-test-value",
+          "when": [{"op": "true"}],
+          "executable": "sleep",
+          "arguments": ["1"],
+          "environment": [],
+          "parser": "lines",
+          "candidate_kind": "value",
+          "append": "space",
+          "timeout_ms": 1500,
+          "output_limit": 4096,
+          "cache_ttl_ms": 10000,
+          "description": "Slow cancellation fixture"
         }
       ]
     }
