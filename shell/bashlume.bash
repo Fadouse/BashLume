@@ -15,8 +15,21 @@ if type -t bashlume >/dev/null 2>&1; then
   return 0
 fi
 
-_bashlume_system_rules=@BASHLUME_RULE_PATH@
-if [[ $_bashlume_system_rules != @BASHLUME_RULE_PATH@ && -d $_bashlume_system_rules ]]; then
+# Prefer data next to the path through which this loader was sourced. This
+# keeps Nix profile/symlinkJoin compositions relocatable instead of pinning
+# them to the otherwise empty core package's rules directory.
+_bashlume_loader_file=${BASH_SOURCE[0]}
+_bashlume_loader_dir=${_bashlume_loader_file%/*}
+[[ $_bashlume_loader_dir == "$_bashlume_loader_file" ]] && _bashlume_loader_dir=.
+_bashlume_loader_dir=$(
+  builtin cd -- "$_bashlume_loader_dir" 2>/dev/null && builtin pwd -P
+) || _bashlume_loader_dir=
+
+_bashlume_system_rules=${_bashlume_loader_dir:+$_bashlume_loader_dir/rules}
+if [[ ! -d $_bashlume_system_rules ]]; then
+  _bashlume_system_rules=@BASHLUME_RULE_PATH@
+fi
+if [[ -d $_bashlume_system_rules ]]; then
   if [[ -n ${BASHLUME_RULE_PATH:-} ]]; then
     BASHLUME_RULE_PATH+=":$_bashlume_system_rules"
   else
@@ -25,15 +38,18 @@ if [[ $_bashlume_system_rules != @BASHLUME_RULE_PATH@ && -d $_bashlume_system_ru
 fi
 unset _bashlume_system_rules
 
-_bashlume_system_keys=@BASHLUME_TRUSTED_KEY_PATH@
-if [[ $_bashlume_system_keys != @BASHLUME_TRUSTED_KEY_PATH@ && -d $_bashlume_system_keys ]]; then
+_bashlume_system_keys=${_bashlume_loader_dir:+$_bashlume_loader_dir/trusted-keys}
+if [[ ! -d $_bashlume_system_keys ]]; then
+  _bashlume_system_keys=@BASHLUME_TRUSTED_KEY_PATH@
+fi
+if [[ -d $_bashlume_system_keys ]]; then
   if [[ -n ${BASHLUME_TRUSTED_KEY_PATHS:-} ]]; then
     BASHLUME_TRUSTED_KEY_PATHS+=":$_bashlume_system_keys"
   else
     BASHLUME_TRUSTED_KEY_PATHS=$_bashlume_system_keys
   fi
 fi
-unset _bashlume_system_keys
+unset _bashlume_system_keys _bashlume_loader_file _bashlume_loader_dir
 
 _bashlume_library=${BASHLUME_LIBRARY:-@BASHLUME_LIBRARY@}
 if [[ $_bashlume_library == @BASHLUME_LIBRARY@ ]]; then

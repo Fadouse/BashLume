@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## Unreleased
+
+- Pin the published Bash, Fish, and Zsh v0.2.0 Stable packs by immutable release URL and SHA-256.
+- Add signature-verifying Nix outputs for each Stable pack, the default core-plus-Bash package, and an optional all-rules package.
+- Make `bashlume reload` rediscover unchanged rule paths so pack installation, rollback, and restoration take effect immediately.
+- Quiesce active probe process groups before Readline accepts a command, restoring Bash's original `SIGCHLD` mask before command execution.
+
+## 0.2.0 — 2026-07-27
 
 - Relicense the BashLume core from MIT to GPL-2.0-or-later in preparation for separately distributed completion rule packs derived from GPL ecosystems.
 - Add the bounded, versioned `.blp` container, signed manifests, independently hashed command blocks, a pure-data Completion IR, and `bashlume-pack` build/inspection tooling.

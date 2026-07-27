@@ -53,3 +53,56 @@ jobs:
             --trusted-key tests/fixtures/rules/test-verifying-key.hex
           python3 tests/tmux_bottom.py target/release/libbashlume.so
           python3 tests/resource_budget.py target/release/libbashlume.so
+
+  nix-release-packs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build release-bound package outputs
+        run: |
+          nix build .#default --out-link result
+          nix build .#bashlume-core --out-link result-core
+          nix build .#bashlume-with-all-rules --out-link result-all
+      - name: Verify locked hashes and signatures
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+
+          lock = json.loads(pathlib.Path("rules/packs.lock").read_text())
+          root = pathlib.Path("result-all/share/bashlume/rules")
+          for source, expected in lock["packs"].items():
+              pack = root / expected["asset"]
+              actual = hashlib.sha256(pack.read_bytes()).hexdigest()
+              assert actual == expected["sha256"], (source, actual, expected["sha256"])
+          PY
+          for source in bash fish zsh; do
+            result-all/bin/bashlume-pack verify \
+              "result-all/share/bashlume/rules/$source.blp" \
+              "result-all/share/bashlume/trusted-keys/$source-rules.pub"
+          done
+          test -f result/share/bashlume/rules/bash.blp
+          test ! -e result/share/bashlume/rules/fish.blp
+          test ! -e result/share/bashlume/rules/zsh.blp
+      - name: Merge all three installed sources in a PTY
+        run: |
+          python3 tests/multishell_rules.py \
+            result-all/lib/bash/libbashlume.so \
+            --bash /bin/bash \
+            --bash-pack result-all/share/bashlume/rules/bash.blp \
+            --fish-pack result-all/share/bashlume/rules/fish.blp \
+            --zsh-pack result-all/share/bashlume/rules/zsh.blp \
+            --trusted-key result-all/share/bashlume/trusted-keys/bash-rules.pub \
+            --trusted-key result-all/share/bashlume/trusted-keys/fish-rules.pub \
+            --trusted-key result-all/share/bashlume/trusted-keys/zsh-rules.pub
+          python3 tests/packaged_rules.py \
+            result-all/share/bashlume/bashlume.bash \
+            --bash /bin/bash
+          python3 tests/packaged_rules.py \
+            result-core/share/bashlume/bashlume.bash \
+            --bash /bin/bash \
+            --external-pack result-all/share/bashlume/rules/bash.blp \
+            --expect-source bash

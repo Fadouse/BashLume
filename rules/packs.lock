@@ -5,24 +5,27 @@
       "channel": "stable",
       "repository": "Fadouse/BashLume-Rules-Bash",
       "required": false,
-      "sha256": null,
-      "version": null
+      "sha256": "a5cc6811f75906e80d2db68b3be5e3f8ee069494be000fd3bac972dee45f1d70",
+      "url": "https://github.com/Fadouse/BashLume-Rules-Bash/releases/download/v0.2.0/bash.blp",
+      "version": "v0.2.0"
     },
     "fish": {
       "asset": "fish.blp",
       "channel": "stable",
       "repository": "Fadouse/BashLume-Rules-Fish",
       "required": false,
-      "sha256": null,
-      "version": null
+      "sha256": "71b2cf5d32afb88c8a391089f12720be9b049de42e8994bb89c1142dc2537849",
+      "url": "https://github.com/Fadouse/BashLume-Rules-Fish/releases/download/v0.2.0/fish.blp",
+      "version": "v0.2.0"
     },
     "zsh": {
       "asset": "zsh.blp",
       "channel": "stable",
       "repository": "Fadouse/BashLume-Rules-Zsh",
       "required": false,
-      "sha256": null,
-      "version": null
+      "sha256": "5395755204ce6a135cad78da5dee916357cac2e22e1633f59ad5d259d7699256",
+      "url": "https://github.com/Fadouse/BashLume-Rules-Zsh/releases/download/v0.2.0/zsh.blp",
+      "version": "v0.2.0"
     }
   },
   "schema": 1

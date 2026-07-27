@@ -1,6 +1,6 @@
 # BashLume Native Completion Rule Packs — Complete Implementation Plan
 
-Status: **Approved design; implementation required**  
+Status: **v0.2.0 Stable implemented, audited, and published**
 Owner: **Fadouse**  
 Core repository: `Fadouse/BashLume`  
 Rule repositories:
@@ -17,7 +17,7 @@ A component, prototype, partial converter, or partially populated rule pack is *
 
 The core container/IR/loader/VM/merge/probe foundation and all three isolated rule repositories are implemented under the GitHub locations above. Format 1.1 adds rule-controlled file/directory fallback while retaining earlier command-block decoders. Independent official Ed25519 identities are provisioned through reviewed `stable-release` environments.
 
-Current pinned-baseline converter accounting, directly verified from clean development builds:
+Current pinned-baseline converter accounting, directly verified from the published v0.2.0 release manifests:
 
 | Source | Pinned Stable | Source files | Command blocks | Registrations | Unsupported | Stale |
 |---|---:|---:|---:|---:|---:|---:|
@@ -25,16 +25,16 @@ Current pinned-baseline converter accounting, directly verified from clean devel
 | Zsh completion | 5.9.2 | 756 | 754 | 1,674 | 0 | 0 |
 | Fish completion | 4.8.1 | 1,061 | 992 | 1,073 | 0 | 0 |
 
-The strict initial-baseline compiler and coverage gates now reject any regression from those complete baselines. Local acceptance results at this checkpoint are:
+The strict initial-baseline compiler and coverage gates reject any regression from those complete baselines. The formal v0.2.0 release runs recorded:
 
-- Bash: 8 exact cases; 1,732 broad cases (`1480 equal / 156 context / 90 inactive / 6 provider`); 866 bounded registration evaluations.
-- Fish: 18 exact cases; 2,132 broad cases (`1616 equal / 297 context / 219 provider`); 1,073 bounded registration evaluations.
-- Zsh: 8 exact cases plus 12 provider-capture invariance cases; 3,314 broad cases (`2812 equal / 484 context / 17 provider / 1 bounded resource classification`); 1,674 bounded registration evaluations.
-- Core: format, test, Clippy, release performance, PTY on Bash 5.0/5.3, tmux, dynamic-probe, and resource gates pass; five repeated standard workloads measured 3,576 KiB additional private memory (the full-gate run measured 3,664 KiB) against a 3,840 KiB cap.
+- Bash: 8 exact cases and 5 provider-invariance cases; 1,732 broad cases (`1,521 equal / 116 context / 90 inactive / 5 provider`); 866 bounded registration evaluations.
+- Fish: 18 exact cases and 6 provider-invariance cases; 2,132 broad cases (`1,630 equal / 287 context / 215 provider`); 1,073 bounded registration evaluations.
+- Zsh: 8 exact cases and 13 provider-capture invariance cases; 3,314 broad cases (`2,841 equal / 461 context / 12 provider`); 1,674 bounded registration evaluations.
+- Core: format, test, Clippy, release performance, PTY on Bash 5.0/5.3, tmux, dynamic-probe, and resource gates pass; the GitHub gate measured 3,516 KiB additional private memory against a 3,840 KiB cap and 455.296 µs completion-ranking p99 against a 500 µs cap.
 - A real Bash PTY loaded all three complete packs together and exposed source-unique `apt-cache` candidates from Bash, Fish, and Zsh while retaining the Fish description row.
 - Coverage schema 3 inventories every pinned primary/support/snapshot Git input, exact linked dependencies, symlink identity, and effective command license. Canonical provenance verification, byte-identical rebuilds, full pack-to-spec comparison, and fresh-job reconstruction all pass; the official key is exposed only to a separate pinned-core signing job.
 
-The local core and all three rule CI scripts pass. No upstream-derived Stable artifact has yet been formally release-signed or published, so the distribution/release portions of Phase H remain open.
+The signed core and three rule-pack v0.2.0 releases are published. An independent post-release audit re-downloaded every asset, checked each `SHA256SUMS`, matched each release key to the core trust store, verified every pack signature and command block, bound provenance to the reviewed rule/upstream/compiler commits, matched GitHub's asset digests, and confirmed that no Broad report crossed the release boundary. `rules/packs.lock` now pins the three immutable release URLs and SHA-256 values. The release-bound Nix outputs verify signatures during their builds; the all-rules output passed the three-source PTY merge plus remove/reload/restore rollback testing.
 
 ## 1. Non-negotiable product requirements
 
@@ -699,7 +699,7 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Implement Bash oracle harness and exact comparison.
 - [x] Implement Zsh oracle harness and exact comparison.
 - [x] Implement Fish oracle harness and exact comparison.
-- [ ] Build hermetic dynamic fixtures and mocked programs.
+- [x] Build hermetic dynamic fixtures and mocked programs.
 - [x] Prove complete registration/file coverage.
 - [x] Run security, resource, Bash 5.0/5.3, tmux, and terminal tests.
 
@@ -708,14 +708,14 @@ Intermediate commits are allowed, but no intermediate state may be presented as 
 - [x] Add Stable/Edge synchronization workflows to each rule repository.
 - [x] Add deterministic release/signing workflows.
 - [x] Add core pack-lock update PR workflow.
-- [ ] Add Nix outputs and local rule search paths.
+- [x] Add release-bound Stable Nix outputs and local rule search paths.
 - [x] Verify runtime is offline and builds are pinned/reproducible.
 
 ### Phase H — Complete release gate
 
 - [x] All three initial pinned baselines compile with zero unsupported and zero stale commands.
 - [x] Exact normalized differential suites pass.
-- [ ] Core and all pack CI/workflows pass.
+- [x] Core and all pack CI/workflows pass.
 - [x] Licensing/provenance audit passes.
 - [x] Dynamic probe security tests pass.
 - [x] Performance/resource gates pass.

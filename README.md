@@ -54,14 +54,28 @@ BashLume never sources Bash, Zsh, or Fish completion scripts at runtime. Separat
 nix build
 ```
 
-The result contains:
+The default output is the core plus the pinned Stable Bash rule pack. It contains:
 
 ```text
 result/lib/bash/libbashlume.so
 result/lib/bash/bashlume-probe  # internal pre-exec sandbox helper
 result/bin/bashlume-pack
 result/share/bashlume/bashlume.bash
+result/share/bashlume/rules/bash.blp
 ```
+
+Release-bound outputs are also available independently:
+
+```bash
+nix build .#bashlume-core
+nix build .#bashlume-pack-tool
+nix build .#bashlume-rules-bash-stable
+nix build .#bashlume-rules-fish-stable
+nix build .#bashlume-rules-zsh-stable
+nix build .#bashlume-with-all-rules
+```
+
+Each rule derivation fetches the release URL and SHA-256 pinned in `rules/packs.lock`, then verifies the pack with its source-specific official key before installation. Fish and Zsh remain explicit optional data packages; the core derivation embeds no upstream rule data. The loader resolves sibling `rules` and `trusted-keys` directories, so installing independent outputs into the same Nix profile also activates them without hard-coded profile paths.
 
 ### Cargo
 
@@ -93,7 +107,7 @@ The loader looks for `result/lib/bash/libbashlume.so` and then `target/release/l
 
 ## Installing and migrating rule packs
 
-The Bash, Fish, and Zsh packs are separate release artifacts; the core package does not embed their differently licensed data. For each desired source, download all files listed by its release `SHA256SUMS` (including the `.blp`, matching `verifying-key.hex`, provenance, and coverage manifests), then verify and install them locally:
+The Bash, Fish, and Zsh packs are separate release artifacts; the core package does not embed their differently licensed data. The current Stable releases are [Bash v0.2.0](https://github.com/Fadouse/BashLume-Rules-Bash/releases/tag/v0.2.0), [Fish v0.2.0](https://github.com/Fadouse/BashLume-Rules-Fish/releases/tag/v0.2.0), and [Zsh v0.2.0](https://github.com/Fadouse/BashLume-Rules-Zsh/releases/tag/v0.2.0). For each desired source, download all files listed by its release `SHA256SUMS` (including the `.blp`, matching `verifying-key.hex`, provenance, and coverage manifests), then verify and install them locally:
 
 ```bash
 sha256sum -c bash.SHA256SUMS
@@ -105,7 +119,7 @@ install -Dm644 verifying-key.hex \
 
 Repeat with distinct filenames for Fish and Zsh, then start a new Bash or run `bashlume reload`. `bashlume rules` must show each pack as `Verified`, compatible, and non-stale before its dynamic providers are enabled. Unsigned or unknown-key packs remain static-only. To roll back one source, remove only its `.blp` and reload; to use a system package, leave `BASHLUME_RULE_PATH` and `BASHLUME_TRUSTED_KEY_PATHS` unset so the packaged loader can append its own `share/bashlume` directories. Existing custom paths remain supported and are colon-separated.
 
-Stable release tags, embedded pack versions, checksums, and provenance are bound to the same reviewed rule-repository commit. Rebuilding provenance additionally requires the pinned upstream and compiler commits recorded in `rules.lock`.
+Stable release tags, embedded pack versions, checksums, and provenance are bound to the same reviewed rule-repository commit. Rebuilding provenance additionally requires the pinned upstream and compiler commits recorded in `rules.lock`. The independent v0.2.0 bindings and verification record are documented in [`docs/releases/v0.2.0-rule-packs.md`](docs/releases/v0.2.0-rule-packs.md).
 
 ## Keys
 
