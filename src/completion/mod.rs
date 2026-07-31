@@ -318,7 +318,7 @@ impl CompletionEngine {
 }
 
 pub fn longest_common_display_prefix(candidates: &[Candidate]) -> Option<String> {
-    let first = candidates.first()?.display.as_str();
+    let first = candidates.first()?.display.as_ref();
     let mut end = first.len();
     for candidate in &candidates[1..] {
         end = common_prefix_boundary(&first[..end], &candidate.display);
@@ -451,15 +451,13 @@ mod tests {
         let shared = result
             .candidates
             .iter()
-            .find(|candidate| candidate.value == "--shared")
+            .find(|candidate| candidate.value.as_ref() == "--shared")
             .unwrap();
         assert_eq!(shared.description.as_deref(), Some("Shared description"));
         assert_eq!(shared.source_mask, 0b0011);
-        assert!(
-            result.candidates.iter().any(|candidate| {
-                candidate.value == "--unique" && candidate.source_mask == 0b0100
-            })
-        );
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.value.as_ref() == "--unique" && candidate.source_mask == 0b0100
+        }));
 
         let file_context = CompletionContext::analyze("bl-merge fixture", 16);
         let mut file_result = engine.complete_explicit(&file_context, &shell, 128);

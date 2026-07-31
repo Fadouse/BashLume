@@ -82,8 +82,8 @@ impl CompletionContext {
 
     pub fn replacement_for(&self, candidate: &Candidate) -> String {
         let mut replacement = match candidate.kind {
-            CandidateKind::Variable => candidate.value.clone(),
-            CandidateKind::User if candidate.value.starts_with('~') => candidate.value.clone(),
+            CandidateKind::Variable => candidate.value.to_string(),
+            CandidateKind::User if candidate.value.starts_with('~') => candidate.value.to_string(),
             _ => quote_shell_word(&candidate.value, self.quote),
         };
         if candidate.append_space {

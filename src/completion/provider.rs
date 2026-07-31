@@ -1393,7 +1393,7 @@ fn nested_completion_values_at_depth(
             let value = candidate.value;
             match candidate.description {
                 Some(description) => format!("{value}\t{description}"),
-                None => value,
+                None => value.to_string(),
             }
         })
         .collect::<Vec<_>>();
@@ -1784,7 +1784,7 @@ fn variable_query(
             0,
         ) {
             sink.push(Candidate {
-                display,
+                display: display.into(),
                 ..candidate
             });
         }
@@ -2052,7 +2052,7 @@ complete -F _replay replay
                 assert_eq!(
                     sink.finish()
                         .into_iter()
-                        .map(|candidate| candidate.value)
+                        .map(|candidate| candidate.value.to_string())
                         .collect::<Vec<_>>(),
                     ["alpha", "beta"]
                 );

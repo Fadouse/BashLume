@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 const MAX_CANDIDATE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_ASCII_SUBSTRING_COMPARISONS: usize = 64 * 1024;
@@ -98,9 +99,9 @@ impl CandidateKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
     /// Human-readable candidate without shell quoting.
-    pub display: String,
+    pub display: Arc<str>,
     /// Text representing the complete shell word (or line for history).
-    pub value: String,
+    pub value: Arc<str>,
     /// Optional human-readable detail supplied by a command-aware rule.
     pub description: Option<String>,
     /// Bitset of contributing external rule sources (bash, fish, zsh, user).
@@ -125,12 +126,18 @@ impl Candidate {
         if !candidate_text_size_is_safe(&display) || !candidate_text_size_is_safe(&value) {
             return None;
         }
+        let same_text = display == value;
         let (match_class, match_score) = match_score(query, &display)?;
-        if candidate_text_has_control(&display)
-            || display != value && candidate_text_has_control(&value)
+        if candidate_text_has_control(&display) || !same_text && candidate_text_has_control(&value)
         {
             return None;
         }
+        let display = Arc::<str>::from(display);
+        let value = if same_text {
+            Arc::clone(&display)
+        } else {
+            Arc::<str>::from(value)
+        };
         Some(Self::matched(
             display,
             value,
@@ -153,16 +160,21 @@ impl Candidate {
         if !candidate_text_size_is_safe(display) || !candidate_text_size_is_safe(value) {
             return None;
         }
+        let same_text =
+            std::ptr::eq(display.as_ptr(), value.as_ptr()) && display.len() == value.len();
         let (match_class, match_score) = match_score(query, display)?;
-        if candidate_text_has_control(display)
-            || !(std::ptr::eq(display.as_ptr(), value.as_ptr()) && display.len() == value.len())
-                && candidate_text_has_control(value)
-        {
+        if candidate_text_has_control(display) || !same_text && candidate_text_has_control(value) {
             return None;
         }
+        let display = Arc::<str>::from(display);
+        let value = if same_text {
+            Arc::clone(&display)
+        } else {
+            Arc::<str>::from(value)
+        };
         Some(Self::matched(
-            display.to_owned(),
-            value.to_owned(),
+            display,
+            value,
             kind,
             append_space,
             recency_bonus,
@@ -172,8 +184,8 @@ impl Candidate {
     }
 
     fn matched(
-        display: String,
-        value: String,
+        display: Arc<str>,
+        value: Arc<str>,
         kind: CandidateKind,
         append_space: bool,
         recency_bonus: i64,
@@ -295,7 +307,7 @@ impl CandidateSink {
             self.best_tier = tier;
         }
 
-        match self.candidates.take(candidate.value.as_str()) {
+        match self.candidates.take(candidate.value.as_ref()) {
             Some(CandidateEntry(current)) if candidate.score > current.score => {
                 let description = candidate
                     .description
@@ -351,7 +363,20 @@ impl CandidateSink {
             .into_iter()
             .map(|entry| entry.0)
             .collect::<Vec<_>>();
-        values.sort_unstable_by(compare_candidates);
+        let uniform_unpreserved_class =
+            values
+                .first()
+                .map(|first| first.match_class)
+                .filter(|match_class| {
+                    values.iter().all(|candidate| {
+                        !candidate.preserve_order && candidate.match_class == *match_class
+                    })
+                });
+        if uniform_unpreserved_class.is_some() {
+            values.sort_unstable_by(compare_ranked_candidates);
+        } else {
+            values.sort_unstable_by(compare_candidates);
+        }
         values
     }
 
@@ -367,7 +392,7 @@ impl CandidateSink {
             .map(|entry| entry.0.value.clone())
             .collect::<Vec<_>>();
         for key in remove {
-            self.candidates.remove(key.as_str());
+            self.candidates.remove(key.as_ref());
         }
     }
 }
@@ -381,13 +406,17 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
             (true, true) => left.insertion_order.cmp(&right.insertion_order),
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
-            (false, false) => right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.display.len().cmp(&right.display.len()))
-                .then_with(|| left.display.cmp(&right.display))
-                .then_with(|| left.value.cmp(&right.value)),
+            (false, false) => compare_ranked_candidates(left, right),
         })
+}
+
+fn compare_ranked_candidates(left: &Candidate, right: &Candidate) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.display.len().cmp(&right.display.len()))
+        .then_with(|| left.display.cmp(&right.display))
+        .then_with(|| left.value.cmp(&right.value))
 }
 
 pub fn match_score(query: &str, candidate: &str) -> Option<(MatchClass, i64)> {
@@ -455,7 +484,22 @@ fn match_ascii_substring_and_fuzzy(
         return (candidate.is_ascii(), None);
     };
     let first = first.to_ascii_lowercase();
-    let mut candidate_is_ascii = true;
+    if !candidate.is_ascii() {
+        return (false, None);
+    }
+    if query.len() >= 3 {
+        let last = query[query.len() - 1].to_ascii_lowercase();
+        let contains_last = if last.is_ascii_alphabetic() {
+            candidate
+                .iter()
+                .any(|character| character.to_ascii_lowercase() == last)
+        } else {
+            candidate.contains(&last)
+        };
+        if !contains_last {
+            return (true, None);
+        }
+    }
     let mut substring_position = None;
     let mut substring_work_remaining = MAX_ASCII_SUBSTRING_COMPARISONS;
     let mut substring_search_deferred = false;
@@ -468,7 +512,6 @@ fn match_ascii_substring_and_fuzzy(
     let mut fuzzy = None;
 
     for (index, &character) in candidate.iter().enumerate() {
-        candidate_is_ascii &= character.is_ascii();
         let folded = character.to_ascii_lowercase();
         // Position zero was already rejected by the prefix comparison in
         // `match_score`; do not compare the same window a second time.
@@ -510,9 +553,6 @@ fn match_ascii_substring_and_fuzzy(
         }
     }
 
-    if !candidate_is_ascii {
-        return (false, None);
-    }
     if substring_position.is_none() && substring_search_deferred {
         // The short-query path above avoids allocations for command names. For
         // adversarial long repeated prefixes, defer to str's bounded two-way
@@ -631,6 +671,34 @@ mod tests {
     }
 
     #[test]
+    fn ascii_fuzzy_prefilter_preserves_case_insensitive_tail_matches() {
+        assert_eq!(
+            match_score("cmZ", "Command-00z"),
+            Some((MatchClass::Fuzzy, 1_000_209))
+        );
+        assert_eq!(match_score("cm2", "command-0001"), None);
+    }
+
+    #[test]
+    fn identical_candidate_text_shares_immutable_storage() {
+        let text = "shared";
+        let borrowed =
+            Candidate::from_borrowed("", text, text, CandidateKind::Value, true, 0).unwrap();
+        assert!(Arc::ptr_eq(&borrowed.display, &borrowed.value));
+
+        let owned = Candidate::new(
+            "",
+            text.to_owned(),
+            text.to_owned(),
+            CandidateKind::Value,
+            true,
+            0,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&owned.display, &owned.value));
+    }
+
+    #[test]
     fn candidates_reject_control_characters_before_matching_or_insertion() {
         assert!(
             Candidate::from_borrowed("", "unsafe\nrow", "unsafe", CandidateKind::Value, true, 0)
@@ -659,7 +727,7 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .map(|candidate| candidate.display.as_str())
+                .map(|candidate| candidate.display.as_ref())
                 .collect::<Vec<_>>(),
             ["who", "whoami"]
         );
@@ -698,7 +766,7 @@ mod tests {
                     .with_preserve_order(true),
             );
         }
-        assert_eq!(preserved.finish()[0].display, "alpha");
+        assert_eq!(preserved.finish()[0].display.as_ref(), "alpha");
 
         let mut ranked = CandidateSink::new(4);
         for name in ["alpha", "zz"] {
@@ -706,7 +774,7 @@ mod tests {
                 Candidate::from_borrowed("", name, name, CandidateKind::Value, true, 0).unwrap(),
             );
         }
-        assert_eq!(ranked.finish()[0].display, "zz");
+        assert_eq!(ranked.finish()[0].display.as_ref(), "zz");
     }
 
     #[test]
@@ -725,7 +793,7 @@ mod tests {
                 .unwrap(),
             );
         }
-        assert_eq!(sink.finish()[0].value, "alpha");
+        assert_eq!(sink.finish()[0].value.as_ref(), "alpha");
     }
 
     #[test]
@@ -746,7 +814,7 @@ mod tests {
         }
         let values = sink.finish();
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].display, "alto");
+        assert_eq!(values[0].display.as_ref(), "alto");
     }
 
     fn thread_cpu_time() -> std::time::Duration {

@@ -367,9 +367,9 @@ impl PluginState {
             let query = completion_match_query(&context);
             if common.len() > query.len() && common.starts_with(query) {
                 let mut partial = result.candidates[0].clone();
-                if let Some(base) = partial.value.strip_suffix(&partial.display) {
-                    partial.value = format!("{base}{common}");
-                    partial.display = common;
+                if let Some(base) = partial.value.strip_suffix(partial.display.as_ref()) {
+                    partial.value = format!("{base}{common}").into();
+                    partial.display = common.into();
                     partial.append_space = false;
                     unsafe { apply_candidate(&context, &partial) };
                     if let Some((new_line, new_point)) = unsafe { readline_line() } {
