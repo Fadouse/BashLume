@@ -100,6 +100,8 @@ unsafe extern "C" {
     pub fn rl_get_keymap_by_name(name: *const c_char) -> Keymap;
     pub fn rl_get_keymap() -> Keymap;
     pub fn rl_named_function(name: *const c_char) -> Option<ReadlineCommand>;
+    pub fn rl_translate_keyseq(input: *const c_char, output: *mut c_char, len: *mut c_int)
+    -> c_int;
 
     // Bash's stable loadable-builtin-facing symbols.
     pub static interactive_shell: c_int;

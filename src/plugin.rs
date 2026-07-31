@@ -41,6 +41,7 @@ const REQUEST_FALLBACK: i32 = i32::MIN;
 struct SavedBinding {
     map: usize,
     sequence: Vec<u8>,
+    lookup_sequence: Vec<u8>,
     original: Option<ReadlineCommand>,
     replacement: ReadlineCommand,
     action: Action,
@@ -493,10 +494,12 @@ impl PluginState {
         let executing_sequence = unsafe { ffi::rl_executing_keyseq };
         let sequence = (!executing_sequence.is_null())
             .then(|| unsafe { CStr::from_ptr(executing_sequence) }.to_bytes());
-        if let Some(binding) = sequence
+        let binding = sequence
             .and_then(|sequence| {
                 self.bindings.iter().find(|binding| {
-                    binding.action == action && binding.map == map && binding.sequence == sequence
+                    binding.action == action
+                        && binding.map == map
+                        && (binding.sequence == sequence || binding.lookup_sequence == sequence)
                 })
             })
             .or_else(|| {
@@ -506,20 +509,20 @@ impl PluginState {
                         && binding.sequence.len() == 1
                         && i32::from(binding.sequence[0]) == key
                 })
-            })
-            .or_else(|| {
-                self.bindings
-                    .iter()
-                    .find(|binding| binding.action == action && binding.map == map)
-            })
-        {
-            if binding.original.is_none_or(|original| {
-                !is_bashlume_wrapper(original) && !is_readline_abort(original)
-            }) {
-                return binding.original;
+            });
+        let Some(binding) = binding else {
+            // An explicitly invoked BashLume defun has no installed binding to
+            // restore, so use the action's stable native equivalent.
+            return named_fallback(action);
+        };
+        match binding.original {
+            Some(original) if !is_bashlume_wrapper(original) && !is_readline_abort(original) => {
+                Some(original)
             }
+            Some(_) => named_fallback(action),
+            // Preserve a key that was genuinely unbound before BashLume.
+            None => None,
         }
-        named_fallback(action)
     }
 }
 
@@ -1025,6 +1028,41 @@ fn callback_or(
     }
 }
 
+unsafe fn translate_key_sequence(sequence: &CStr) -> Option<Vec<u8>> {
+    let input_length = sequence.to_bytes().len();
+    let capacity = input_length.checked_mul(2)?.checked_add(1)?;
+    let mut output = vec![0_u8; capacity];
+    let mut output_length = 0_i32;
+    if unsafe {
+        ffi::rl_translate_keyseq(
+            sequence.as_ptr(),
+            output.as_mut_ptr().cast(),
+            &mut output_length,
+        )
+    } != 0
+        || output_length < 0
+        || output_length as usize >= capacity
+    {
+        return None;
+    }
+    output.truncate(output_length as usize);
+    Some(output)
+}
+
+unsafe fn readline_binding(
+    sequence: &[u8],
+    map: ffi::Keymap,
+    kind: *mut i32,
+) -> Option<ReadlineCommand> {
+    // Readline 8.0 uses `len` to bound its loop but still checks
+    // `keyseq[i + 1]` for the final key. Give every lookup its own explicit
+    // terminator so prefix queries are correct and never read another slice.
+    let mut terminated = Vec::with_capacity(sequence.len().checked_add(1)?);
+    terminated.extend_from_slice(sequence);
+    terminated.push(0);
+    unsafe { ffi::rl_function_of_keyseq_len(terminated.as_ptr().cast(), sequence.len(), map, kind) }
+}
+
 unsafe fn install_binding(
     state: &mut PluginState,
     map: ffi::Keymap,
@@ -1038,28 +1076,22 @@ unsafe fn install_binding(
     let Ok(sequence_c) = CString::new(sequence) else {
         return;
     };
+    let Some(translated_sequence) = (unsafe { translate_key_sequence(&sequence_c) }) else {
+        return;
+    };
     // Installing a longer sequence can replace a function or macro on one of
     // its proper prefixes with a nested keymap. That topology cannot be
     // restored by rebinding only the leaf, so intercept only sequences whose
-    // complete prefix chain is already composed of keymaps.
-    for prefix_length in 1..sequence.len() {
+    // complete translated prefix chain is already composed of keymaps.
+    for prefix_length in 1..translated_sequence.len() {
         let mut prefix_kind = ffi::ISFUNC;
-        unsafe {
-            ffi::rl_function_of_keyseq_len(
-                sequence.as_ptr().cast(),
-                prefix_length,
-                map,
-                &mut prefix_kind,
-            )
-        };
+        unsafe { readline_binding(&translated_sequence[..prefix_length], map, &mut prefix_kind) };
         if prefix_kind != ffi::ISKMAP {
             return;
         }
     }
     let mut kind = ffi::ISFUNC;
-    let original = unsafe {
-        ffi::rl_function_of_keyseq_len(sequence.as_ptr().cast(), sequence.len(), map, &mut kind)
-    };
+    let original = unsafe { readline_binding(&translated_sequence, map, &mut kind) };
     // Readline does not expose a symmetric API for recovering the payload of
     // macros and keymap bindings. Preserve such custom bindings rather than
     // replacing them with a callback that cannot restore or invoke them.
@@ -1070,6 +1102,7 @@ unsafe fn install_binding(
         state.bindings.push(SavedBinding {
             map: map as usize,
             sequence: sequence.to_vec(),
+            lookup_sequence: translated_sequence,
             original,
             replacement,
             action,
@@ -1081,9 +1114,14 @@ unsafe fn install_space_prefetch_binding(state: &mut PluginState, map: ffi::Keym
     if map.is_null() {
         return;
     }
+    let Ok(sequence) = CString::new(b" ".as_slice()) else {
+        return;
+    };
+    let Some(translated_sequence) = (unsafe { translate_key_sequence(&sequence) }) else {
+        return;
+    };
     let mut kind = ffi::ISFUNC;
-    let original =
-        unsafe { ffi::rl_function_of_keyseq_len(b" ".as_ptr().cast(), 1, map, &mut kind) };
+    let original = unsafe { readline_binding(&translated_sequence, map, &mut kind) };
     let self_insert = unsafe { ffi::rl_named_function(c"self-insert".as_ptr()) };
     if kind != ffi::ISFUNC
         || original.map(|function| function as usize)
@@ -1158,14 +1196,8 @@ unsafe fn install_bindings(state: &mut PluginState) {
 unsafe fn restore_bindings(bindings: &[SavedBinding]) {
     for binding in bindings {
         let map = binding.map as ffi::Keymap;
-        let current = unsafe {
-            ffi::rl_function_of_keyseq_len(
-                binding.sequence.as_ptr().cast(),
-                binding.sequence.len(),
-                map,
-                std::ptr::null_mut(),
-            )
-        };
+        let current =
+            unsafe { readline_binding(&binding.lookup_sequence, map, std::ptr::null_mut()) };
         if current.is_none_or(|function| function as usize != binding.replacement as usize) {
             continue;
         }
