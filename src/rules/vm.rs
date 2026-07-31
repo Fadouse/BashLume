@@ -162,6 +162,15 @@ pub struct FilesystemRequest {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct EvaluationResult {
     pub candidates: Vec<EmittedCandidate>,
+    /// Candidates emitted before this evaluation encountered any unresolved
+    /// asynchronous dependency. Runtime menus may display these while replay
+    /// workers finish without exposing dependency-derived false positives.
+    #[serde(skip)]
+    pub(crate) provisional_candidates: Vec<EmittedCandidate>,
+    #[serde(skip)]
+    pub(crate) provisional_yielded: bool,
+    #[serde(skip)]
+    pub(crate) optimization_incomplete: bool,
     pub truncated: bool,
     pub probes: Vec<ProbeRequest>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -265,89 +274,180 @@ pub fn evaluate_with_outcomes(
     completion_results: &HashMap<String, Vec<String>>,
 ) -> Result<EvaluationResult, VmError> {
     program.validate().map_err(VmError::InvalidProgram)?;
+    evaluate_validated_with_outcomes(
+        program,
+        context,
+        source,
+        trust,
+        mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+    )
+}
+
+/// Evaluate a command block that was already fully validated while decoding a
+/// trusted pack block. Runtime pack providers use this path to avoid traversing
+/// immutable Script IR again on every replay round.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_validated_with_outcomes(
+    program: &CommandProgram,
+    context: &EvaluationContext<'_>,
+    source: SourceKind,
+    trust: TrustStatus,
+    mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+) -> Result<EvaluationResult, VmError> {
+    evaluate_runtime_with_outcomes(
+        program,
+        context,
+        source,
+        trust,
+        mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_runtime_with_outcomes(
+    program: &CommandProgram,
+    context: &EvaluationContext<'_>,
+    source: SourceKind,
+    trust: TrustStatus,
+    mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
+) -> Result<EvaluationResult, VmError> {
+    evaluate_runtime_programs_with_outcomes(
+        &[(program, trust)],
+        context,
+        source,
+        mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+        allow_provisional_yield,
+        runtime_optimizations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_runtime_programs_with_outcomes(
+    programs: &[(&CommandProgram, TrustStatus)],
+    context: &EvaluationContext<'_>,
+    source: SourceKind,
+    mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
+) -> Result<EvaluationResult, VmError> {
     let candidate_limit = candidate_limit.clamp(1, MAX_EMITTED_CANDIDATES);
     let mut result = EvaluationResult::default();
     let mut evaluated_rules = 0_usize;
 
-    for rule in &program.static_rules {
-        evaluated_rules = evaluated_rules.saturating_add(1);
-        if evaluated_rules > MAX_EVALUATED_RULES {
-            return Err(VmError::Limit("evaluated rules"));
-        }
-        if evaluate_predicates(&rule.when, context)? {
-            result.path_completion = result.path_completion.merge(rule.path_completion);
-            for candidate in &rule.candidates {
-                if result.candidates.len() >= candidate_limit {
-                    result.truncated = true;
-                    break;
+    for &(program, trust) in programs {
+        for rule in &program.static_rules {
+            evaluated_rules = evaluated_rules.saturating_add(1);
+            if evaluated_rules > MAX_EVALUATED_RULES {
+                return Err(VmError::Limit("evaluated rules"));
+            }
+            if evaluate_predicates(&rule.when, context)? {
+                result.path_completion = result.path_completion.merge(rule.path_completion);
+                for candidate in &rule.candidates {
+                    if result.candidates.len() >= candidate_limit {
+                        result.truncated = true;
+                        break;
+                    }
+                    let emitted = EmittedCandidate {
+                        candidate: candidate.clone(),
+                        source,
+                    };
+                    result.candidates.push(emitted);
                 }
-                result.candidates.push(EmittedCandidate {
-                    candidate: candidate.clone(),
-                    source,
-                });
             }
         }
-    }
 
-    for probe in &program.probes {
-        if !evaluate_predicates(&probe.when, context)? {
-            continue;
-        }
-        let authorized = trust.permits_dynamic_probes();
-        if mode != EvaluationMode::ExplicitTab || !authorized {
-            if mode == EvaluationMode::ExplicitTab && !authorized {
-                result.denied_probe_count = result.denied_probe_count.saturating_add(1);
+        for probe in &program.probes {
+            if !evaluate_predicates(&probe.when, context)? {
+                continue;
             }
-            continue;
+            let authorized = trust.permits_dynamic_probes();
+            if mode != EvaluationMode::ExplicitTab || !authorized {
+                if mode == EvaluationMode::ExplicitTab && !authorized {
+                    result.denied_probe_count = result.denied_probe_count.saturating_add(1);
+                }
+                continue;
+            }
+            if result.probes.len() >= MAX_PROBE_REQUESTS {
+                return Err(VmError::Limit("probe requests"));
+            }
+            let arguments = probe
+                .arguments
+                .iter()
+                .map(|argument| expand_template(argument, context))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut environment = Vec::with_capacity(probe.environment.len());
+            for (name, value) in &probe.environment {
+                environment.push((name.clone(), expand_template(value, context)?));
+            }
+            result.probes.push(ProbeRequest {
+                key: ProbeKey {
+                    executable: probe.executable.clone(),
+                    arguments,
+                    environment,
+                    working_directory: context.working_directory.to_string_lossy().into_owned(),
+                    parser: probe.parser,
+                    include_stderr: false,
+                },
+                probe_id: probe.id.clone(),
+                candidate_kind: probe.candidate_kind,
+                append: probe.append,
+                timeout_ms: probe.timeout_ms,
+                output_limit: probe.output_limit,
+                cache_ttl_ms: probe.cache_ttl_ms,
+                description: probe.description.clone(),
+                source,
+                dynamic_authorized: true,
+            });
         }
-        if result.probes.len() >= MAX_PROBE_REQUESTS {
-            return Err(VmError::Limit("probe requests"));
-        }
-        let arguments = probe
-            .arguments
-            .iter()
-            .map(|argument| expand_template(argument, context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut environment = Vec::with_capacity(probe.environment.len());
-        for (name, value) in &probe.environment {
-            environment.push((name.clone(), expand_template(value, context)?));
-        }
-        result.probes.push(ProbeRequest {
-            key: ProbeKey {
-                executable: probe.executable.clone(),
-                arguments,
-                environment,
-                working_directory: context.working_directory.to_string_lossy().into_owned(),
-                parser: probe.parser,
-                include_stderr: false,
-            },
-            probe_id: probe.id.clone(),
-            candidate_kind: probe.candidate_kind,
-            append: probe.append,
-            timeout_ms: probe.timeout_ms,
-            output_limit: probe.output_limit,
-            cache_ttl_ms: probe.cache_ttl_ms,
-            description: probe.description.clone(),
-            source,
-            dynamic_authorized: true,
-        });
     }
-    if !program.scripts.is_empty() {
-        let command = context
-            .words
+    let module_groups = programs
+        .iter()
+        .filter(|(program, _)| !program.scripts.is_empty())
+        .map(|(program, trust)| (program.scripts.as_slice(), *trust))
+        .collect::<Vec<_>>();
+    if !module_groups.is_empty() {
+        let canonical_name = programs
             .first()
-            .map_or(program.canonical_name.as_str(), String::as_str);
-        super::script_vm::evaluate_modules(
-            &program.scripts,
+            .map_or("", |(program, _)| program.canonical_name.as_str());
+        let command = context.words.first().map_or(canonical_name, String::as_str);
+        let script_allow_provisional_yield = allow_provisional_yield
+            && result.probes.is_empty()
+            && result.completion_requests.is_empty()
+            && result.filesystem_requests.is_empty();
+        super::script_vm::evaluate_module_groups(
+            &module_groups,
             command,
             context,
             source,
-            trust,
             mode,
             candidate_limit,
             probe_results,
             completion_results,
             &mut result,
+            script_allow_provisional_yield,
+            runtime_optimizations,
         )?;
     }
     Ok(result)
@@ -2982,6 +3082,413 @@ complete -c demo -a '(generated)'
         )
         .unwrap();
         assert_eq!(result.candidates[0].candidate.value, "matched");
+    }
+
+    #[test]
+    fn fish_quick_pass_never_yields_dependency_derived_fallbacks() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "if test -e /virtual/state\n    complete -c demo -l exists\nelse\n    complete -c demo -l missing\nend\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+        assert_eq!(result.filesystem_requests.len(), 1);
+    }
+
+    #[test]
+    fn fish_quick_pass_does_not_cross_skipped_argument_side_effects() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "set -g gate yes\ncomplete -c demo -l other -a '(set -g gate no; echo unrelated)'\ncomplete -c demo -n 'test $gate = yes' -l version\n",
+        );
+        let words = vec!["demo".into(), "--ver".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+        assert!(result.optimization_incomplete);
+    }
+
+    #[test]
+    fn fish_quick_pass_yields_only_after_prior_dependencies_are_replayed() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "test -e /virtual/state\ncomplete -c demo -l ready\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let mut completion_results = HashMap::new();
+        completion_results.insert(
+            "filesystem:fish:test:-e:/virtual/state".into(),
+            vec!["true".into()],
+        );
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &completion_results,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(result.provisional_yielded);
+        assert_eq!(
+            result
+                .provisional_candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--ready"]
+        );
+    }
+
+    #[test]
+    fn fish_quick_pass_does_not_publish_candidates_erased_after_a_dependency() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l removed\ntest -e /virtual/state\ncomplete -c demo -e -l removed\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+    }
+
+    #[test]
+    fn fish_quick_pass_recognizes_combined_erase_flags() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l removed\ntest -e /virtual/state\ncomplete -ec demo -l removed\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+    }
+
+    #[test]
+    fn fish_erase_removes_argument_candidates_and_path_policy() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l color -r -f -a 'red blue'\ncomplete -ec demo -l color\n",
+        );
+        let words = vec!["demo".into(), "--color=".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.path_completion, PathCompletion::Inherit);
+    }
+
+    #[test]
+    fn fish_erase_applies_across_ordered_script_modules() {
+        let mut program = script_program(
+            ScriptDialect::Fish,
+            "first.fish",
+            "demo",
+            "complete -c demo -l old -f\n",
+        );
+        program.scripts.push(
+            crate::rules::script_parser::parse_script(
+                ScriptDialect::Fish,
+                "second.fish",
+                "complete -ec demo\n",
+            )
+            .unwrap(),
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.path_completion, PathCompletion::Inherit);
+    }
+
+    #[test]
+    fn fish_dynamic_combined_flags_are_normalized_before_erase() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l old\nset flags -ec demo\ncomplete $flags -l old\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+    }
+
+    #[test]
+    fn fish_pack_defined_functions_are_available_wrapper_services() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "wrapper",
+            "function target\nend\ncomplete -c wrapper -w target\ncomplete -c target -l provided\n",
+        );
+        let words = vec!["wrapper".into(), "--".into()];
+        let environment = HashMap::new();
+        let mut evaluation_context = context(&words, &environment);
+        let available = HashSet::from(["wrapper".to_owned()]);
+        evaluation_context.available_commands = Some(&available);
+        let result = evaluate(
+            &program,
+            &evaluation_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate.value == "--provided")
+        );
+    }
+
+    #[test]
+    fn fish_dynamic_option_selectors_are_not_skipped_by_the_fast_matcher() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "set opts -l target\ncomplete -c demo -l other $opts\n",
+        );
+        let words = vec!["demo".into(), "--tar".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate.value == "--target")
+        );
+    }
+
+    #[test]
+    fn fish_selective_erase_restores_an_older_duplicate_contribution() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -a shared\ncomplete -c demo -l mode -r -a shared\ncomplete -c demo -e -l mode\n",
+        );
+        let words = vec!["demo".into(), "shared".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.candidate.value == "shared")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fish_erase_and_wrappers_compose_across_command_programs() {
+        let first = script_program(
+            ScriptDialect::Fish,
+            "first.fish",
+            "wrapper",
+            "function target\nend\ncomplete -c wrapper -w target\ncomplete -c target -l old\ncomplete -c target -f\n",
+        );
+        let second = script_program(
+            ScriptDialect::Fish,
+            "second.fish",
+            "wrapper",
+            "complete -ec target\ncomplete -c target -l new\n",
+        );
+        let words = vec!["wrapper".into(), "--".into()];
+        let environment = HashMap::new();
+        let available = HashSet::from(["wrapper".to_owned()]);
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.available_commands = Some(&available);
+        let result = evaluate_runtime_programs_with_outcomes(
+            &[
+                (&first, TrustStatus::Unsigned),
+                (&second, TrustStatus::Unsigned),
+            ],
+            &evaluation_context,
+            SourceKind::Fish,
+            EvaluationMode::Passive,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate.value == "--new")
+        );
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate.value == "--old")
+        );
+        assert_eq!(result.path_completion, PathCompletion::Inherit);
+    }
+
+    #[test]
+    fn runtime_fish_condition_memoization_rejects_stateful_predicates() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            r#"
+function flip
+    if set -q hit
+        return 1
+    end
+    set -g hit yes
+    return 0
+end
+complete -c demo -n flip -a first
+complete -c demo -n flip -a second
+"#,
+        );
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
     }
 
     #[test]

@@ -5,6 +5,9 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 use super::CompletionMode;
 use super::context::{CompletionContext, MAX_COMPLETION_CONTEXT_BYTES};
@@ -14,9 +17,10 @@ use crate::rules::format::SourceKind;
 use crate::rules::ir::{AppendPolicy, PathCompletion, RuleCandidateKind};
 use crate::rules::loader::LoadedProgram;
 use crate::rules::vm::{
-    CompletionRequest, EvaluationContext, EvaluationMode, FilesystemRequest, FilesystemRequestKind,
-    ProbeKey, ProbeRequest, ProbeResult, evaluate_with_outcomes, nested_completion_path_marker,
-    platform_signal_snapshot,
+    CompletionRequest, EmittedCandidate, EvaluationContext, EvaluationMode, EvaluationResult,
+    FilesystemRequest, FilesystemRequestKind, ProbeKey, ProbeRequest, ProbeResult,
+    evaluate_runtime_programs_with_outcomes, evaluate_runtime_with_outcomes,
+    nested_completion_path_marker, platform_signal_snapshot,
 };
 use crate::shell::ShellSnapshot;
 
@@ -45,10 +49,267 @@ pub trait CompletionProvider: Send {
     ) -> ProviderStatus;
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ReplayKey {
+    pack_id: [u8; 32],
+    source_path: String,
+    depth: usize,
+    explicit: bool,
+}
+
 #[derive(Default)]
-pub struct RuleProvider;
+struct ReplayState {
+    probe_results: HashMap<ProbeKey, ProbeResult>,
+    completion_results: HashMap<String, Vec<String>>,
+    probes: Vec<ProbeRequest>,
+    completion_requests: Vec<CompletionRequest>,
+    filesystem_requests: Vec<FilesystemRequest>,
+    evaluated: Option<(u64, Arc<EvaluationResult>)>,
+    provisional_candidates: Arc<[EmittedCandidate]>,
+    provisional_path_completion: PathCompletion,
+    provisional_redraws: u8,
+}
+
+#[derive(Default)]
+pub struct RuleProvider {
+    replay_context: Option<(String, usize, PathBuf, u64)>,
+    replay_states: HashMap<ReplayKey, ReplayState>,
+    quick_provisional: Arc<[EmittedCandidate]>,
+    quick_path_completion: PathCompletion,
+    quick_redraws: u8,
+    quick_evaluated: bool,
+}
 
 const MAX_COMMAND_SNAPSHOT: usize = 4096;
+const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
+
+fn owned_strings_bytes(values: &Vec<String>) -> usize {
+    values
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(values.iter().map(String::capacity).sum::<usize>())
+}
+
+fn emitted_candidate_bytes(candidate: &EmittedCandidate) -> usize {
+    std::mem::size_of::<EmittedCandidate>()
+        .saturating_add(candidate.candidate.value.capacity())
+        .saturating_add(candidate.candidate.display.capacity())
+        .saturating_add(
+            candidate
+                .candidate
+                .description
+                .as_ref()
+                .map_or(0, String::capacity),
+        )
+}
+
+fn probe_key_bytes(key: &ProbeKey) -> usize {
+    std::mem::size_of::<ProbeKey>()
+        .saturating_add(key.executable.capacity())
+        .saturating_add(key.working_directory.capacity())
+        .saturating_add(owned_strings_bytes(&key.arguments))
+        .saturating_add(
+            key.environment
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, String)>()),
+        )
+        .saturating_add(
+            key.environment
+                .iter()
+                .map(|(name, value)| name.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+}
+
+fn probe_request_bytes(request: &ProbeRequest) -> usize {
+    probe_key_bytes(&request.key)
+        .saturating_add(request.probe_id.capacity())
+        .saturating_add(request.description.as_ref().map_or(0, String::capacity))
+}
+
+fn completion_request_bytes(request: &CompletionRequest) -> usize {
+    std::mem::size_of::<CompletionRequest>().saturating_add(request.line.capacity())
+}
+
+fn filesystem_request_bytes(request: &FilesystemRequest) -> usize {
+    std::mem::size_of::<FilesystemRequest>()
+        .saturating_add(request.request_id.capacity())
+        .saturating_add(request.path.capacity())
+        .saturating_add(request.operator.as_ref().map_or(0, String::capacity))
+}
+
+fn replay_dependency_bytes(
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+) -> usize {
+    probe_results
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(ProbeKey, ProbeResult)>().saturating_add(1))
+        .saturating_add(
+            probe_results
+                .iter()
+                .map(|(key, result)| {
+                    probe_key_bytes(key).saturating_add(owned_strings_bytes(&result.values))
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            completion_results
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Vec<String>)>().saturating_add(1)),
+        )
+        .saturating_add(
+            completion_results
+                .iter()
+                .map(|(key, values)| key.capacity().saturating_add(owned_strings_bytes(values)))
+                .sum::<usize>(),
+        )
+}
+
+fn evaluation_result_bytes(result: &EvaluationResult) -> usize {
+    result
+        .candidates
+        .capacity()
+        .saturating_mul(std::mem::size_of::<EmittedCandidate>())
+        .saturating_add(
+            result
+                .candidates
+                .iter()
+                .map(emitted_candidate_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            result
+                .provisional_candidates
+                .iter()
+                .map(emitted_candidate_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            result
+                .probes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ProbeRequest>()),
+        )
+        .saturating_add(result.probes.iter().map(probe_request_bytes).sum::<usize>())
+        .saturating_add(
+            result
+                .completion_requests
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CompletionRequest>()),
+        )
+        .saturating_add(
+            result
+                .completion_requests
+                .iter()
+                .map(completion_request_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            result
+                .filesystem_requests
+                .capacity()
+                .saturating_mul(std::mem::size_of::<FilesystemRequest>()),
+        )
+        .saturating_add(
+            result
+                .filesystem_requests
+                .iter()
+                .map(filesystem_request_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(owned_strings_bytes(&result.snapshot_providers))
+}
+
+fn replay_state_bytes(state: &ReplayState) -> usize {
+    replay_dependency_bytes(&state.probe_results, &state.completion_results)
+        .saturating_add(
+            state
+                .probes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ProbeRequest>()),
+        )
+        .saturating_add(state.probes.iter().map(probe_request_bytes).sum::<usize>())
+        .saturating_add(
+            state
+                .completion_requests
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CompletionRequest>()),
+        )
+        .saturating_add(
+            state
+                .completion_requests
+                .iter()
+                .map(completion_request_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .filesystem_requests
+                .capacity()
+                .saturating_mul(std::mem::size_of::<FilesystemRequest>()),
+        )
+        .saturating_add(
+            state
+                .filesystem_requests
+                .iter()
+                .map(filesystem_request_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .evaluated
+                .as_ref()
+                .map_or(0, |(_, result)| evaluation_result_bytes(result)),
+        )
+        .saturating_add(
+            state
+                .provisional_candidates
+                .iter()
+                .map(emitted_candidate_bytes)
+                .sum::<usize>(),
+        )
+}
+
+fn trim_replay_states(states: &mut HashMap<ReplayKey, ReplayState>, configured_limit: usize) {
+    let limit = configured_limit.min(MAX_REPLAY_BYTES);
+    let mut retained = states
+        .iter()
+        .map(|(key, state)| {
+            (
+                key.clone(),
+                std::mem::size_of::<ReplayKey>()
+                    .saturating_add(key.source_path.capacity())
+                    .saturating_add(replay_state_bytes(state)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let map_bytes = states
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(ReplayKey, ReplayState)>().saturating_add(1));
+    let mut total =
+        map_bytes.saturating_add(retained.iter().map(|(_, bytes)| *bytes).sum::<usize>());
+    if total <= limit {
+        return;
+    }
+    retained.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+    for (key, bytes) in retained {
+        states.remove(&key);
+        total = total.saturating_sub(bytes);
+        if total <= limit {
+            break;
+        }
+    }
+    states.shrink_to_fit();
+    if states
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(ReplayKey, ReplayState)>().saturating_add(1))
+        > limit
+    {
+        states.clear();
+        states.shrink_to_fit();
+    }
+}
 
 fn command_snapshot(
     shell: &ShellSnapshot,
@@ -98,6 +359,20 @@ impl CompletionProvider for RuleProvider {
         let Some(command) = context.command_name.as_deref() else {
             return ProviderStatus::default();
         };
+        let replay_context = (
+            context.line.clone(),
+            context.point,
+            shell.cwd.clone(),
+            shell.generation,
+        );
+        if self.replay_context.as_ref() != Some(&replay_context) {
+            self.replay_context = Some(replay_context);
+            self.replay_states.clear();
+            self.quick_provisional = Arc::default();
+            self.quick_path_completion = PathCompletion::Inherit;
+            self.quick_redraws = 0;
+            self.quick_evaluated = false;
+        }
         let (programs, pending) = cache.rule_programs(command);
         let mut status = ProviderStatus {
             pending,
@@ -107,12 +382,104 @@ impl CompletionProvider for RuleProvider {
                 PathCompletion::Inherit
             },
         };
-        let Some(programs) = programs.map(<[_]>::to_vec) else {
+        let Some(programs) = programs else {
             return status;
         };
+        status.pending |= cache.snapshots_pending();
+        let fish_program_count = programs
+            .iter()
+            .filter(|loaded| loaded.source == SourceKind::Fish)
+            .count();
         let (mut available_commands, shell_commands, command_snapshot_pending) =
             command_snapshot(shell, cache);
         status.pending |= command_snapshot_pending;
+        if mode == CompletionMode::ExplicitTab && context.query.starts_with("--") {
+            if self.quick_redraws > 0 {
+                self.quick_redraws -= 1;
+                push_emitted_candidates(context, sink, &self.quick_provisional);
+                status.path_completion = status.path_completion.merge(self.quick_path_completion);
+                status.pending = true;
+                return status;
+            }
+            if !self.quick_evaluated
+                && fish_program_count == 1
+                && programs
+                    .iter()
+                    .any(|loaded| loaded.source == SourceKind::Fish)
+            {
+                self.quick_evaluated = true;
+                let quick_context = EvaluationContext {
+                    current_word: &context.query,
+                    words: &context.words,
+                    word_index: context.word_index,
+                    command_path: &context.command_path,
+                    environment: &shell.environment,
+                    working_directory: &shell.cwd,
+                    available_commands: Some(&available_commands),
+                    shell_commands: Some(&shell_commands),
+                    shell_functions: None,
+                    shell_variables: Some(&shell.variables),
+                    shell_variable_values: Some(&shell.variable_values),
+                    users: None,
+                    groups: None,
+                    hosts: None,
+                    process_ids: None,
+                    process_names: None,
+                    network_interfaces: None,
+                    signals: None,
+                    passwd_records: None,
+                    group_records: None,
+                    effective_user_id: shell.effective_user_id,
+                };
+                for loaded in programs
+                    .iter()
+                    .filter(|loaded| loaded.source == SourceKind::Fish)
+                {
+                    match evaluate_runtime_with_outcomes(
+                        &loaded.program,
+                        &quick_context,
+                        loaded.source,
+                        loaded.trust,
+                        EvaluationMode::ExplicitTab,
+                        sink.remaining_capacity_hint(),
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        true,
+                        true,
+                    ) {
+                        Ok(mut evaluated) if evaluated.provisional_yielded => {
+                            let provisional = std::mem::take(&mut evaluated.provisional_candidates);
+                            let retained_bytes = provisional
+                                .iter()
+                                .map(emitted_candidate_bytes)
+                                .sum::<usize>();
+                            if retained_bytes <= cache.replay_byte_limit().min(MAX_REPLAY_BYTES) {
+                                self.quick_provisional = Arc::from(provisional);
+                                // Provisional candidates may precede deterministic
+                                // Fish path-policy statements. Suppress generic path
+                                // candidates until the complete replay publishes the
+                                // final policy.
+                                self.quick_path_completion = PathCompletion::Suppress;
+                                push_emitted_candidates(context, sink, &self.quick_provisional);
+                                status.path_completion =
+                                    status.path_completion.merge(self.quick_path_completion);
+                                self.quick_redraws = 1;
+                                status.pending = true;
+                                return status;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            cache.record_rule_error(format!("{}: {error}", loaded.pack_name));
+                        }
+                    }
+                }
+            }
+        }
+        if self.quick_evaluated && self.quick_redraws == 0 {
+            self.quick_provisional = Arc::default();
+            self.quick_path_completion = PathCompletion::Inherit;
+        }
         for required in programs
             .iter()
             .flat_map(|loaded| loaded.required_commands.iter())
@@ -167,23 +534,255 @@ impl CompletionProvider for RuleProvider {
             CompletionMode::Passive => EvaluationMode::Passive,
             CompletionMode::ExplicitTab => EvaluationMode::ExplicitTab,
         };
-        for loaded in programs {
-            let evaluated = complete_loaded_program(
-                &loaded,
-                &evaluation_context,
-                context,
-                shell,
-                cache,
-                sink,
-                mode,
-                evaluation_mode,
-                0,
-            );
+        let fish_programs = programs
+            .iter()
+            .filter(|loaded| loaded.source == SourceKind::Fish)
+            .collect::<Vec<_>>();
+        let mut fish_evaluated = false;
+        for loaded in programs.iter() {
+            let evaluated = if loaded.source == SourceKind::Fish {
+                if fish_evaluated {
+                    continue;
+                }
+                fish_evaluated = true;
+                complete_loaded_programs(
+                    &fish_programs,
+                    &evaluation_context,
+                    context,
+                    shell,
+                    cache,
+                    sink,
+                    mode,
+                    evaluation_mode,
+                    0,
+                    true,
+                    Some(&mut self.replay_states),
+                )
+            } else {
+                complete_loaded_program(
+                    loaded,
+                    &evaluation_context,
+                    context,
+                    shell,
+                    cache,
+                    sink,
+                    mode,
+                    evaluation_mode,
+                    0,
+                    false,
+                    Some(&mut self.replay_states),
+                )
+            };
             status.pending |= evaluated.pending;
             status.path_completion = status.path_completion.merge(evaluated.path_completion);
+            trim_replay_states(&mut self.replay_states, cache.replay_byte_limit());
         }
         status
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_replay_dependencies(
+    pack_name: &str,
+    probes: &[ProbeRequest],
+    completion_requests: &[CompletionRequest],
+    filesystem_requests: &[FilesystemRequest],
+    evaluation_context: &EvaluationContext<'_>,
+    context: &CompletionContext,
+    shell: &ShellSnapshot,
+    cache: &mut CompletionCache,
+    sink: &mut CandidateSink,
+    mode: CompletionMode,
+    depth: usize,
+    probe_results: &mut HashMap<ProbeKey, ProbeResult>,
+    completion_results: &mut HashMap<String, Vec<String>>,
+    status: &mut ProviderStatus,
+    refresh_existing: bool,
+) -> Result<(bool, bool), ()> {
+    let mut progressed = false;
+    let mut unresolved = false;
+    for request in filesystem_requests {
+        if !refresh_existing && completion_results.contains_key(&request.request_id) {
+            continue;
+        }
+        let (values, filesystem_pending, filesystem_limited) =
+            cache.filesystem_values(request, evaluation_context.working_directory);
+        if filesystem_limited {
+            cache.record_rule_error(format!(
+                "{}: filesystem replay cache resource limit",
+                pack_name
+            ));
+            return Err(());
+        }
+        status.pending |= filesystem_pending;
+        if let Some(values) = values {
+            let changed = completion_results.get(&request.request_id) != Some(&values);
+            completion_results.insert(request.request_id.clone(), values);
+            if replay_dependency_bytes(probe_results, completion_results)
+                > cache.replay_byte_limit().min(MAX_REPLAY_BYTES)
+            {
+                cache.record_rule_error(format!(
+                    "{}: completion replay state exceeds the configured limit",
+                    pack_name
+                ));
+                return Err(());
+            }
+            progressed |= changed;
+        } else {
+            unresolved = true;
+        }
+    }
+    for request in completion_requests {
+        if !refresh_existing && completion_results.contains_key(&request.line) {
+            continue;
+        }
+        let (values, nested_pending) =
+            nested_completion_values_at_depth(request, shell, cache, mode, depth);
+        status.pending |= nested_pending;
+        if let Some(values) = values {
+            let changed = completion_results.get(&request.line) != Some(&values);
+            completion_results.insert(request.line.clone(), values);
+            if replay_dependency_bytes(probe_results, completion_results)
+                > cache.replay_byte_limit().min(MAX_REPLAY_BYTES)
+            {
+                cache.record_rule_error(format!(
+                    "{}: completion replay state exceeds the configured limit",
+                    pack_name
+                ));
+                return Err(());
+            }
+            progressed |= changed;
+        } else {
+            unresolved = true;
+        }
+    }
+    for probe in probes {
+        let (outcome, probe_pending) = cache.probe_outcome(probe);
+        status.pending |= probe_pending;
+        if probe.probe_id.starts_with("script:") {
+            if !refresh_existing && probe_results.contains_key(&probe.key) {
+                continue;
+            }
+            if let Some(outcome) = outcome {
+                let changed = probe_results.get(&probe.key) != Some(&outcome);
+                probe_results.insert(probe.key.clone(), outcome);
+                if replay_dependency_bytes(probe_results, completion_results)
+                    > cache.replay_byte_limit().min(MAX_REPLAY_BYTES)
+                {
+                    cache.record_rule_error(format!(
+                        "{}: completion replay state exceeds the configured limit",
+                        pack_name
+                    ));
+                    return Err(());
+                }
+                progressed |= changed;
+            } else {
+                unresolved = true;
+            }
+        } else if let Some(outcome) = outcome.filter(|outcome| outcome.status == 0) {
+            push_probe_values(context, sink, probe, &outcome.values);
+        }
+    }
+    Ok((progressed, unresolved))
+}
+
+fn push_emitted_candidates(
+    context: &CompletionContext,
+    sink: &mut CandidateSink,
+    candidates: &[EmittedCandidate],
+) {
+    for emitted in candidates {
+        push_rule_candidate(
+            context,
+            sink,
+            emitted.candidate.preserve_order,
+            emitted.candidate.value.clone(),
+            emitted.candidate.display.clone(),
+            emitted.candidate.description.clone(),
+            emitted.candidate.kind,
+            emitted.candidate.append,
+            emitted.source,
+        );
+    }
+}
+
+fn push_evaluation_result(
+    context: &CompletionContext,
+    sink: &mut CandidateSink,
+    status: &mut ProviderStatus,
+    evaluated: &EvaluationResult,
+) {
+    status.path_completion = status.path_completion.merge(evaluated.path_completion);
+    push_emitted_candidates(context, sink, &evaluated.candidates);
+}
+
+fn loaded_replay_key(loaded: &[&LoadedProgram], depth: usize, explicit: bool) -> ReplayKey {
+    if let [loaded] = loaded {
+        return ReplayKey {
+            pack_id: loaded.pack_id,
+            source_path: loaded.program.source_path.clone(),
+            depth,
+            explicit,
+        };
+    }
+    let mut hasher = Sha256::new();
+    for program in loaded {
+        hasher.update(program.pack_id);
+        hasher.update((program.program.source_path.len() as u64).to_le_bytes());
+        hasher.update(program.program.source_path.as_bytes());
+    }
+    let pack_id: [u8; 32] = hasher.finalize().into();
+    ReplayKey {
+        pack_id,
+        source_path: format!(
+            "fish-program-group:{:02x}{:02x}{:02x}{:02x}",
+            pack_id[0], pack_id[1], pack_id[2], pack_id[3]
+        ),
+        depth,
+        explicit,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_loaded_programs(
+    loaded: &[&LoadedProgram],
+    evaluation_context: &EvaluationContext<'_>,
+    evaluation_mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
+) -> Result<EvaluationResult, crate::rules::vm::VmError> {
+    if let [loaded] = loaded {
+        return evaluate_runtime_with_outcomes(
+            &loaded.program,
+            evaluation_context,
+            loaded.source,
+            loaded.trust,
+            evaluation_mode,
+            candidate_limit,
+            probe_results,
+            completion_results,
+            allow_provisional_yield,
+            runtime_optimizations,
+        );
+    }
+    let programs = loaded
+        .iter()
+        .map(|loaded| (loaded.program.as_ref(), loaded.trust))
+        .collect::<Vec<_>>();
+    evaluate_runtime_programs_with_outcomes(
+        &programs,
+        evaluation_context,
+        SourceKind::Fish,
+        evaluation_mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+        allow_provisional_yield,
+        runtime_optimizations,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,94 +796,327 @@ fn complete_loaded_program(
     mode: CompletionMode,
     evaluation_mode: EvaluationMode,
     depth: usize,
+    allow_cross_program_provisional: bool,
+    replay_states: Option<&mut HashMap<ReplayKey, ReplayState>>,
+) -> ProviderStatus {
+    complete_loaded_programs(
+        &[loaded],
+        evaluation_context,
+        context,
+        shell,
+        cache,
+        sink,
+        mode,
+        evaluation_mode,
+        depth,
+        allow_cross_program_provisional,
+        replay_states,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_loaded_programs(
+    loaded: &[&LoadedProgram],
+    evaluation_context: &EvaluationContext<'_>,
+    context: &CompletionContext,
+    shell: &ShellSnapshot,
+    cache: &mut CompletionCache,
+    sink: &mut CandidateSink,
+    mode: CompletionMode,
+    evaluation_mode: EvaluationMode,
+    depth: usize,
+    allow_cross_program_provisional: bool,
+    mut replay_states: Option<&mut HashMap<ReplayKey, ReplayState>>,
 ) -> ProviderStatus {
     let mut status = ProviderStatus::default();
-    let mut probe_results = HashMap::<ProbeKey, ProbeResult>::new();
-    let mut completion_results = HashMap::<String, Vec<String>>::new();
-    for round in 0..=8 {
-        let evaluated = match evaluate_with_outcomes(
-            &loaded.program,
+    let Some(first_loaded) = loaded.first().copied() else {
+        return status;
+    };
+    let pack_name = if loaded.len() == 1 {
+        first_loaded.pack_name.as_str()
+    } else {
+        "Fish rule program group"
+    };
+    let all_fish = loaded
+        .iter()
+        .all(|loaded| loaded.source == SourceKind::Fish);
+    let replay_key = loaded_replay_key(
+        loaded,
+        depth,
+        evaluation_mode == EvaluationMode::ExplicitTab,
+    );
+    let replay = replay_states
+        .as_deref_mut()
+        .and_then(|states| states.remove(&replay_key))
+        .unwrap_or_default();
+    let mut probe_results = replay.probe_results;
+    let mut completion_results = replay.completion_results;
+    let mut probes = replay.probes;
+    let mut completion_requests = replay.completion_requests;
+    let mut filesystem_requests = replay.filesystem_requests;
+    let mut cached_evaluated = replay.evaluated;
+    let mut provisional_candidates = replay.provisional_candidates;
+    let mut provisional_path_completion = replay.provisional_path_completion;
+    let mut provisional_redraws = replay.provisional_redraws;
+    if provisional_redraws > 0 {
+        provisional_redraws -= 1;
+        push_emitted_candidates(context, sink, &provisional_candidates);
+        status.path_completion = status.path_completion.merge(provisional_path_completion);
+        status.pending = true;
+        if let Some(states) = replay_states.as_deref_mut() {
+            states.insert(
+                replay_key,
+                ReplayState {
+                    probe_results,
+                    completion_results,
+                    probes,
+                    completion_requests,
+                    filesystem_requests,
+                    evaluated: cached_evaluated,
+                    provisional_candidates,
+                    provisional_path_completion,
+                    provisional_redraws,
+                },
+            );
+        }
+        return status;
+    }
+    let allow_provisional_yield = allow_cross_program_provisional
+        && all_fish
+        && evaluation_mode == EvaluationMode::ExplicitTab
+        && context.query.starts_with("--")
+        && provisional_candidates.is_empty();
+    if !probes.is_empty() || !completion_requests.is_empty() || !filesystem_requests.is_empty() {
+        let Ok((dependencies_changed, unresolved)) = resolve_replay_dependencies(
+            pack_name,
+            &probes,
+            &completion_requests,
+            &filesystem_requests,
             evaluation_context,
-            loaded.source,
-            loaded.trust,
+            context,
+            shell,
+            cache,
+            sink,
+            mode,
+            depth,
+            &mut probe_results,
+            &mut completion_results,
+            &mut status,
+            true,
+        ) else {
+            return status;
+        };
+        if unresolved {
+            push_emitted_candidates(context, sink, &provisional_candidates);
+            status.path_completion = status.path_completion.merge(provisional_path_completion);
+            if let Some(states) = replay_states.as_deref_mut() {
+                states.insert(
+                    replay_key,
+                    ReplayState {
+                        probe_results,
+                        completion_results,
+                        probes,
+                        completion_requests,
+                        filesystem_requests,
+                        evaluated: None,
+                        provisional_candidates,
+                        provisional_path_completion,
+                        provisional_redraws: 0,
+                    },
+                );
+            }
+            return status;
+        }
+        if !dependencies_changed {
+            if let Some((generation, evaluated)) = cached_evaluated.take() {
+                if generation == cache.response_generation() {
+                    push_evaluation_result(context, sink, &mut status, &evaluated);
+                    if let Some(states) = replay_states.as_deref_mut() {
+                        states.insert(
+                            replay_key,
+                            ReplayState {
+                                probe_results,
+                                completion_results,
+                                probes,
+                                completion_requests,
+                                filesystem_requests,
+                                evaluated: Some((generation, evaluated)),
+                                provisional_candidates: Arc::default(),
+                                provisional_path_completion: PathCompletion::Inherit,
+                                provisional_redraws: 0,
+                            },
+                        );
+                    }
+                    return status;
+                }
+            }
+        }
+    } else if let Some((generation, evaluated)) = cached_evaluated.take() {
+        if generation == cache.response_generation() {
+            push_evaluation_result(context, sink, &mut status, &evaluated);
+            if let Some(states) = replay_states.as_deref_mut() {
+                states.insert(
+                    replay_key,
+                    ReplayState {
+                        probe_results,
+                        completion_results,
+                        probes,
+                        completion_requests,
+                        filesystem_requests,
+                        evaluated: Some((generation, evaluated)),
+                        provisional_candidates: Arc::default(),
+                        provisional_path_completion: PathCompletion::Inherit,
+                        provisional_redraws: 0,
+                    },
+                );
+            }
+            return status;
+        }
+    }
+    for round in 0..=8 {
+        let mut evaluated = match evaluate_loaded_programs(
+            loaded,
+            evaluation_context,
             evaluation_mode,
             sink.remaining_capacity_hint(),
             &probe_results,
             &completion_results,
+            allow_provisional_yield,
+            allow_provisional_yield,
         ) {
             Ok(evaluated) => evaluated,
             Err(error) => {
-                cache.record_rule_error(format!("{}: {error}", loaded.pack_name));
+                cache.record_rule_error(format!("{pack_name}: {error}"));
                 return status;
             }
         };
-        let mut progressed = false;
-        let mut unresolved = false;
-        for request in &evaluated.filesystem_requests {
-            if completion_results.contains_key(&request.request_id) {
-                continue;
-            }
-            let (values, filesystem_pending, filesystem_limited) =
-                cache.filesystem_values(request, evaluation_context.working_directory);
-            if filesystem_limited {
-                cache.record_rule_error(format!(
-                    "{}: filesystem replay cache resource limit",
-                    loaded.pack_name
-                ));
-                return status;
-            }
-            status.pending |= filesystem_pending;
-            if let Some(values) = values {
-                completion_results.insert(request.request_id.clone(), values);
-                progressed = true;
-            } else {
-                unresolved = true;
-            }
-        }
-        for request in &evaluated.completion_requests {
-            if completion_results.contains_key(&request.line) {
-                continue;
-            }
-            let (values, nested_pending) =
-                nested_completion_values_at_depth(request, shell, cache, mode, depth);
-            status.pending |= nested_pending;
-            if let Some(values) = values {
-                completion_results.insert(request.line.clone(), values);
-                progressed = true;
-            } else {
-                unresolved = true;
-            }
-        }
-        for probe in &evaluated.probes {
-            let (outcome, probe_pending) = cache.probe_outcome(probe);
-            status.pending |= probe_pending;
-            if probe.probe_id.starts_with("script:") {
-                if probe_results.contains_key(&probe.key) {
-                    continue;
+        if evaluated.optimization_incomplete
+            && evaluated.probes.is_empty()
+            && evaluated.completion_requests.is_empty()
+            && evaluated.filesystem_requests.is_empty()
+        {
+            evaluated = match evaluate_loaded_programs(
+                loaded,
+                evaluation_context,
+                evaluation_mode,
+                sink.remaining_capacity_hint(),
+                &probe_results,
+                &completion_results,
+                false,
+                false,
+            ) {
+                Ok(evaluated) => evaluated,
+                Err(error) => {
+                    cache.record_rule_error(format!("{pack_name}: {error}"));
+                    return status;
                 }
-                if let Some(outcome) = outcome {
-                    probe_results.insert(probe.key.clone(), outcome);
-                    progressed = true;
-                } else {
-                    unresolved = true;
-                }
-            } else if let Some(outcome) = outcome.filter(|outcome| outcome.status == 0) {
-                push_probe_values(context, sink, probe, &outcome.values);
+            };
+        }
+        if evaluated.provisional_yielded {
+            provisional_candidates =
+                Arc::from(std::mem::take(&mut evaluated.provisional_candidates));
+            // The remaining Fish program can still refine path policy even
+            // though it cannot invalidate this provisional option. Avoid
+            // exposing filesystem false positives before full replay.
+            provisional_path_completion = PathCompletion::Suppress;
+            push_emitted_candidates(context, sink, &provisional_candidates);
+            status.path_completion = status.path_completion.merge(provisional_path_completion);
+            status.pending = true;
+            if let Some(states) = replay_states.as_deref_mut() {
+                states.insert(
+                    replay_key,
+                    ReplayState {
+                        probe_results,
+                        completion_results,
+                        probes,
+                        completion_requests,
+                        filesystem_requests,
+                        evaluated: None,
+                        provisional_candidates,
+                        provisional_path_completion,
+                        provisional_redraws: 1,
+                    },
+                );
             }
+            return status;
+        }
+        probes = evaluated.probes.clone();
+        completion_requests = evaluated.completion_requests.clone();
+        filesystem_requests = evaluated.filesystem_requests.clone();
+        let Ok((progressed, unresolved)) = resolve_replay_dependencies(
+            pack_name,
+            &probes,
+            &completion_requests,
+            &filesystem_requests,
+            evaluation_context,
+            context,
+            shell,
+            cache,
+            sink,
+            mode,
+            depth,
+            &mut probe_results,
+            &mut completion_results,
+            &mut status,
+            false,
+        ) else {
+            return status;
+        };
+        // Keep both dependency keys and their partial outcomes while workers
+        // run. A later event-hook turn can poll them before replaying the VM,
+        // rather than repeatedly rediscovering the same pending requests.
+        if unresolved {
+            let newly_provisional = std::mem::take(&mut evaluated.provisional_candidates);
+            if !newly_provisional.is_empty() {
+                provisional_candidates = Arc::from(newly_provisional);
+            }
+            push_emitted_candidates(context, sink, &provisional_candidates);
+            status.path_completion = status.path_completion.merge(provisional_path_completion);
+            if let Some(states) = replay_states.as_deref_mut() {
+                states.insert(
+                    replay_key,
+                    ReplayState {
+                        probe_results,
+                        completion_results,
+                        probes,
+                        completion_requests,
+                        filesystem_requests,
+                        evaluated: None,
+                        provisional_candidates,
+                        provisional_path_completion,
+                        provisional_redraws: 0,
+                    },
+                );
+            }
+            return status;
         }
         if progressed {
             if round == 8 {
                 cache.record_rule_error(format!(
-                    "{}: completion replay dependency limit exceeded",
-                    loaded.pack_name
+                    "{pack_name}: completion replay dependency limit exceeded"
                 ));
                 status.pending = false;
                 return status;
             }
             continue;
         }
-        if unresolved {
-            return status;
+        let reusable = (!evaluated.truncated)
+            .then(|| (cache.response_generation(), Arc::new(evaluated.clone())));
+        if let Some(states) = replay_states.as_deref_mut() {
+            states.insert(
+                replay_key,
+                ReplayState {
+                    probe_results,
+                    completion_results,
+                    probes,
+                    completion_requests,
+                    filesystem_requests,
+                    evaluated: reusable,
+                    provisional_candidates: Arc::default(),
+                    provisional_path_completion: PathCompletion::Inherit,
+                    provisional_redraws: 0,
+                },
+            );
         }
         status.path_completion = status.path_completion.merge(evaluated.path_completion);
         for emitted in evaluated.candidates {
@@ -591,7 +1423,7 @@ fn complete_nested_rules(
             PathCompletion::Inherit
         },
     };
-    let Some(programs) = programs.map(<[_]>::to_vec) else {
+    let Some(programs) = programs else {
         return status;
     };
     let (mut available_commands, shell_commands, command_snapshot_pending) =
@@ -651,18 +1483,45 @@ fn complete_nested_rules(
         CompletionMode::Passive => EvaluationMode::Passive,
         CompletionMode::ExplicitTab => EvaluationMode::ExplicitTab,
     };
-    for loaded in programs {
-        let evaluated = complete_loaded_program(
-            &loaded,
-            &evaluation_context,
-            context,
-            shell,
-            cache,
-            sink,
-            mode,
-            evaluation_mode,
-            depth,
-        );
+    let fish_programs = programs
+        .iter()
+        .filter(|loaded| loaded.source == SourceKind::Fish)
+        .collect::<Vec<_>>();
+    let mut fish_evaluated = false;
+    for loaded in programs.iter() {
+        let evaluated = if loaded.source == SourceKind::Fish {
+            if fish_evaluated {
+                continue;
+            }
+            fish_evaluated = true;
+            complete_loaded_programs(
+                &fish_programs,
+                &evaluation_context,
+                context,
+                shell,
+                cache,
+                sink,
+                mode,
+                evaluation_mode,
+                depth,
+                false,
+                None,
+            )
+        } else {
+            complete_loaded_program(
+                loaded,
+                &evaluation_context,
+                context,
+                shell,
+                cache,
+                sink,
+                mode,
+                evaluation_mode,
+                depth,
+                false,
+                None,
+            )
+        };
         status.pending |= evaluated.pending;
         status.path_completion = status.path_completion.merge(evaluated.path_completion);
     }
@@ -789,9 +1648,12 @@ impl CompletionProvider for GenericProvider {
             return status;
         }
         if user_query(context, cache, sink) {
+            status.pending |= cache.snapshots_pending();
             return status;
         }
-        host_query(context, cache, sink);
+        if host_query(context, cache, sink) {
+            status.pending |= cache.snapshots_pending();
+        }
 
         if context.command_position {
             status.pending |= command_candidates(context, shell, cache, sink);
@@ -956,9 +1818,13 @@ fn user_query(
     true
 }
 
-fn host_query(context: &CompletionContext, cache: &CompletionCache, sink: &mut CandidateSink) {
+fn host_query(
+    context: &CompletionContext,
+    cache: &CompletionCache,
+    sink: &mut CandidateSink,
+) -> bool {
     let Some((user, prefix)) = context.query.rsplit_once('@') else {
-        return;
+        return false;
     };
     for host in cache.hosts() {
         if let Some(candidate) = Candidate::new(
@@ -972,6 +1838,7 @@ fn host_query(context: &CompletionContext, cache: &CompletionCache, sink: &mut C
             sink.push(candidate);
         }
     }
+    true
 }
 
 fn path_candidates(
@@ -1107,7 +1974,7 @@ complete -F _replay replay
             source: SourceKind::Bash,
             trust: crate::rules::format::TrustStatus::Unsigned,
             required_commands: Vec::new(),
-            program: crate::rules::ir::CommandProgram {
+            program: Arc::new(crate::rules::ir::CommandProgram {
                 canonical_name: "replay".into(),
                 registrations: vec!["replay".into()],
                 source_path: "replay.bash".into(),
@@ -1116,7 +1983,7 @@ complete -F _replay replay
                 static_rules: Vec::new(),
                 probes: Vec::new(),
                 scripts: vec![module],
-            },
+            }),
         };
         let shell = ShellSnapshot {
             cwd: directory.clone(),
@@ -1158,6 +2025,8 @@ complete -F _replay replay
             CompletionMode::ExplicitTab,
             EvaluationMode::ExplicitTab,
             0,
+            false,
+            None,
         );
         assert!(first.pending);
         assert!(sink.finish().is_empty());
@@ -1176,6 +2045,8 @@ complete -F _replay replay
                 CompletionMode::ExplicitTab,
                 EvaluationMode::ExplicitTab,
                 0,
+                false,
+                None,
             );
             if !status.pending {
                 assert_eq!(
@@ -1191,6 +2062,51 @@ complete -F _replay replay
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replay_candidate_retention_is_aggregate_bounded() {
+        let large_candidate = |suffix: u8| {
+            let mut value = String::with_capacity(3 * 1024 * 1024);
+            value.push(char::from(b'a' + suffix));
+            let mut display = String::with_capacity(3 * 1024 * 1024);
+            display.push(char::from(b'a' + suffix));
+            EmittedCandidate {
+                candidate: crate::rules::ir::CandidateTemplate {
+                    value,
+                    display,
+                    description: None,
+                    kind: RuleCandidateKind::Option,
+                    append: AppendPolicy::Space,
+                    preserve_order: false,
+                },
+                source: SourceKind::Fish,
+            }
+        };
+        let mut states = HashMap::new();
+        for suffix in 0..3 {
+            states.insert(
+                ReplayKey {
+                    pack_id: [suffix; 32],
+                    source_path: format!("{suffix}.fish"),
+                    depth: 0,
+                    explicit: true,
+                },
+                ReplayState {
+                    evaluated: Some((
+                        1,
+                        Arc::new(EvaluationResult {
+                            candidates: vec![large_candidate(suffix)],
+                            ..EvaluationResult::default()
+                        }),
+                    )),
+                    ..ReplayState::default()
+                },
+            );
+        }
+        trim_replay_states(&mut states, MAX_REPLAY_BYTES);
+        assert!(states.values().map(replay_state_bytes).sum::<usize>() <= MAX_REPLAY_BYTES);
+        assert!(states.len() < 3);
     }
 
     #[test]

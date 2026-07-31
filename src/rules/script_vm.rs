@@ -8,6 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::Arc;
+
+use crate::completion::matcher::match_score;
 
 use super::format::{SourceKind, TrustStatus};
 use super::ir::{AppendPolicy, CandidateTemplate, PathCompletion, ProbeParser, RuleCandidateKind};
@@ -39,6 +43,8 @@ const MAX_TOTAL_CANDIDATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_WORK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ZSH_TAG_STATE_ITEMS: usize = 256;
 const MAX_ZSH_TAG_STATE_BYTES: usize = 16 * 1024;
+const MAX_FISH_MEMOIZED_CONDITIONS: usize = 1024;
+const MAX_FISH_MEMOIZED_CONDITION_BYTES: usize = 64 * 1024;
 
 fn bounded_string_snapshot<'a>(values: impl IntoIterator<Item = &'a String>) -> bool {
     let mut count = 0_usize;
@@ -99,19 +105,24 @@ fn validate_evaluation_context(context: &EvaluationContext<'_>) -> Result<(), Vm
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn evaluate_modules(
-    modules: &[ScriptModule],
+pub(crate) fn evaluate_module_groups(
+    module_groups: &[(&[ScriptModule], TrustStatus)],
     command: &str,
     context: &EvaluationContext<'_>,
     source: SourceKind,
-    trust: TrustStatus,
     mode: EvaluationMode,
     candidate_limit: usize,
     probe_results: &HashMap<ProbeKey, ProbeResult>,
     completion_results: &HashMap<String, Vec<String>>,
     result: &mut EvaluationResult,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
 ) -> Result<(), VmError> {
     validate_evaluation_context(context)?;
+    let modules = module_groups
+        .iter()
+        .flat_map(|(modules, trust)| modules.iter().map(move |module| (module, *trust)))
+        .collect::<Vec<_>>();
     let candidate_limit = candidate_limit.clamp(1, MAX_EMITTED_CANDIDATES);
     let mut candidate_bytes = result.candidates.iter().fold(0_usize, |total, emitted| {
         total
@@ -128,6 +139,18 @@ pub(crate) fn evaluate_modules(
     if candidate_bytes > MAX_TOTAL_CANDIDATE_BYTES {
         return Err(VmError::Limit("candidate bytes"));
     }
+    let declarative_fish = source == SourceKind::Fish
+        && modules
+            .iter()
+            .all(|(module, _)| module.dialect == ScriptDialect::Fish);
+    let fish_static_path = declarative_fish.then_some(result.path_completion);
+    let fish_static_candidates = if declarative_fish {
+        result.path_completion = PathCompletion::Inherit;
+        std::mem::take(&mut result.candidates)
+    } else {
+        Vec::new()
+    };
+    let fish_has_static_candidates = !fish_static_candidates.is_empty();
     let mut output_work_bytes = 0_usize;
     let mut candidate_indices = result
         .candidates
@@ -135,10 +158,20 @@ pub(crate) fn evaluate_modules(
         .enumerate()
         .map(|(index, candidate)| (candidate.candidate.value.clone(), index))
         .collect::<HashMap<_, _>>();
+    let fish_module_functions = modules
+        .iter()
+        .filter(|(module, _)| module.dialect == ScriptDialect::Fish)
+        .flat_map(|(module, _)| {
+            module
+                .functions
+                .iter()
+                .map(|function| function.name.as_str())
+        })
+        .collect::<HashSet<_>>();
     let mut effective_commands = vec![command.to_owned()];
     loop {
         let mut changed = false;
-        for module in modules {
+        for (module, _) in &modules {
             for registration in &module.registrations {
                 if effective_commands.iter().any(|effective| {
                     registration_matches(module.dialect, &registration.command, effective)
@@ -146,6 +179,7 @@ pub(crate) fn evaluate_modules(
                     if let Some(service) = &registration.service {
                         let available = module.dialect != ScriptDialect::Fish
                             || fish_builtin_available(service)
+                            || fish_module_functions.contains(service.as_str())
                             || context.command_available(service).unwrap_or(true);
                         if available && !effective_commands.contains(service) {
                             effective_commands.push(service.clone());
@@ -159,11 +193,44 @@ pub(crate) fn evaluate_modules(
             break;
         }
     }
-    for module in modules {
+    let fish_initial_candidate_bytes = if declarative_fish { 0 } else { candidate_bytes };
+    let mut fish_candidates = fish_static_candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, emitted)| CandidateRecord {
+            emitted,
+            fish_group: 0,
+            fish_item: index as u64,
+            provisional: true,
+        })
+        .collect::<Vec<_>>();
+    let mut fish_effects = if fish_has_static_candidates
+        || fish_static_path.is_some_and(|path| path != PathCompletion::Inherit)
+    {
+        vec![FishRegistrationEffect {
+            group: 0,
+            selectors: HashSet::new(),
+            path: FishPathEffect::Static(fish_static_path.unwrap_or(PathCompletion::Inherit)),
+        }]
+    } else {
+        Vec::new()
+    };
+    let mut fish_group = 0_u64;
+    let mut fish_force_files = false;
+    let mut fish_path_completion = match command {
+        "cd" => PathCompletion::Directories,
+        "." | "source" => PathCompletion::Files,
+        _ => PathCompletion::Inherit,
+    }
+    .merge(fish_static_path.unwrap_or(PathCompletion::Inherit));
+    let mut fish_provisional_yielded = false;
+    let mut saw_fish_module = declarative_fish;
+    for (module_index, &(module, module_trust)) in modules.iter().enumerate() {
         if !module.registrations.iter().any(|registration| {
             let available = module.dialect != ScriptDialect::Fish
                 || registration.service.as_deref().is_none_or(|service| {
                     fish_builtin_available(service)
+                        || fish_module_functions.contains(service)
                         || context.command_available(service).unwrap_or(true)
                 });
             available
@@ -173,12 +240,16 @@ pub(crate) fn evaluate_modules(
         }) {
             continue;
         }
+        let later_fish_erase = modules[module_index + 1..].iter().any(|(later, _)| {
+            later.dialect == ScriptDialect::Fish
+                && fish_statements_may_erase_completions(&later.statements)
+        });
         let mut machine = Machine::new(
             module,
             command,
             context,
             source,
-            trust,
+            module_trust,
             mode,
             candidate_limit.saturating_sub(result.candidates.len()),
             candidate_bytes,
@@ -186,38 +257,28 @@ pub(crate) fn evaluate_modules(
             probe_results,
             completion_results,
             &effective_commands,
+            allow_provisional_yield && !later_fish_erase,
+            runtime_optimizations,
         );
+        if module.dialect == ScriptDialect::Fish {
+            saw_fish_module = true;
+            machine.candidates = std::mem::take(&mut fish_candidates);
+            machine.emitted_values = machine
+                .candidates
+                .iter()
+                .map(|candidate| candidate.emitted.candidate.value.clone())
+                .collect();
+            machine.fish_registration_effects = std::mem::take(&mut fish_effects);
+            machine.fish_group = fish_group;
+            machine.fish_force_files = fish_force_files;
+            machine.path_completion = fish_path_completion;
+            machine.initial_candidate_bytes = fish_initial_candidate_bytes;
+        }
         let execution = machine.run();
+        let provisional_yielded = machine.provisional_yielded;
+        result.optimization_incomplete |= machine.skipped_candidate_work;
         candidate_bytes = machine.candidate_bytes;
         output_work_bytes = machine.output_work_bytes;
-        if module.dialect == ScriptDialect::Fish {
-            machine.candidates.sort_by(|left, right| {
-                match (
-                    left.emitted.candidate.preserve_order,
-                    right.emitted.candidate.preserve_order,
-                ) {
-                    (true, true) => right
-                        .fish_group
-                        .cmp(&left.fish_group)
-                        .then_with(|| left.fish_item.cmp(&right.fish_item)),
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (false, false) => fish_file_cmp(
-                        &left.emitted.candidate.value,
-                        &right.emitted.candidate.value,
-                    )
-                    .then_with(|| {
-                        left.emitted
-                            .candidate
-                            .display
-                            .cmp(&right.emitted.candidate.display)
-                    }),
-                }
-            });
-            for candidate in &mut machine.candidates {
-                candidate.emitted.candidate.preserve_order = true;
-            }
-        }
         if execution.is_ok() && machine.completion_invoked {
             result.completion_status = Some(
                 if matches!(module.dialect, ScriptDialect::Bash | ScriptDialect::Zsh) {
@@ -226,24 +287,6 @@ pub(crate) fn evaluate_modules(
                     0
                 },
             );
-        }
-        for record in machine.candidates {
-            let emitted = record.emitted;
-            if module.dialect == ScriptDialect::Bash {
-                result.candidates.push(emitted);
-            } else if let Some(index) = candidate_indices.get(&emitted.candidate.value).copied() {
-                let existing = &mut result.candidates[index].candidate;
-                if existing.description.is_none() {
-                    existing.description = emitted.candidate.description;
-                }
-                if emitted.candidate.append == AppendPolicy::NoSpace {
-                    existing.append = AppendPolicy::NoSpace;
-                }
-                existing.preserve_order |= emitted.candidate.preserve_order;
-            } else {
-                candidate_indices.insert(emitted.candidate.value.clone(), result.candidates.len());
-                result.candidates.push(emitted);
-            }
         }
         for request in machine.completion_requests {
             if !result.completion_requests.contains(&request) {
@@ -265,9 +308,44 @@ pub(crate) fn evaluate_modules(
             .denied_probe_count
             .saturating_add(machine.denied_probe_count);
         result.truncated |= machine.truncated;
-        result.path_completion = result.path_completion.merge(machine.path_completion);
+        if module.dialect == ScriptDialect::Fish {
+            fish_candidates = machine.candidates;
+            fish_effects = machine.fish_registration_effects;
+            fish_group = machine.fish_group;
+            fish_force_files = machine.fish_force_files;
+            fish_path_completion = machine.path_completion;
+            if provisional_yielded {
+                fish_candidates.retain(|candidate| candidate.provisional);
+                fish_provisional_yielded = true;
+            }
+        } else {
+            result.path_completion = result.path_completion.merge(machine.path_completion);
+            for record in machine.candidates {
+                let emitted = record.emitted;
+                if module.dialect == ScriptDialect::Bash {
+                    result.candidates.push(emitted);
+                } else if let Some(index) = candidate_indices.get(&emitted.candidate.value).copied()
+                {
+                    let existing = &mut result.candidates[index].candidate;
+                    if existing.description.is_none() {
+                        existing.description = emitted.candidate.description;
+                    }
+                    if emitted.candidate.append == AppendPolicy::NoSpace {
+                        existing.append = AppendPolicy::NoSpace;
+                    }
+                    existing.preserve_order |= emitted.candidate.preserve_order;
+                } else {
+                    candidate_indices
+                        .insert(emitted.candidate.value.clone(), result.candidates.len());
+                    result.candidates.push(emitted);
+                }
+            }
+        }
         execution?;
-        if result.candidates.len() >= candidate_limit {
+        if provisional_yielded {
+            break;
+        }
+        if module.dialect != ScriptDialect::Fish && result.candidates.len() >= candidate_limit {
             result.candidates.truncate(candidate_limit);
             break;
         }
@@ -281,10 +359,75 @@ pub(crate) fn evaluate_modules(
             return Err(VmError::Limit("filesystem requests"));
         }
     }
+    // Keep per-registration contributions reversible until every erase has
+    // run, then select the newest surviving contribution for each value.
+    let mut deduplicated = Vec::<CandidateRecord>::new();
+    let mut deduplicated_indices = HashMap::<String, usize>::new();
+    for record in fish_candidates {
+        if let Some(index) = deduplicated_indices
+            .get(&record.emitted.candidate.value)
+            .copied()
+        {
+            deduplicated[index] = record;
+        } else {
+            deduplicated_indices.insert(record.emitted.candidate.value.clone(), deduplicated.len());
+            deduplicated.push(record);
+        }
+    }
+    let mut fish_candidates = deduplicated;
+    fish_candidates.sort_by(|left, right| {
+        match (
+            left.emitted.candidate.preserve_order,
+            right.emitted.candidate.preserve_order,
+        ) {
+            (true, true) => right
+                .fish_group
+                .cmp(&left.fish_group)
+                .then_with(|| left.fish_item.cmp(&right.fish_item)),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => fish_file_cmp(
+                &left.emitted.candidate.value,
+                &right.emitted.candidate.value,
+            )
+            .then_with(|| {
+                left.emitted
+                    .candidate
+                    .display
+                    .cmp(&right.emitted.candidate.display)
+            }),
+        }
+    });
+    for record in fish_candidates {
+        let mut emitted = record.emitted;
+        emitted.candidate.preserve_order = true;
+        if let Some(index) = candidate_indices.get(&emitted.candidate.value).copied() {
+            let existing = &mut result.candidates[index].candidate;
+            if existing.description.is_none() {
+                existing.description = emitted.candidate.description;
+            }
+            if emitted.candidate.append == AppendPolicy::NoSpace {
+                existing.append = AppendPolicy::NoSpace;
+            }
+            existing.preserve_order = true;
+        } else {
+            candidate_indices.insert(emitted.candidate.value.clone(), result.candidates.len());
+            result.candidates.push(emitted);
+        }
+    }
+    if saw_fish_module {
+        result.path_completion = result.path_completion.merge(fish_path_completion);
+    }
+    if fish_provisional_yielded {
+        result.provisional_candidates = std::mem::take(&mut result.candidates);
+        result.provisional_yielded = true;
+    } else if result.candidates.len() > candidate_limit {
+        result.candidates.truncate(candidate_limit);
+    }
     Ok(())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Variable {
     values: Vec<String>,
     exported: bool,
@@ -333,6 +476,137 @@ enum AvailabilityKind {
     Command,
     Function,
     Builtin,
+}
+
+fn fish_complete_command_can_match(
+    command: &ScriptCommand,
+    context: &EvaluationContext<'_>,
+) -> bool {
+    let query = context.current_word;
+    // The conservative fast path is intentionally limited to an unattached
+    // long-option query. Other contexts can consume argument expressions or
+    // path policy in ways that are not visible from the literal registration.
+    if !query.starts_with("--") || query.contains('=') {
+        return true;
+    }
+
+    let previous = context
+        .word_index
+        .checked_sub(1)
+        .and_then(|index| context.words.get(index))
+        .map(String::as_str)
+        .unwrap_or("");
+    let mut candidate = String::new();
+    let mut has_options = false;
+    let mut option_matches = false;
+    let mut previous_is_option = false;
+    let mut arguments_match = false;
+    let mut dynamic_option = false;
+    let mut dynamic_arguments = false;
+    let mut erase = false;
+    let mut has_arguments = false;
+    let mut requires_parameter = false;
+    let mut index = 1;
+    while index < command.words.len() {
+        let option = command.words[index].as_plain_literal();
+        match option {
+            Some("-l" | "--long-option" | "-s" | "--short-option" | "-o" | "--old-option")
+                if index + 1 < command.words.len() =>
+            {
+                has_options = true;
+                let long = matches!(option, Some("-l" | "--long-option"));
+                if let Some(value) = command.words[index + 1].as_plain_literal() {
+                    candidate.clear();
+                    candidate.push('-');
+                    if long {
+                        candidate.push('-');
+                    }
+                    candidate.push_str(value);
+                    option_matches |= match_score(query, &candidate).is_some();
+                    previous_is_option |= previous == candidate;
+                } else {
+                    dynamic_option = true;
+                }
+                index += 2;
+            }
+            Some("-a" | "--arguments") => {
+                has_arguments = true;
+                if let Some(argument) = command.words.get(index + 1) {
+                    if let Some(value) = argument.as_plain_literal() {
+                        if value.bytes().filter(|byte| *byte == b'-').count() >= 2 {
+                            arguments_match |=
+                                split_fish_completion_words(value).into_iter().any(|value| {
+                                    let value = value
+                                        .split_once('\t')
+                                        .map_or(value.as_str(), |(value, _)| value);
+                                    match_score(query, value).is_some()
+                                });
+                        }
+                    } else {
+                        dynamic_arguments = true;
+                    }
+                    index += 2;
+                } else {
+                    dynamic_arguments = true;
+                    index += 1;
+                }
+            }
+            Some("-r" | "--require-parameter" | "-x" | "--exclusive") => {
+                requires_parameter = true;
+                index += 1;
+            }
+            Some("-e" | "--erase") => {
+                erase = true;
+                index += 1;
+            }
+            Some(value)
+                if value.starts_with("--long-option=") || value.starts_with("--short-option=") =>
+            {
+                has_options = true;
+                let long = value.starts_with("--long-option=");
+                candidate.clear();
+                candidate.push('-');
+                if long {
+                    candidate.push('-');
+                }
+                candidate.push_str(value.split_once('=').map_or("", |(_, value)| value));
+                option_matches |= match_score(query, &candidate).is_some();
+                previous_is_option |= previous == candidate;
+                index += 1;
+            }
+            Some(value)
+                if value.starts_with("-l")
+                    || value.starts_with("-s")
+                    || value.starts_with("-o") =>
+            {
+                dynamic_option = true;
+                index += 1;
+            }
+            Some(value) if value.starts_with("-a") || value.starts_with("--arguments=") => {
+                dynamic_arguments = true;
+                has_arguments = true;
+                index += 1;
+            }
+            None => {
+                // A runtime-expanded word in option position can supply `-l`,
+                // `-s`, or another selector that matches this query.
+                dynamic_option = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    if dynamic_option || erase {
+        return true;
+    }
+    if !has_options {
+        return !has_arguments || dynamic_arguments || arguments_match;
+    }
+    if (requires_parameter || has_arguments) && previous_is_option {
+        return true;
+    }
+    option_matches
 }
 
 fn fish_option_present(arguments: &[String], short: char, long: &str) -> bool {
@@ -397,12 +671,67 @@ struct CandidateRecord {
     emitted: EmittedCandidate,
     fish_group: u64,
     fish_item: u64,
+    provisional: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FishPathEffect {
+    None,
+    NoFiles,
+    Suppress,
+    ForceFiles,
+    Static(PathCompletion),
+}
+
+struct FishRegistrationEffect {
+    group: u64,
+    selectors: HashSet<String>,
+    path: FishPathEffect,
 }
 
 #[derive(Clone)]
-struct DeferredCompletion {
-    statements: Vec<ScriptStatement>,
-    words: Vec<ScriptWord>,
+struct FastFishCondition {
+    result: bool,
+    entry_status: i32,
+    state_generation: u64,
+    steps: usize,
+    loop_iterations: usize,
+    output_work_bytes: usize,
+    dependency_accesses: u64,
+}
+
+#[derive(Clone)]
+enum RuntimeFunction<'a> {
+    Borrowed(&'a ScriptFunction),
+    Owned(Arc<ScriptFunction>),
+}
+
+impl RuntimeFunction<'_> {
+    fn same_definition(&self, function: &ScriptFunction) -> bool {
+        match self {
+            Self::Borrowed(existing) => {
+                std::ptr::eq(*existing, function) || **existing == *function
+            }
+            Self::Owned(existing) => **existing == *function,
+        }
+    }
+}
+
+impl Deref for RuntimeFunction<'_> {
+    type Target = ScriptFunction;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(function) => function,
+            Self::Owned(function) => function,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeferredCompletion<'a> {
+    statements: &'a [ScriptStatement],
+    words: &'a [ScriptWord],
 }
 
 struct Machine<'a> {
@@ -412,12 +741,17 @@ struct Machine<'a> {
     source: SourceKind,
     trust: TrustStatus,
     mode: EvaluationMode,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
+    provisional_yielded: bool,
     candidate_limit: usize,
     variables: HashMap<String, Variable>,
-    functions: HashMap<String, ScriptFunction>,
+    functions: HashMap<String, RuntimeFunction<'a>>,
     function_order: Vec<String>,
+    function_generation: u64,
     candidates: Vec<CandidateRecord>,
     candidate_bytes: usize,
+    initial_candidate_bytes: usize,
     output_work_bytes: usize,
     emitted_values: HashSet<String>,
     emission_attempts: usize,
@@ -425,6 +759,15 @@ struct Machine<'a> {
     fish_group: u64,
     fish_item: u64,
     fish_force_files: bool,
+    fish_base_path_completion: PathCompletion,
+    fish_registration_effects: Vec<FishRegistrationEffect>,
+    fast_fish_condition_cache: HashMap<String, FastFishCondition>,
+    fast_fish_condition_seen: HashSet<String>,
+    fish_condition_depth: usize,
+    condition_state_generation: u64,
+    dependency_epoch: u64,
+    fish_may_erase_completions: bool,
+    skipped_candidate_work: bool,
     probes: Vec<ProbeRequest>,
     completion_requests: Vec<CompletionRequest>,
     filesystem_requests: Vec<FilesystemRequest>,
@@ -445,7 +788,7 @@ struct Machine<'a> {
     suppress_word_splitting: bool,
     probe_results: &'a HashMap<ProbeKey, ProbeResult>,
     completion_results: &'a HashMap<String, Vec<String>>,
-    deferred_completion_words: HashMap<String, DeferredCompletion>,
+    deferred_completion_words: HashMap<&'a str, DeferredCompletion<'a>>,
     effective_commands: Vec<String>,
     runtime_bash_registrations: Vec<(String, ScriptEntry, AppendPolicy)>,
     active_tags: Vec<String>,
@@ -470,6 +813,8 @@ impl<'a> Machine<'a> {
         probe_results: &'a HashMap<ProbeKey, ProbeResult>,
         completion_results: &'a HashMap<String, Vec<String>>,
         effective_commands: &[String],
+        allow_provisional_yield: bool,
+        runtime_optimizations: bool,
     ) -> Self {
         let mut variables = context
             .environment
@@ -532,19 +877,23 @@ impl<'a> Machine<'a> {
             .map(|function| function.name.clone())
             .collect::<Vec<_>>();
         function_order.dedup();
-        let mut functions = module
+        let mut function_definitions = module
             .functions
             .iter()
-            .map(|function| (function.name.clone(), function.clone()))
+            .map(|function| (function.name.clone(), function))
             .collect::<HashMap<_, _>>();
-        collect_statement_functions(&module.statements, &mut functions);
-        let mut additional_functions = functions
+        collect_statement_functions(&module.statements, &mut function_definitions);
+        let mut additional_functions = function_definitions
             .keys()
             .filter(|name| !function_order.contains(name))
             .cloned()
             .collect::<Vec<_>>();
         additional_functions.sort_unstable();
         function_order.extend(additional_functions);
+        let functions = function_definitions
+            .into_iter()
+            .map(|(name, function)| (name, RuntimeFunction::Borrowed(function)))
+            .collect();
         let mut deferred_completion_words = HashMap::new();
         collect_deferred_completion_words(&module.statements, &mut deferred_completion_words);
         for function in &module.functions {
@@ -553,6 +902,15 @@ impl<'a> Machine<'a> {
             }
             collect_deferred_completion_words(&function.body, &mut deferred_completion_words);
         }
+        let fish_base_path_completion = if module.dialect == ScriptDialect::Fish {
+            match command {
+                "cd" => PathCompletion::Directories,
+                "." | "source" => PathCompletion::Files,
+                _ => PathCompletion::Inherit,
+            }
+        } else {
+            PathCompletion::Inherit
+        };
         Self {
             module,
             command,
@@ -560,12 +918,17 @@ impl<'a> Machine<'a> {
             source,
             trust,
             mode,
+            allow_provisional_yield,
+            runtime_optimizations,
+            provisional_yielded: false,
             candidate_limit,
             variables,
             functions,
             function_order,
+            function_generation: 0,
             candidates: Vec::new(),
             candidate_bytes,
+            initial_candidate_bytes: candidate_bytes,
             output_work_bytes,
             emitted_values: HashSet::new(),
             emission_attempts: 0,
@@ -573,21 +936,22 @@ impl<'a> Machine<'a> {
             fish_group: 0,
             fish_item: 0,
             fish_force_files: false,
+            fish_base_path_completion,
+            fish_registration_effects: Vec::new(),
+            fast_fish_condition_cache: HashMap::new(),
+            fast_fish_condition_seen: HashSet::new(),
+            fish_condition_depth: 0,
+            condition_state_generation: 0,
+            dependency_epoch: 0,
+            fish_may_erase_completions: fish_statements_may_erase_completions(&module.statements),
+            skipped_candidate_work: false,
             probes: Vec::new(),
             completion_requests: Vec::new(),
             filesystem_requests: Vec::new(),
             snapshot_providers: Vec::new(),
             denied_probe_count: 0,
             truncated: false,
-            path_completion: if module.dialect == ScriptDialect::Fish {
-                match command {
-                    "cd" => PathCompletion::Directories,
-                    "." | "source" => PathCompletion::Files,
-                    _ => PathCompletion::Inherit,
-                }
-            } else {
-                PathCompletion::Inherit
-            },
+            path_completion: fish_base_path_completion,
             steps: 0,
             call_depth: 0,
             active_functions: Vec::new(),
@@ -612,6 +976,69 @@ impl<'a> Machine<'a> {
         }
     }
 
+    fn exec_fish_top_level(&mut self) -> Result<CommandResult, VmError> {
+        let mut result = CommandResult::success();
+        let mut output = Vec::new();
+        let mut output_bytes = 0_usize;
+        let mut stopped_for_dependency = false;
+        for statement in &self.module.statements {
+            result = self.exec_statement(statement)?;
+            append_bounded_output(&mut output, &mut output_bytes, &mut result.output)?;
+            self.record_status(result.status);
+            if result.control != Control::None {
+                break;
+            }
+            if self.allow_provisional_yield
+                && self.mode == EvaluationMode::ExplicitTab
+                && self.dependency_epoch == 0
+                && !self.fish_may_erase_completions
+                && self.has_matching_provisional_candidate()
+            {
+                // All dependencies encountered before this candidate were
+                // replayed successfully. With no erasure anywhere in the
+                // module, later statements can refine but cannot invalidate it.
+                self.provisional_yielded = true;
+                break;
+            }
+            if self.runtime_optimizations && self.dependency_epoch > 0 {
+                stopped_for_dependency = true;
+                if self.allow_provisional_yield
+                    && self.mode == EvaluationMode::ExplicitTab
+                    && !self.fish_may_erase_completions
+                    && self.has_matching_provisional_candidate()
+                {
+                    self.provisional_yielded = true;
+                }
+                break;
+            }
+        }
+        if self.allow_provisional_yield
+            && self.mode == EvaluationMode::ExplicitTab
+            && !stopped_for_dependency
+            && self.has_matching_provisional_candidate()
+        {
+            // With no asynchronous dependency, the quick pass reached the
+            // normal end of the module and already includes deterministic
+            // erasures and path-policy updates.
+            self.provisional_yielded = true;
+        }
+        result.output = output;
+        Ok(result)
+    }
+
+    fn has_matching_provisional_candidate(&self) -> bool {
+        !self.skipped_candidate_work
+            && !self.context.current_word.is_empty()
+            && self.candidates.iter().any(|candidate| {
+                candidate.provisional
+                    && match_score(
+                        self.context.current_word,
+                        &candidate.emitted.candidate.value,
+                    )
+                    .is_some()
+            })
+    }
+
     fn run(&mut self) -> Result<(), VmError> {
         match self.module.dialect {
             ScriptDialect::Fish => {
@@ -633,7 +1060,11 @@ impl<'a> Machine<'a> {
                     self.set_values("service", vec![service], false);
                 }
                 self.completion_invoked = true;
-                self.exec_statements(&self.module.statements)?;
+                if self.runtime_optimizations {
+                    self.exec_fish_top_level()?;
+                } else {
+                    self.exec_statements(&self.module.statements)?;
+                }
             }
             ScriptDialect::Zsh => {
                 let entries = self.matching_entries();
@@ -954,6 +1385,22 @@ impl<'a> Machine<'a> {
     }
 
     fn exec_statement(&mut self, statement: &ScriptStatement) -> Result<CommandResult, VmError> {
+        let is_fish_complete = matches!(statement, ScriptStatement::Command { command }
+            if command.words.first().and_then(ScriptWord::as_plain_literal) == Some("complete"));
+        if self.runtime_optimizations && self.module.dialect == ScriptDialect::Fish {
+            if !is_fish_complete {
+                self.condition_state_generation = self.condition_state_generation.wrapping_add(1);
+            }
+            if self.fish_condition_depth == 0
+                && self.call_depth == 0
+                && !self.fast_fish_condition_cache.is_empty()
+                && !is_fish_complete
+            {
+                // A top-level statement between registrations can change any
+                // input observed by a later condition.
+                self.fast_fish_condition_cache.clear();
+            }
+        }
         self.step()?;
         match statement {
             ScriptStatement::Command { command } => {
@@ -1167,11 +1614,21 @@ impl<'a> Machine<'a> {
                 Ok(result)
             }
             ScriptStatement::Function { function } => {
+                if self
+                    .functions
+                    .get(&function.name)
+                    .is_some_and(|existing| existing.same_definition(function))
+                {
+                    return Ok(CommandResult::success());
+                }
                 if !self.functions.contains_key(&function.name) {
                     self.function_order.push(function.name.clone());
                 }
-                self.functions
-                    .insert(function.name.clone(), function.clone());
+                self.functions.insert(
+                    function.name.clone(),
+                    RuntimeFunction::Owned(Arc::new(function.clone())),
+                );
+                self.function_generation = self.function_generation.wrapping_add(1);
                 Ok(CommandResult::success())
             }
             ScriptStatement::Noop => Ok(CommandResult::success()),
@@ -1310,6 +1767,7 @@ impl<'a> Machine<'a> {
             variable.exported.hash(&mut hasher);
             variable.readonly.hash(&mut hasher);
             variable.array.hash(&mut hasher);
+            variable.associative.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -2145,6 +2603,7 @@ impl<'a> Machine<'a> {
             }
             return Ok(CommandResult::success());
         }
+        self.dependency_epoch = self.dependency_epoch.wrapping_add(1);
         let request = CompletionRequest { line };
         if !self.completion_requests.contains(&request) {
             if self.completion_requests.len() >= MAX_COMPLETION_REQUESTS {
@@ -3480,12 +3939,12 @@ impl<'a> Machine<'a> {
             // process identifier. A fixed shell-local identity is sufficient
             // for completion code that only uses `$$` to form temporary names.
             "$" => vec!["1".into()],
-            "#" => vec![
+            "#" => vec![{
                 self.variables
                     .get("@")
                     .map_or(0, |variable| variable.values.len())
-                    .to_string(),
-            ],
+                    .to_string()
+            }],
             _ => self
                 .variables
                 .get(name)
@@ -4059,7 +4518,11 @@ impl<'a> Machine<'a> {
         if !self.functions.contains_key(&function.name) {
             self.function_order.push(function.name.clone());
         }
-        self.functions.insert(function.name.clone(), function);
+        self.functions.insert(
+            function.name.clone(),
+            RuntimeFunction::Owned(Arc::new(function)),
+        );
+        self.function_generation = self.function_generation.wrapping_add(1);
         Ok(CommandResult::success())
     }
 
@@ -4467,6 +4930,7 @@ impl<'a> Machine<'a> {
         if let Some(values) = self.completion_results.get(&request_id) {
             return Some(values.clone());
         }
+        self.dependency_epoch = self.dependency_epoch.wrapping_add(1);
         let request = FilesystemRequest {
             request_id,
             kind,
@@ -5170,7 +5634,150 @@ impl<'a> Machine<'a> {
         Ok(CommandResult::output(output))
     }
 
+    fn charge_fast_fish_memo(
+        &mut self,
+        steps: usize,
+        loop_iterations: usize,
+        output_work_bytes: usize,
+        dependency_accesses: u64,
+    ) -> Result<(), VmError> {
+        self.steps = self.steps.saturating_add(steps);
+        self.loop_iterations = self.loop_iterations.saturating_add(loop_iterations);
+        self.output_work_bytes = self.output_work_bytes.saturating_add(output_work_bytes);
+        self.dependency_epoch = self.dependency_epoch.wrapping_add(dependency_accesses);
+        if self.steps > MAX_STEPS {
+            return Err(VmError::Limit("shell script steps"));
+        }
+        if self.loop_iterations > MAX_LOOP_ITERATIONS {
+            return Err(VmError::Limit("shell loop iterations"));
+        }
+        if self.output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+            return Err(VmError::Limit("shell command output work"));
+        }
+        self.check_machine_memory()
+    }
+
+    fn evaluate_cached_fish_condition(
+        &mut self,
+        source: &str,
+        statements: &[ScriptStatement],
+    ) -> Result<bool, VmError> {
+        if !self.runtime_optimizations
+            || !self.trust.permits_dynamic_probes()
+            || !self
+                .deferred_completion_words
+                .get(source)
+                .is_some_and(|deferred| deferred.statements == statements)
+        {
+            return Ok(self.exec_statements(statements)?.status == 0);
+        }
+        let entry_status = self.last_status;
+        if let Some(cached) = self
+            .fast_fish_condition_cache
+            .get(source)
+            .filter(|cached| {
+                cached.entry_status == entry_status
+                    && cached.state_generation == self.condition_state_generation
+            })
+            .cloned()
+        {
+            self.charge_fast_fish_memo(
+                cached.steps,
+                cached.loop_iterations,
+                cached.output_work_bytes,
+                cached.dependency_accesses,
+            )?;
+            return Ok(cached.result);
+        }
+
+        let seen_before = self.fast_fish_condition_seen.contains(source);
+        let variables_before = (seen_before || !self.fast_fish_condition_cache.is_empty())
+            .then(|| self.variables.clone());
+        let registration_effects_before = self.fish_registration_effects.len();
+        let state_before = (
+            self.function_generation,
+            self.candidates.len(),
+            self.emission_attempts,
+            self.completion_invoked,
+            self.fish_force_files,
+            self.path_completion,
+            self.probes.len(),
+            self.completion_requests.len(),
+            self.filesystem_requests.len(),
+            self.snapshot_providers.len(),
+            self.runtime_bash_registrations.len(),
+            self.stdin_cursor,
+        );
+        let steps = self.steps;
+        let loop_iterations = self.loop_iterations;
+        let output_work_bytes = self.output_work_bytes;
+        let dependency_epoch = self.dependency_epoch;
+        self.fish_condition_depth = self.fish_condition_depth.saturating_add(1);
+        let evaluated = self.exec_statements(statements);
+        self.fish_condition_depth = self.fish_condition_depth.saturating_sub(1);
+        let result = evaluated?.status == 0;
+        let state_unchanged = variables_before
+            .as_ref()
+            .is_none_or(|variables| variables == &self.variables)
+            && registration_effects_before == self.fish_registration_effects.len()
+            && state_before
+                == (
+                    self.function_generation,
+                    self.candidates.len(),
+                    self.emission_attempts,
+                    self.completion_invoked,
+                    self.fish_force_files,
+                    self.path_completion,
+                    self.probes.len(),
+                    self.completion_requests.len(),
+                    self.filesystem_requests.len(),
+                    self.snapshot_providers.len(),
+                    self.runtime_bash_registrations.len(),
+                    self.stdin_cursor,
+                );
+        if !state_unchanged {
+            self.fast_fish_condition_cache.clear();
+        } else if seen_before
+            && self.fast_fish_condition_cache.len() < MAX_FISH_MEMOIZED_CONDITIONS
+            && self
+                .fast_fish_condition_cache
+                .keys()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(source.len())
+                <= MAX_FISH_MEMOIZED_CONDITION_BYTES
+        {
+            self.fast_fish_condition_cache.insert(
+                source.to_owned(),
+                FastFishCondition {
+                    result,
+                    entry_status,
+                    state_generation: self.condition_state_generation,
+                    steps: self.steps.saturating_sub(steps),
+                    loop_iterations: self.loop_iterations.saturating_sub(loop_iterations),
+                    output_work_bytes: self.output_work_bytes.saturating_sub(output_work_bytes),
+                    dependency_accesses: self.dependency_epoch.wrapping_sub(dependency_epoch),
+                },
+            );
+        }
+        if !self.fast_fish_condition_seen.contains(source)
+            && self.fast_fish_condition_seen.len() < MAX_FISH_MEMOIZED_CONDITIONS
+            && self
+                .fast_fish_condition_seen
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(source.len())
+                <= MAX_FISH_MEMOIZED_CONDITION_BYTES
+        {
+            self.fast_fish_condition_seen.insert(source.to_owned());
+        }
+        Ok(result)
+    }
+
     fn complete_command(&mut self, command: &ScriptCommand) -> Result<CommandResult, VmError> {
+        let emit_candidates =
+            !self.runtime_optimizations || fish_complete_command_can_match(command, self.context);
         let mut arguments = Vec::new();
         let mut index = 1;
         while index < command.words.len() {
@@ -5191,12 +5798,11 @@ impl<'a> Machine<'a> {
                 ] = command.words[index + 1].parts.as_slice()
                 {
                     if matches!(option.as_str(), "-n" | "--condition") {
-                        let result = self.exec_statements(statements)?;
-                        if result.status != 0 {
+                        if !self.evaluate_cached_fish_condition(source, statements)? {
                             return Ok(CommandResult::status(1));
                         }
                         arguments.push(":".into());
-                    } else {
+                    } else if emit_candidates {
                         let mut output = Vec::new();
                         for word in words {
                             output.extend(self.expand_command_word(word)?);
@@ -5206,21 +5812,28 @@ impl<'a> Machine<'a> {
                         } else {
                             arguments.push(output.join("\0"));
                         }
+                    } else {
+                        self.skipped_candidate_work = true;
+                        arguments.push(String::new());
                     }
                     let _ = source;
-                } else {
+                } else if emit_candidates || matches!(option.as_str(), "-n" | "--condition") {
                     arguments.extend(self.expand_command_word(&command.words[index + 1])?);
+                } else {
+                    self.skipped_candidate_work = true;
+                    arguments.push(String::new());
                 }
                 index += 2;
             } else {
                 index += 1;
             }
         }
-        self.complete_builtin_normalized(&arguments, true)
+        let arguments = normalize_fish_complete_arguments(&arguments);
+        self.complete_builtin_normalized(&arguments, true, emit_candidates)
     }
 
     fn complete_builtin(&mut self, arguments: &[String]) -> Result<CommandResult, VmError> {
-        self.complete_builtin_normalized(arguments, false)
+        self.complete_builtin_normalized(arguments, false, true)
     }
 
     fn capture_bash_registration(&mut self, arguments: &[String]) {
@@ -5389,10 +6002,74 @@ impl<'a> Machine<'a> {
         Ok(CommandResult::success())
     }
 
+    fn rebuild_fish_registration_state(&mut self) {
+        self.emitted_values = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.emitted.candidate.value.clone())
+            .collect();
+        self.candidate_bytes =
+            self.candidates
+                .iter()
+                .fold(self.initial_candidate_bytes, |bytes, candidate| {
+                    bytes
+                        .saturating_add(candidate.emitted.candidate.value.len().saturating_mul(2))
+                        .saturating_add(
+                            candidate
+                                .emitted
+                                .candidate
+                                .description
+                                .as_ref()
+                                .map_or(0, String::len),
+                        )
+                });
+        self.fish_force_files = false;
+        self.path_completion = self.fish_base_path_completion;
+        for effect in &self.fish_registration_effects {
+            match effect.path {
+                FishPathEffect::None => {}
+                FishPathEffect::NoFiles => {
+                    if !self.fish_force_files {
+                        self.path_completion = PathCompletion::Suppress;
+                    }
+                }
+                FishPathEffect::Suppress => {
+                    self.path_completion = self.path_completion.merge(PathCompletion::Suppress);
+                }
+                FishPathEffect::ForceFiles => {
+                    self.fish_force_files = true;
+                    self.path_completion = self.path_completion.merge(PathCompletion::Files);
+                }
+                FishPathEffect::Static(path) => {
+                    self.path_completion = self.path_completion.merge(path);
+                }
+            }
+        }
+    }
+
+    fn erase_fish_registrations(&mut self, selectors: &HashSet<String>) {
+        let mut erased_groups = HashSet::new();
+        self.fish_registration_effects.retain(|effect| {
+            let erase = selectors.is_empty()
+                || effect
+                    .selectors
+                    .iter()
+                    .any(|selector| selectors.contains(selector));
+            if erase {
+                erased_groups.insert(effect.group);
+            }
+            !erase
+        });
+        self.candidates
+            .retain(|candidate| !erased_groups.contains(&candidate.fish_group));
+        self.rebuild_fish_registration_state();
+    }
+
     fn complete_builtin_normalized(
         &mut self,
         arguments: &[String],
         already_normalized: bool,
+        emit_candidates: bool,
     ) -> Result<CommandResult, VmError> {
         if self.initializing {
             if self.module.dialect == ScriptDialect::Bash {
@@ -5416,6 +6093,7 @@ impl<'a> Machine<'a> {
                 self.check_values(&output)?;
                 return Ok(CommandResult::output(output));
             }
+            self.dependency_epoch = self.dependency_epoch.wrapping_add(1);
             let request = CompletionRequest { line };
             if !self.completion_requests.contains(&request) {
                 if self.completion_requests.len() >= MAX_COMPLETION_REQUESTS {
@@ -5562,26 +6240,16 @@ impl<'a> Machine<'a> {
         {
             return Ok(CommandResult::status(1));
         }
+        let selectors = short
+            .iter()
+            .map(|value| format!("-{value}"))
+            .chain(long.iter().map(|value| format!("--{value}")))
+            .chain(old.iter().map(|value| format!("-{value}")))
+            .collect::<HashSet<_>>();
         if erase {
-            let values = short
-                .iter()
-                .map(|value| format!("-{value}"))
-                .chain(long.iter().map(|value| format!("--{value}")))
-                .chain(old.iter().map(|value| format!("-{value}")))
-                .collect::<HashSet<_>>();
-            if values.is_empty() {
-                self.candidates.clear();
-                self.emitted_values.clear();
-            } else {
-                self.candidates
-                    .retain(|candidate| !values.contains(&candidate.emitted.candidate.value));
-                for value in values {
-                    self.emitted_values.remove(&value);
-                }
-            }
+            self.erase_fish_registrations(&selectors);
             return Ok(CommandResult::success());
         }
-        values = self.expand_deferred_completion_values(values)?;
         self.fish_group = self.fish_group.wrapping_add(1);
         self.fish_item = 0;
         let previous = self
@@ -5605,18 +6273,32 @@ impl<'a> Machine<'a> {
         let option_parameter_applies =
             requires_parameter && previous_is_option || attached_long_prefix.is_some();
         let exclusive_applies = !has_options || option_parameter_applies;
-        if no_files && exclusive_applies {
+        let path_effect = if no_files && exclusive_applies {
             if !self.fish_force_files {
                 self.path_completion = PathCompletion::Suppress;
             }
+            FishPathEffect::NoFiles
         } else if exclusive && exclusive_applies
             || attached_long_prefix.is_some() && has_argument_expression
         {
             self.path_completion = self.path_completion.merge(PathCompletion::Suppress);
+            FishPathEffect::Suppress
         } else if force_files && exclusive_applies {
             self.fish_force_files = true;
             self.path_completion = self.path_completion.merge(PathCompletion::Files);
+            FishPathEffect::ForceFiles
+        } else {
+            FishPathEffect::None
+        };
+        self.fish_registration_effects.push(FishRegistrationEffect {
+            group: self.fish_group,
+            selectors,
+            path: path_effect,
+        });
+        if !emit_candidates {
+            return Ok(CommandResult::success());
         }
+        values = self.expand_deferred_completion_values(values)?;
         let option_append = AppendPolicy::Space;
         if self.context.current_word.starts_with('-') {
             for value in short {
@@ -5720,12 +6402,13 @@ impl<'a> Machine<'a> {
             let mut expanded = Vec::new();
             let mut changed = false;
             for value in values {
-                let Some(deferred) = self.deferred_completion_words.get(&value).cloned() else {
+                let Some(deferred) = self.deferred_completion_words.get(value.as_str()).cloned()
+                else {
                     expanded.push(value);
                     continue;
                 };
                 changed = true;
-                for word in &deferred.words {
+                for word in deferred.words {
                     expanded.extend(self.expand_word(word)?);
                     self.check_values(&expanded)?;
                 }
@@ -5743,8 +6426,10 @@ impl<'a> Machine<'a> {
         let Some((name, arguments)) = words.split_first() else {
             return true;
         };
-        self.invoke(name, arguments, &[])
-            .is_ok_and(|result| result.status == 0)
+        self.fish_condition_depth = self.fish_condition_depth.saturating_add(1);
+        let result = self.invoke(name, arguments, &[]);
+        self.fish_condition_depth = self.fish_condition_depth.saturating_sub(1);
+        result.is_ok_and(|result| result.status == 0)
     }
 
     fn compgen_builtin(&mut self, arguments: &[String]) -> Result<CommandResult, VmError> {
@@ -6197,9 +6882,9 @@ impl<'a> Machine<'a> {
             .min_by(|(left, _), (right, _)| {
                 left.len().cmp(&right.len()).then_with(|| left.cmp(right))
             })
-            .map(|(_, deferred)| deferred.clone())
+            .map(|(_, deferred)| *deferred)
         {
-            return self.exec_statements(&deferred.statements);
+            return self.exec_statements(deferred.statements);
         }
         if action.starts_with('(') && action.ends_with(')') {
             let mut body = &action[1..action.len() - 1];
@@ -6215,10 +6900,10 @@ impl<'a> Machine<'a> {
                 .min_by(|(left, _), (right, _)| {
                     left.len().cmp(&right.len()).then_with(|| left.cmp(right))
                 })
-                .map(|(_, deferred)| deferred.words.clone());
+                .map(|(_, deferred)| deferred.words);
             let mut values = Vec::new();
             if let Some(words) = deferred_words {
-                for word in &words {
+                for word in words {
                     for expanded in self.expand_command_word(word)? {
                         let (value, description) = zsh_described_value(&expanded);
                         values.extend(
@@ -7041,7 +7726,7 @@ impl<'a> Machine<'a> {
             self.function_order.push(target.clone());
             self.functions.insert(
                 target.clone(),
-                ScriptFunction {
+                RuntimeFunction::Owned(Arc::new(ScriptFunction {
                     name: target.clone(),
                     arguments: Vec::new(),
                     body: vec![ScriptStatement::Command {
@@ -7051,8 +7736,9 @@ impl<'a> Machine<'a> {
                             redirections: Vec::new(),
                         },
                     }],
-                },
+                })),
             );
+            self.function_generation = self.function_generation.wrapping_add(1);
             return Ok(CommandResult::success());
         }
         let initial_emissions = self.emission_attempts;
@@ -7067,11 +7753,11 @@ impl<'a> Machine<'a> {
                 for setup in first_action.setups {
                     if let Some(deferred) = self
                         .deferred_completion_words
-                        .get(&setup)
+                        .get(setup.as_str())
                         .filter(|deferred| !deferred.statements.is_empty())
                         .cloned()
                     {
-                        self.exec_statements(&deferred.statements)?;
+                        self.exec_statements(deferred.statements)?;
                     }
                 }
                 self.execute_zsh_action(
@@ -7104,18 +7790,14 @@ impl<'a> Machine<'a> {
                         .iter()
                         .filter_map(|(source, deferred)| {
                             (!deferred.statements.is_empty())
-                                .then(|| {
-                                    action
-                                        .find(source)
-                                        .map(|position| (position, deferred.clone()))
-                                })
+                                .then(|| action.find(source).map(|position| (position, *deferred)))
                                 .flatten()
                         })
                         .collect::<Vec<_>>();
                     deferred.sort_by_key(|(position, _)| *position);
                     if !deferred.is_empty() {
                         for (_, deferred) in deferred {
-                            self.exec_statements(&deferred.statements)?;
+                            self.exec_statements(deferred.statements)?;
                         }
                         deferred_executed = true;
                         continue;
@@ -8010,6 +8692,7 @@ impl<'a> Machine<'a> {
             self.module.source_path,
             stable_probe_hash(&key)
         );
+        self.dependency_epoch = self.dependency_epoch.wrapping_add(1);
         if self.probes.iter().any(|probe| probe.probe_id == probe_id) {
             return Ok(CommandResult::status(125));
         }
@@ -8106,13 +8789,21 @@ impl<'a> Machine<'a> {
         self.candidate_bytes = self.candidate_bytes.saturating_add(emission_bytes);
         let fish_item = self.fish_item;
         self.fish_item = self.fish_item.wrapping_add(1);
-        let deduplicate = self.module.dialect != ScriptDialect::Bash;
+        // Fish erasure is registration-scoped. Preserve duplicate
+        // contributions until all erases have run, then deduplicate the
+        // surviving registrations in `evaluate_modules`.
+        let deduplicate = !matches!(
+            self.module.dialect,
+            ScriptDialect::Bash | ScriptDialect::Fish
+        );
+        let provisional = self.dependency_epoch == 0;
         if deduplicate && !self.emitted_values.insert(value.clone()) {
             if let Some(existing) = self
                 .candidates
                 .iter_mut()
                 .find(|candidate| candidate.emitted.candidate.value == value)
             {
+                existing.provisional &= provisional;
                 if self.module.dialect == ScriptDialect::Fish {
                     existing.emitted.candidate.description = description;
                     existing.emitted.candidate.kind = kind;
@@ -8150,6 +8841,7 @@ impl<'a> Machine<'a> {
             },
             fish_group: self.fish_group,
             fish_item,
+            provisional,
         });
     }
 }
@@ -8331,14 +9023,161 @@ fn statements_use_unquoted_parameter(statements: &[ScriptStatement], name: &str)
     })
 }
 
-fn collect_statement_functions(
-    statements: &[ScriptStatement],
-    functions: &mut HashMap<String, ScriptFunction>,
+fn fish_word_may_erase_completions(word: &ScriptWord) -> bool {
+    word.parts.iter().any(|part| match part {
+        ScriptWordPart::CommandSubstitution { statements, .. } => {
+            fish_statements_may_erase_completions(statements)
+        }
+        ScriptWordPart::BraceExpansion { alternatives, .. }
+        | ScriptWordPart::Array {
+            elements: alternatives,
+        } => alternatives.iter().any(fish_word_may_erase_completions),
+        ScriptWordPart::DeferredScript {
+            statements, words, ..
+        } => {
+            fish_statements_may_erase_completions(statements)
+                || words.iter().any(fish_word_may_erase_completions)
+        }
+        ScriptWordPart::Literal { .. }
+        | ScriptWordPart::Parameter { .. }
+        | ScriptWordPart::Arithmetic { .. } => false,
+    })
+}
+
+fn fish_complete_command_may_erase(command: &ScriptCommand) -> bool {
+    if command.words.first().and_then(ScriptWord::as_plain_literal) != Some("complete") {
+        return false;
+    }
+    let mut consumes_next = false;
+    for word in command.words.iter().skip(1) {
+        if consumes_next {
+            consumes_next = false;
+            continue;
+        }
+        let Some(argument) = word.as_plain_literal() else {
+            // A dynamic word in option position can expand to `--erase`.
+            return true;
+        };
+        if argument == "--erase" {
+            return true;
+        }
+        if argument.starts_with("--") {
+            consumes_next = !argument.contains('=')
+                && matches!(
+                    argument,
+                    "--arguments"
+                        | "--command"
+                        | "--path"
+                        | "--short-option"
+                        | "--long-option"
+                        | "--old-option"
+                        | "--description"
+                        | "--condition"
+                        | "--wraps"
+                        | "--color"
+                );
+            continue;
+        }
+        let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            continue;
+        };
+        for (index, flag) in flags.char_indices() {
+            if flag == 'e' {
+                return true;
+            }
+            if matches!(flag, 'c' | 'p' | 's' | 'l' | 'o' | 'a' | 'd' | 'n' | 'w') {
+                consumes_next = index + flag.len_utf8() == flags.len();
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn fish_statements_may_erase_completions(statements: &[ScriptStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        ScriptStatement::Command { command } => {
+            fish_complete_command_may_erase(command)
+                || command.assignments.iter().any(|assignment| {
+                    assignment
+                        .index
+                        .as_ref()
+                        .is_some_and(fish_word_may_erase_completions)
+                        || fish_word_may_erase_completions(&assignment.value)
+                })
+                || command.words.iter().any(fish_word_may_erase_completions)
+                || command
+                    .redirections
+                    .iter()
+                    .any(|redirection| fish_word_may_erase_completions(&redirection.target))
+        }
+        ScriptStatement::Pipeline { commands, .. } => {
+            fish_statements_may_erase_completions(commands)
+        }
+        ScriptStatement::AndOr { first, rest } => {
+            fish_statements_may_erase_completions(std::slice::from_ref(first))
+                || rest.iter().any(|arm| {
+                    fish_statements_may_erase_completions(std::slice::from_ref(&arm.statement))
+                })
+        }
+        ScriptStatement::If {
+            branches,
+            otherwise,
+        } => {
+            branches.iter().any(|branch| {
+                fish_statements_may_erase_completions(&branch.condition)
+                    || fish_statements_may_erase_completions(&branch.body)
+            }) || fish_statements_may_erase_completions(otherwise)
+        }
+        ScriptStatement::While {
+            condition, body, ..
+        } => {
+            fish_statements_may_erase_completions(condition)
+                || fish_statements_may_erase_completions(body)
+        }
+        ScriptStatement::For { words, body, .. } => {
+            words.iter().any(fish_word_may_erase_completions)
+                || fish_statements_may_erase_completions(body)
+        }
+        ScriptStatement::Group { body, .. } => fish_statements_may_erase_completions(body),
+        ScriptStatement::Case { word, arms } => {
+            fish_word_may_erase_completions(word)
+                || arms.iter().any(|arm| {
+                    arm.patterns.iter().any(fish_word_may_erase_completions)
+                        || fish_statements_may_erase_completions(&arm.body)
+                })
+        }
+        ScriptStatement::Function { function } => {
+            function
+                .arguments
+                .iter()
+                .any(fish_word_may_erase_completions)
+                || fish_statements_may_erase_completions(&function.body)
+        }
+        ScriptStatement::Redirected {
+            statement,
+            redirections,
+        } => {
+            fish_statements_may_erase_completions(std::slice::from_ref(statement))
+                || redirections
+                    .iter()
+                    .any(|redirection| fish_word_may_erase_completions(&redirection.target))
+        }
+        ScriptStatement::Return { status } => {
+            status.as_ref().is_some_and(fish_word_may_erase_completions)
+        }
+        ScriptStatement::Break | ScriptStatement::Continue | ScriptStatement::Noop => false,
+    })
+}
+
+fn collect_statement_functions<'a>(
+    statements: &'a [ScriptStatement],
+    functions: &mut HashMap<String, &'a ScriptFunction>,
 ) {
     for statement in statements {
         match statement {
             ScriptStatement::Function { function } => {
-                functions.insert(function.name.clone(), function.clone());
+                functions.insert(function.name.clone(), function);
             }
             ScriptStatement::If {
                 branches,
@@ -8365,9 +9204,9 @@ fn collect_statement_functions(
     }
 }
 
-fn collect_deferred_completion_words(
-    statements: &[ScriptStatement],
-    deferred: &mut HashMap<String, DeferredCompletion>,
+fn collect_deferred_completion_words<'a>(
+    statements: &'a [ScriptStatement],
+    deferred: &mut HashMap<&'a str, DeferredCompletion<'a>>,
 ) {
     for statement in statements {
         match statement {
@@ -8456,9 +9295,9 @@ fn collect_deferred_completion_words(
     }
 }
 
-fn collect_deferred_completion_word(
-    word: &ScriptWord,
-    deferred: &mut HashMap<String, DeferredCompletion>,
+fn collect_deferred_completion_word<'a>(
+    word: &'a ScriptWord,
+    deferred: &mut HashMap<&'a str, DeferredCompletion<'a>>,
 ) {
     for part in &word.parts {
         match part {
@@ -8468,13 +9307,7 @@ fn collect_deferred_completion_word(
                 words,
             } => {
                 if !words.is_empty() || !statements.is_empty() {
-                    deferred.insert(
-                        source.clone(),
-                        DeferredCompletion {
-                            statements: statements.clone(),
-                            words: words.clone(),
-                        },
-                    );
+                    deferred.insert(source.as_str(), DeferredCompletion { statements, words });
                 }
                 collect_deferred_completion_words(statements, deferred);
                 for word in words {

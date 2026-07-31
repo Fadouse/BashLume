@@ -30,6 +30,7 @@ pub struct ShellSnapshot {
     pub home: Option<PathBuf>,
     pub path: String,
     pub effective_user_id: u32,
+    pub generation: u64,
 }
 
 impl ShellSnapshot {
@@ -38,6 +39,7 @@ impl ShellSnapshot {
     /// # Safety
     /// All Bash FFI calls must happen on the shell's main thread.
     pub unsafe fn refresh(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.aliases = unsafe { aliases() };
         self.functions = unsafe { functions() };
         self.builtins = unsafe { builtins() };

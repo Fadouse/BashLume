@@ -68,6 +68,8 @@ unsafe extern "C" {
     pub static mut rl_startup_hook: Option<ReadlineHook>;
     pub static mut rl_event_hook: Option<ReadlineHook>;
     pub static mut rl_readline_state: c_ulong;
+    pub static mut rl_last_func: Option<ReadlineCommand>;
+    pub static mut rl_executing_keyseq: *mut c_char;
 
     pub fn rl_redisplay();
     pub fn rl_forced_update_display() -> c_int;
@@ -76,6 +78,8 @@ unsafe extern "C" {
     pub fn rl_begin_undo_group() -> c_int;
     pub fn rl_end_undo_group() -> c_int;
     pub fn rl_ding() -> c_int;
+    pub fn rl_clear_pending_input() -> c_int;
+    pub fn rl_set_keyboard_input_timeout(microseconds: c_int) -> c_int;
 
     pub fn rl_add_defun(
         name: *const c_char,
@@ -126,3 +130,4 @@ pub const RL_STATE_COMPLETING: c_ulong = 0x0000_4000;
 pub const RL_STATE_SIGHANDLER: c_ulong = 0x0000_8000;
 
 pub const ISFUNC: c_int = 0;
+pub const ISKMAP: c_int = 1;

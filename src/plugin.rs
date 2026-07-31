@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,9 +16,11 @@ static STATE: Mutex<Option<PluginState>> = Mutex::new(None);
 static ORIGINAL_REDISPLAY: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_STARTUP: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_EVENT: AtomicUsize = AtomicUsize::new(0);
+static EVENT_INPUT_TIMEOUT: AtomicI32 = AtomicI32::new(-1);
 static MARK_ACTIVE_FUNCTION: AtomicUsize = AtomicUsize::new(0);
 static FORKED_CHILD: AtomicBool = AtomicBool::new(false);
 static ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
+static MODULE_PIN_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
@@ -29,8 +31,11 @@ enum Action {
     EndOrAccept,
     Enter,
     OperateAndGetNext,
+    PrefetchSpace,
     Cancel,
 }
+
+const REQUEST_FALLBACK: i32 = i32::MIN;
 
 #[derive(Clone)]
 struct SavedBinding {
@@ -166,11 +171,12 @@ impl PluginState {
     }
 
     unsafe fn sync_event_hook(&self) {
-        let required = self.completion.background_pending()
-            || self.enabled
-                && (self.menu.as_ref().is_some_and(|menu| menu.pending)
-                    || self.diagnostic_due.is_some());
-        unsafe { configure_event_hook(required) };
+        let completion_pending = self.completion.background_pending()
+            || self.enabled && self.menu.as_ref().is_some_and(|menu| menu.pending);
+        let diagnostic_pending = self.enabled && self.diagnostic_due.is_some();
+        unsafe {
+            configure_event_hook(completion_pending || diagnostic_pending, completion_pending)
+        };
     }
 
     unsafe fn render(&mut self) {
@@ -181,6 +187,7 @@ impl PluginState {
             return;
         };
         let context = CompletionContext::analyze(&line, point);
+        self.completion.prefetch_rules(&context);
         let dynamic_context = (line.clone(), point);
         if self.last_dynamic_context.as_ref() != Some(&dynamic_context) {
             self.completion.cancel_dynamic();
@@ -274,17 +281,7 @@ impl PluginState {
 
     unsafe fn complete(&mut self, backwards: bool) -> i32 {
         if !self.enabled {
-            return unsafe {
-                self.call_fallback(
-                    if backwards {
-                        Action::CompleteBackward
-                    } else {
-                        Action::CompleteForward
-                    },
-                    1,
-                    b'\t' as i32,
-                )
-            };
+            return REQUEST_FALLBACK;
         }
 
         let stale_menu = self.menu.as_ref().is_some_and(|menu| {
@@ -319,17 +316,7 @@ impl PluginState {
         }
 
         let Some((line, point)) = (unsafe { readline_line() }) else {
-            return unsafe {
-                self.call_fallback(
-                    if backwards {
-                        Action::CompleteBackward
-                    } else {
-                        Action::CompleteForward
-                    },
-                    1,
-                    b'\t' as i32,
-                )
-            };
+            return REQUEST_FALLBACK;
         };
         let dynamic_context = (line.clone(), point);
         if self.last_dynamic_context.as_ref() != Some(&dynamic_context) {
@@ -424,7 +411,8 @@ impl PluginState {
                 }
             }
         }
-        unsafe { self.call_fallback(fallback, count, key) }
+        let _ = (fallback, count, key);
+        REQUEST_FALLBACK
     }
 
     unsafe fn accept_word(&mut self, count: i32, key: i32) -> i32 {
@@ -442,7 +430,8 @@ impl PluginState {
                 }
             }
         }
-        unsafe { self.call_fallback(Action::AcceptWord, count, key) }
+        let _ = (count, key);
+        REQUEST_FALLBACK
     }
 
     unsafe fn enter(&mut self, count: i32, key: i32) -> i32 {
@@ -473,7 +462,8 @@ impl PluginState {
             self.completion.quiesce_dynamic_before_command();
             unsafe { self.sync_event_hook() };
         }
-        unsafe { self.call_fallback(fallback, count, key) }
+        let _ = (fallback, count, key);
+        REQUEST_FALLBACK
     }
 
     unsafe fn cancel(&mut self, count: i32, key: i32) -> i32 {
@@ -483,32 +473,154 @@ impl PluginState {
             unsafe { self.sync_event_hook() };
             return 0;
         }
-        unsafe { self.call_fallback(Action::Cancel, count, key) }
+        // Readline's native `abort` longjmps to its C recovery point and must
+        // never be called through a Rust frame. The default Ctrl-G binding is
+        // therefore left untouched; an explicitly invoked BashLume defun uses
+        // the safe public subset of abort's behavior.
+        let _ = (count, key);
+        unsafe {
+            ffi::rl_ding();
+            ffi::rl_clear_pending_input();
+        }
+        0
     }
 
-    unsafe fn call_fallback(&self, action: Action, count: i32, key: i32) -> i32 {
+    unsafe fn fallback_function(&self, action: Action, key: i32) -> Option<ReadlineCommand> {
+        // `rl_executing_keymap` is the nested map for the final byte of an
+        // escape sequence. Saved bindings use the active top-level editing
+        // map, while `rl_executing_keyseq` identifies the exact sequence.
         let map = unsafe { ffi::rl_get_keymap() } as usize;
-        if let Some(function) = self
-            .bindings
-            .iter()
-            .find(|binding| binding.action == action && binding.map == map)
-            .and_then(|binding| binding.original)
+        let executing_sequence = unsafe { ffi::rl_executing_keyseq };
+        let sequence = (!executing_sequence.is_null())
+            .then(|| unsafe { CStr::from_ptr(executing_sequence) }.to_bytes());
+        if let Some(binding) = sequence
+            .and_then(|sequence| {
+                self.bindings.iter().find(|binding| {
+                    binding.action == action && binding.map == map && binding.sequence == sequence
+                })
+            })
+            .or_else(|| {
+                self.bindings.iter().find(|binding| {
+                    binding.action == action
+                        && binding.map == map
+                        && binding.sequence.len() == 1
+                        && i32::from(binding.sequence[0]) == key
+                })
+            })
+            .or_else(|| {
+                self.bindings
+                    .iter()
+                    .find(|binding| binding.action == action && binding.map == map)
+            })
         {
-            return unsafe { function(count, key) };
+            if binding.original.is_none_or(|original| {
+                !is_bashlume_wrapper(original) && !is_readline_abort(original)
+            }) {
+                return binding.original;
+            }
         }
-        // Stable Readline defaults for maps where no direct binding existed.
-        let name = match action {
-            Action::CompleteForward | Action::CompleteBackward => c"complete",
-            Action::AcceptAll => c"forward-char",
-            Action::AcceptWord => c"forward-word",
-            Action::EndOrAccept => c"end-of-line",
-            Action::Enter => c"accept-line",
-            Action::OperateAndGetNext => c"operate-and-get-next",
-            Action::Cancel => c"abort",
-        };
-        let function = unsafe { ffi::rl_named_function(name.as_ptr()) };
-        function.map_or(0, |function| unsafe { function(count, key) })
+        named_fallback(action)
     }
+}
+
+fn is_readline_abort(function: ReadlineCommand) -> bool {
+    unsafe { ffi::rl_named_function(c"abort".as_ptr()) }
+        .is_some_and(|abort| abort as usize == function as usize)
+}
+
+fn is_bashlume_wrapper(function: ReadlineCommand) -> bool {
+    if [
+        complete_forward as ReadlineCommand,
+        complete_backward,
+        accept_all,
+        end_or_accept,
+        accept_word,
+        enter,
+        operate_and_get_next,
+        insert_space_and_prefetch,
+        cancel,
+    ]
+    .into_iter()
+    .any(|wrapper| wrapper as usize == function as usize)
+    {
+        return true;
+    }
+    // NODELETE permits a later BashLume build to coexist with retained defuns
+    // from an older DSO. Reject wrappers from any BashLume module, not only
+    // function addresses from this build.
+    let mut information = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    if unsafe {
+        libc::dladdr(
+            function as *const () as *const libc::c_void,
+            information.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return false;
+    }
+    let information = unsafe { information.assume_init() };
+    if information.dli_fname.is_null() {
+        return false;
+    }
+    unsafe { CStr::from_ptr(information.dli_fname) }
+        .to_bytes()
+        .windows(b"bashlume".len())
+        .any(|window| window.eq_ignore_ascii_case(b"bashlume"))
+}
+
+unsafe fn pin_shared_object() -> Result<(), String> {
+    if MODULE_PIN_HANDLE.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+    let mut information = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    if unsafe {
+        libc::dladdr(
+            load as *const () as *const libc::c_void,
+            information.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return Err("could not identify the BashLume shared object".into());
+    }
+    let information = unsafe { information.assume_init() };
+    if information.dli_fname.is_null() {
+        return Err("BashLume shared object has no loader path".into());
+    }
+    let handle = unsafe {
+        libc::dlopen(
+            information.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
+        )
+    };
+    if handle.is_null() {
+        let detail = unsafe {
+            let error = libc::dlerror();
+            (!error.is_null()).then(|| CStr::from_ptr(error).to_string_lossy().into_owned())
+        }
+        .unwrap_or_else(|| "unknown dynamic-loader error".into());
+        return Err(format!(
+            "could not pin the BashLume shared object: {detail}"
+        ));
+    }
+    // Deliberately retain this reference for process lifetime. Readline defun
+    // entries and pthread_atfork handlers cannot be unregistered safely.
+    MODULE_PIN_HANDLE.store(handle as usize, Ordering::Release);
+    Ok(())
+}
+
+fn named_fallback(action: Action) -> Option<ReadlineCommand> {
+    let name = match action {
+        Action::CompleteForward | Action::CompleteBackward => c"complete",
+        Action::AcceptAll => c"forward-char",
+        Action::AcceptWord => c"forward-word",
+        Action::EndOrAccept => c"end-of-line",
+        Action::Enter => c"accept-line",
+        Action::OperateAndGetNext => c"operate-and-get-next",
+        Action::PrefetchSpace => c"self-insert",
+        // Native abort performs a longjmp and cannot be called through Rust.
+        Action::Cancel => return None,
+    };
+    unsafe { ffi::rl_named_function(name.as_ptr()) }
 }
 
 pub unsafe fn load() -> Result<(), String> {
@@ -518,6 +630,7 @@ pub unsafe fn load() -> Result<(), String> {
     if unsafe { ffi::isatty(libc::STDERR_FILENO) } == 0 {
         return Err("Readline output is not attached to a terminal".into());
     }
+    unsafe { pin_shared_object()? };
 
     let mut guard = lock_state();
     if guard.is_some() {
@@ -555,7 +668,7 @@ pub unsafe fn load() -> Result<(), String> {
     unsafe {
         ffi::rl_redisplay_function = Some(redisplay_callback);
         ffi::rl_startup_hook = Some(startup_callback);
-        configure_event_hook(false);
+        configure_event_hook(false, false);
     }
     let mark_active = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"rl_mark_active_p".as_ptr()) };
     MARK_ACTIVE_FUNCTION.store(mark_active as usize, Ordering::Release);
@@ -589,7 +702,9 @@ pub unsafe fn unload() {
     if unsafe { ffi::rl_event_hook }
         .is_some_and(|function| function as usize == event_callback as *const () as usize)
     {
-        unsafe { ffi::rl_event_hook = original_event() };
+        unsafe { configure_event_hook(false, false) };
+    } else {
+        unsafe { restore_event_input_timeout() };
     }
     if forked_child {
         // The worker thread does not survive fork. Leaking its inherited
@@ -626,10 +741,13 @@ pub unsafe fn control(arguments: *mut ffi::WordList) -> i32 {
             0
         }
         "disable" => {
+            // `disable` can be reached reentrantly from a bind -x callback.
+            // Finish probe cancellation before native accept-line paths become
+            // eligible, so no command can inherit BashLume's SIGCHLD mask.
+            state.completion.quiesce_dynamic_before_command();
             state.enabled = false;
             state.menu = None;
             state.last_ghost = None;
-            state.completion.cancel_dynamic();
             unsafe { state.sync_event_hook() };
             0
         }
@@ -683,6 +801,15 @@ unsafe extern "C" fn redisplay_callback() {
             return;
         }
         if let Some(state) = lock_state().as_mut() {
+            // Native Readline abort resets `rl_last_func` before its C
+            // longjmp. Ctrl-G remains natively bound, so clear any BashLume
+            // menu on the subsequent redisplay without invoking abort here.
+            if state.menu.is_some() && unsafe { ffi::rl_last_func }.is_none() {
+                state.menu = None;
+                state.completion.cancel_dynamic();
+                state.last_ghost = None;
+                unsafe { state.sync_event_hook() };
+            }
             unsafe { state.render() };
         }
     });
@@ -709,6 +836,7 @@ unsafe extern "C" fn startup_callback() -> i32 {
 unsafe extern "C" fn event_callback() -> i32 {
     let status = original_event().map_or(0, |function| unsafe { function() });
     if FORKED_CHILD.load(Ordering::Acquire) {
+        unsafe { configure_event_hook(false, false) };
         return status;
     }
     let busy = unsafe { ffi::rl_readline_state }
@@ -728,13 +856,14 @@ unsafe extern "C" fn event_callback() -> i32 {
         let Some(state) = guard.as_mut() else {
             return false;
         };
-        state.completion.poll_background();
+        let background_changed = state.completion.poll_background();
         let changed = if state.enabled {
             let menu_changed = unsafe { state.poll_pending_menu() };
+            let background_changed = background_changed && state.menu.is_none();
             let diagnostic_due = state
                 .diagnostic_due
                 .is_some_and(|deadline| Instant::now() >= deadline);
-            menu_changed || diagnostic_due
+            background_changed || menu_changed || diagnostic_due
         } else {
             false
         };
@@ -746,7 +875,7 @@ unsafe extern "C" fn event_callback() -> i32 {
             if let Some(state) = lock_state().as_mut() {
                 state.enabled = false;
             }
-            unsafe { configure_event_hook(false) };
+            unsafe { configure_event_hook(false, false) };
             eprintln!("bashlume: asynchronous redraw failed; falling back to native Readline");
             false
         }
@@ -827,6 +956,10 @@ unsafe extern "C" fn operate_and_get_next(count: i32, key: i32) -> i32 {
     )
 }
 
+unsafe extern "C" fn insert_space_and_prefetch(count: i32, key: i32) -> i32 {
+    callback_or(0, |_| REQUEST_FALLBACK, count, key, Action::PrefetchSpace)
+}
+
 unsafe extern "C" fn cancel(count: i32, key: i32) -> i32 {
     callback_or(
         0,
@@ -844,24 +977,52 @@ fn callback_or(
     key: i32,
     fallback: Action,
 ) -> i32 {
-    if FORKED_CHILD.load(Ordering::Acquire) {
-        let guard = lock_state();
-        return guard.as_ref().map_or(default, |state| unsafe {
-            state.call_fallback(fallback, count, key)
-        });
+    enum Prepared {
+        Return(i32),
+        Fallback(Option<ReadlineCommand>),
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+
+    let forked_child = FORKED_CHILD.load(Ordering::Acquire);
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut guard = lock_state();
         let Some(state) = guard.as_mut() else {
-            return default;
+            return Prepared::Fallback(named_fallback(fallback));
         };
-        if state.enabled {
-            callback(state)
+        let result = if forked_child || !state.enabled {
+            REQUEST_FALLBACK
         } else {
-            unsafe { state.call_fallback(fallback, count, key) }
+            callback(state)
+        };
+        if result == REQUEST_FALLBACK {
+            Prepared::Fallback(unsafe { state.fallback_function(fallback, key) })
+        } else {
+            Prepared::Return(result)
         }
     }))
-    .unwrap_or(default)
+    .unwrap_or(Prepared::Return(default));
+
+    match prepared {
+        Prepared::Return(status) => status,
+        Prepared::Fallback(function) => {
+            // Readline commands may re-enter BashLume or longjmp (notably
+            // `abort`), so no Rust mutex guard may be live across this call.
+            let status = function.map_or(default, |function| unsafe { function(count, key) });
+            if function.is_some() && fallback == Action::PrefetchSpace && !forked_child {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut guard = lock_state();
+                    let Some(state) = guard.as_mut().filter(|state| state.enabled) else {
+                        return;
+                    };
+                    if let Some((line, point)) = unsafe { readline_line() } {
+                        let context = CompletionContext::analyze(&line, point);
+                        state.completion.prefetch_rules(&context);
+                        unsafe { state.sync_event_hook() };
+                    }
+                }));
+            }
+            status
+        }
+    }
 }
 
 unsafe fn install_binding(
@@ -877,11 +1038,34 @@ unsafe fn install_binding(
     let Ok(sequence_c) = CString::new(sequence) else {
         return;
     };
+    // Installing a longer sequence can replace a function or macro on one of
+    // its proper prefixes with a nested keymap. That topology cannot be
+    // restored by rebinding only the leaf, so intercept only sequences whose
+    // complete prefix chain is already composed of keymaps.
+    for prefix_length in 1..sequence.len() {
+        let mut prefix_kind = ffi::ISFUNC;
+        unsafe {
+            ffi::rl_function_of_keyseq_len(
+                sequence.as_ptr().cast(),
+                prefix_length,
+                map,
+                &mut prefix_kind,
+            )
+        };
+        if prefix_kind != ffi::ISKMAP {
+            return;
+        }
+    }
     let mut kind = ffi::ISFUNC;
     let original = unsafe {
         ffi::rl_function_of_keyseq_len(sequence.as_ptr().cast(), sequence.len(), map, &mut kind)
     };
-    let original = (kind == ffi::ISFUNC).then_some(original).flatten();
+    // Readline does not expose a symmetric API for recovering the payload of
+    // macros and keymap bindings. Preserve such custom bindings rather than
+    // replacing them with a callback that cannot restore or invoke them.
+    if kind != ffi::ISFUNC {
+        return;
+    }
     if unsafe { ffi::rl_bind_keyseq_in_map(sequence_c.as_ptr(), Some(replacement), map) } == 0 {
         state.bindings.push(SavedBinding {
             map: map as usize,
@@ -893,6 +1077,31 @@ unsafe fn install_binding(
     }
 }
 
+unsafe fn install_space_prefetch_binding(state: &mut PluginState, map: ffi::Keymap) {
+    if map.is_null() {
+        return;
+    }
+    let mut kind = ffi::ISFUNC;
+    let original =
+        unsafe { ffi::rl_function_of_keyseq_len(b" ".as_ptr().cast(), 1, map, &mut kind) };
+    let self_insert = unsafe { ffi::rl_named_function(c"self-insert".as_ptr()) };
+    if kind != ffi::ISFUNC
+        || original.map(|function| function as usize)
+            != self_insert.map(|function| function as usize)
+    {
+        return;
+    }
+    unsafe {
+        install_binding(
+            state,
+            map,
+            b" ",
+            insert_space_and_prefetch,
+            Action::PrefetchSpace,
+        )
+    };
+}
+
 unsafe fn install_bindings(state: &mut PluginState) {
     let definitions: &[(&CStr, ReadlineCommand)] = &[
         (c"bashlume-complete", complete_forward),
@@ -902,6 +1111,7 @@ unsafe fn install_bindings(state: &mut PluginState) {
         (c"bashlume-end-or-accept", end_or_accept),
         (c"bashlume-enter", enter),
         (c"bashlume-operate-and-get-next", operate_and_get_next),
+        (c"bashlume-prefetch-space", insert_space_and_prefetch),
         (c"bashlume-cancel", cancel),
     ];
     for (name, function) in definitions {
@@ -919,13 +1129,13 @@ unsafe fn install_bindings(state: &mut PluginState) {
         (b"\x1b\x1b[C", accept_word, Action::AcceptWord),
         (b"\r", enter, Action::Enter),
         (b"\n", enter, Action::Enter),
-        (b"\x07", cancel, Action::Cancel),
     ];
     for map_name in [c"emacs-standard", c"vi-insert"] {
         let map = unsafe { ffi::rl_get_keymap_by_name(map_name.as_ptr()) };
         for &(sequence, replacement, action) in editing_bindings {
             unsafe { install_binding(state, map, sequence, replacement, action) };
         }
+        unsafe { install_space_prefetch_binding(state, map) };
     }
 
     let vi_movement = unsafe { ffi::rl_get_keymap_by_name(c"vi-move".as_ptr()) };
@@ -1104,19 +1314,45 @@ fn original_event() -> Option<ffi::ReadlineHook> {
     (pointer != 0).then(|| unsafe { std::mem::transmute::<usize, ffi::ReadlineHook>(pointer) })
 }
 
-unsafe fn configure_event_hook(required: bool) {
+const PENDING_EVENT_INPUT_TIMEOUT_US: i32 = 5_000;
+
+unsafe fn restore_event_input_timeout() {
+    let previous = EVENT_INPUT_TIMEOUT.swap(-1, Ordering::AcqRel);
+    if previous >= 0 {
+        unsafe { ffi::rl_set_keyboard_input_timeout(previous) };
+    }
+}
+
+unsafe fn configure_event_hook(required: bool, fast_poll: bool) {
     let current = unsafe { ffi::rl_event_hook };
     let is_ours =
         current.is_some_and(|function| function as usize == event_callback as *const () as usize);
+    if !is_ours {
+        unsafe { restore_event_input_timeout() };
+    }
     if required && !is_ours {
         let original = ORIGINAL_EVENT.load(Ordering::Acquire);
         let current_is_original =
             current.map_or(original == 0, |function| function as usize == original);
         if current_is_original {
+            if fast_poll {
+                let previous =
+                    unsafe { ffi::rl_set_keyboard_input_timeout(PENDING_EVENT_INPUT_TIMEOUT_US) };
+                EVENT_INPUT_TIMEOUT.store(previous, Ordering::Release);
+            }
             unsafe { ffi::rl_event_hook = Some(event_callback) };
+        }
+    } else if required && is_ours {
+        if fast_poll && EVENT_INPUT_TIMEOUT.load(Ordering::Acquire) < 0 {
+            let previous =
+                unsafe { ffi::rl_set_keyboard_input_timeout(PENDING_EVENT_INPUT_TIMEOUT_US) };
+            EVENT_INPUT_TIMEOUT.store(previous, Ordering::Release);
+        } else if !fast_poll {
+            unsafe { restore_event_input_timeout() };
         }
     } else if !required && is_ours {
         unsafe { ffi::rl_event_hook = original_event() };
+        unsafe { restore_event_input_timeout() };
     }
 }
 

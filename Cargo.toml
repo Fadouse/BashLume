@@ -28,7 +28,7 @@ unicode-width = "0.2.2"
 zstd = { version = "0.13.3", default-features = false }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"

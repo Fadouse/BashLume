@@ -200,12 +200,23 @@ impl Config {
 }
 
 fn split_paths(value: &str) -> Vec<PathBuf> {
-    value
-        .split(':')
-        .filter(|part| !part.is_empty())
-        .take(128)
-        .map(PathBuf::from)
-        .collect()
+    const MAX_PATHS: usize = 128;
+    const MAX_PATH_BYTES: usize = 4096;
+    const MAX_TOTAL_BYTES: usize = 512 * 1024;
+
+    let mut paths = Vec::new();
+    let mut total_bytes = 0_usize;
+    for part in value.split(':').filter(|part| !part.is_empty()) {
+        if paths.len() >= MAX_PATHS {
+            break;
+        }
+        if part.len() > MAX_PATH_BYTES || total_bytes.saturating_add(part.len()) > MAX_TOTAL_BYTES {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(part.len());
+        paths.push(PathBuf::from(part));
+    }
+    paths
 }
 
 fn default_rule_paths() -> Vec<PathBuf> {

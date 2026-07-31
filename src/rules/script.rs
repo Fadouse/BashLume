@@ -781,6 +781,208 @@ mod registration_tests {
     }
 }
 
+fn string_vector_bytes(values: &Vec<String>) -> usize {
+    values
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(values.iter().map(String::capacity).sum::<usize>())
+}
+
+fn script_statements_bytes(statements: &Vec<ScriptStatement>) -> usize {
+    statements
+        .capacity()
+        .saturating_mul(std::mem::size_of::<ScriptStatement>())
+        .saturating_add(
+            statements
+                .iter()
+                .map(script_statement_heap_bytes)
+                .sum::<usize>(),
+        )
+}
+
+fn script_words_bytes(words: &Vec<ScriptWord>) -> usize {
+    words
+        .capacity()
+        .saturating_mul(std::mem::size_of::<ScriptWord>())
+        .saturating_add(words.iter().map(script_word_heap_bytes).sum::<usize>())
+}
+
+fn script_function_heap_bytes(function: &ScriptFunction) -> usize {
+    function
+        .name
+        .capacity()
+        .saturating_add(script_words_bytes(&function.arguments))
+        .saturating_add(script_statements_bytes(&function.body))
+}
+
+fn script_registration_heap_bytes(registration: &ScriptRegistration) -> usize {
+    registration
+        .command
+        .capacity()
+        .saturating_add(registration.service.as_ref().map_or(0, String::capacity))
+        .saturating_add(match &registration.entry {
+            ScriptEntry::Function { name } => name.capacity(),
+            ScriptEntry::FishComplete { .. } | ScriptEntry::Module => 0,
+        })
+}
+
+fn script_statement_heap_bytes(statement: &ScriptStatement) -> usize {
+    match statement {
+        ScriptStatement::Command { command } => script_command_heap_bytes(command),
+        ScriptStatement::AndOr { first, rest } => std::mem::size_of::<ScriptStatement>()
+            .saturating_add(script_statement_heap_bytes(first))
+            .saturating_add(
+                rest.capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptAndOrArm>()),
+            )
+            .saturating_add(
+                rest.iter()
+                    .map(|arm| {
+                        std::mem::size_of::<ScriptStatement>()
+                            .saturating_add(script_statement_heap_bytes(&arm.statement))
+                    })
+                    .sum::<usize>(),
+            ),
+        ScriptStatement::Pipeline { commands, .. }
+        | ScriptStatement::Group { body: commands, .. } => script_statements_bytes(commands),
+        ScriptStatement::If {
+            branches,
+            otherwise,
+        } => branches
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ScriptConditionalBranch>())
+            .saturating_add(
+                branches
+                    .iter()
+                    .map(|branch| {
+                        script_statements_bytes(&branch.condition)
+                            .saturating_add(script_statements_bytes(&branch.body))
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(script_statements_bytes(otherwise)),
+        ScriptStatement::While {
+            condition, body, ..
+        } => script_statements_bytes(condition).saturating_add(script_statements_bytes(body)),
+        ScriptStatement::For {
+            variables,
+            words,
+            body,
+        } => string_vector_bytes(variables)
+            .saturating_add(script_words_bytes(words))
+            .saturating_add(script_statements_bytes(body)),
+        ScriptStatement::Case { word, arms } => script_word_heap_bytes(word)
+            .saturating_add(
+                arms.capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptCaseArm>()),
+            )
+            .saturating_add(
+                arms.iter()
+                    .map(|arm| {
+                        script_words_bytes(&arm.patterns)
+                            .saturating_add(script_statements_bytes(&arm.body))
+                    })
+                    .sum::<usize>(),
+            ),
+        ScriptStatement::Function { function } => script_function_heap_bytes(function),
+        ScriptStatement::Return { status } => status.as_ref().map_or(0, script_word_heap_bytes),
+        ScriptStatement::Redirected {
+            statement,
+            redirections,
+        } => std::mem::size_of::<ScriptStatement>()
+            .saturating_add(script_statement_heap_bytes(statement))
+            .saturating_add(
+                redirections
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptRedirection>()),
+            )
+            .saturating_add(
+                redirections
+                    .iter()
+                    .map(script_redirection_heap_bytes)
+                    .sum::<usize>(),
+            ),
+        ScriptStatement::Break | ScriptStatement::Continue | ScriptStatement::Noop => 0,
+    }
+}
+
+fn script_command_heap_bytes(command: &ScriptCommand) -> usize {
+    command
+        .assignments
+        .capacity()
+        .saturating_mul(std::mem::size_of::<ScriptAssignment>())
+        .saturating_add(
+            command
+                .assignments
+                .iter()
+                .map(|assignment| {
+                    assignment
+                        .name
+                        .capacity()
+                        .saturating_add(assignment.index.as_ref().map_or(0, script_word_heap_bytes))
+                        .saturating_add(script_word_heap_bytes(&assignment.value))
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(script_words_bytes(&command.words))
+        .saturating_add(
+            command
+                .redirections
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ScriptRedirection>()),
+        )
+        .saturating_add(
+            command
+                .redirections
+                .iter()
+                .map(script_redirection_heap_bytes)
+                .sum::<usize>(),
+        )
+}
+
+fn script_redirection_heap_bytes(redirection: &ScriptRedirection) -> usize {
+    redirection
+        .operator
+        .capacity()
+        .saturating_add(script_word_heap_bytes(&redirection.target))
+}
+
+fn script_word_heap_bytes(word: &ScriptWord) -> usize {
+    word.parts
+        .capacity()
+        .saturating_mul(std::mem::size_of::<ScriptWordPart>())
+        .saturating_add(
+            word.parts
+                .iter()
+                .map(script_word_part_heap_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(word.raw.as_ref().map_or(0, String::capacity))
+}
+
+fn script_word_part_heap_bytes(part: &ScriptWordPart) -> usize {
+    match part {
+        ScriptWordPart::Literal { value, .. } => value.capacity(),
+        ScriptWordPart::Parameter { expression, .. }
+        | ScriptWordPart::Arithmetic { expression, .. } => expression.capacity(),
+        ScriptWordPart::CommandSubstitution { statements, .. } => {
+            script_statements_bytes(statements)
+        }
+        ScriptWordPart::BraceExpansion { alternatives, .. }
+        | ScriptWordPart::Array {
+            elements: alternatives,
+        } => script_words_bytes(alternatives),
+        ScriptWordPart::DeferredScript {
+            source,
+            statements,
+            words,
+        } => source
+            .capacity()
+            .saturating_add(script_statements_bytes(statements))
+            .saturating_add(script_words_bytes(words)),
+    }
+}
+
 impl ScriptModule {
     pub(crate) fn requires_block_v4(&self) -> bool {
         statements_require_block_v4(&self.statements)
@@ -791,40 +993,33 @@ impl ScriptModule {
     }
 
     pub fn approximate_bytes(&self) -> usize {
-        let mut state = ValidationState::default();
-        let _ = state.string(&self.source_path);
-        let _ = state.statements(&self.statements, 0);
-        for function in &self.functions {
-            let _ = state.function(function, 0);
-        }
-        for registration in &self.registrations {
-            let _ = state.string(&registration.command);
-            if let Some(service) = &registration.service {
-                let _ = state.string(service);
-            }
-            if let ScriptEntry::Function { name } = &registration.entry {
-                let _ = state.string(name);
-            }
-        }
-        for capability in &self.probe_capabilities {
-            let _ = state.string(capability);
-        }
-        for name in &self.zsh_function_names {
-            let _ = state.string(name);
-        }
         std::mem::size_of::<Self>()
-            .saturating_add(state.string_bytes)
-            .saturating_add(state.nodes.saturating_mul(64))
+            .saturating_add(self.source_path.capacity())
+            .saturating_add(script_statements_bytes(&self.statements))
+            .saturating_add(
+                self.functions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptFunction>()),
+            )
+            .saturating_add(
+                self.functions
+                    .iter()
+                    .map(script_function_heap_bytes)
+                    .sum::<usize>(),
+            )
             .saturating_add(
                 self.registrations
-                    .len()
+                    .capacity()
                     .saturating_mul(std::mem::size_of::<ScriptRegistration>()),
             )
             .saturating_add(
-                self.probe_capabilities
-                    .len()
-                    .saturating_mul(std::mem::size_of::<String>()),
+                self.registrations
+                    .iter()
+                    .map(script_registration_heap_bytes)
+                    .sum::<usize>(),
             )
+            .saturating_add(string_vector_bytes(&self.probe_capabilities))
+            .saturating_add(string_vector_bytes(&self.zsh_function_names))
     }
 
     pub fn validate(&self) -> Result<(), ScriptValidationError> {

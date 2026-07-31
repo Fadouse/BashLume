@@ -1,32 +1,41 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{
-    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
-};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::matcher::match_score;
-use crate::rules::loader::{LoadedProgram, PackSummary, RuleStore};
+use crate::rules::loader::{LoadedProgram, PackSummary, RuleStore, sort_loaded_programs};
 use crate::rules::probe::ProbeSupervisor;
 use crate::rules::vm::{FilesystemRequest, ProbeKey, ProbeRequest, ProbeResult};
 
 const MAX_PATH_DIRECTORIES: usize = 256;
+const MAX_PATH_COMPONENT_BYTES: usize = 4096;
+const MAX_PATH_SNAPSHOT_BYTES: usize = 512 * 1024;
+const MAX_RULE_CONFIGURATION_PATHS: usize = 128;
+const MAX_RULE_CONFIGURATION_BYTES: usize = 512 * 1024;
 const MAX_FILESYSTEM_CACHE_ENTRIES: usize = 128;
 const FILESYSTEM_CACHE_TTL: Duration = Duration::from_secs(2);
 const MAX_DIRECTORY_CACHE_ENTRIES: usize = 4096;
 const MAX_RULE_CACHE_ENTRIES: usize = 4096;
 const MAX_PROBE_CACHE_ENTRIES: usize = 1024;
 const MAX_WORKER_REQUESTS: usize = 512;
+const MAX_WORKER_RESPONSES: usize = 8;
 const MAX_PENDING_SCANS: usize = 512;
 const MAX_PENDING_RULE_REQUESTS: usize = 512;
+const MAX_RULE_LOOKUP_BYTES: usize = 4096;
+const MAX_RULE_REJECTIONS: usize = 4096;
+const MAX_PROBE_REJECTIONS: usize = 1024;
 const MAX_PROBE_WORKER_REQUESTS: usize = 8;
+const MAX_PROBE_WORKER_RESPONSES: usize = 8;
+const MAX_PENDING_PROBES: usize = 32;
 const PROBE_CANCELLATION_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 static MAIN_PROBE_MASK_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -83,9 +92,11 @@ enum Request {
         key: ScanKey,
         max_candidates: usize,
         generation: u64,
+        request_token: u64,
     },
     LoadSnapshots {
         home: Option<PathBuf>,
+        generation: u64,
     },
     ResolveFilesystem {
         key: FilesystemKey,
@@ -110,6 +121,7 @@ enum Response {
         entries: Vec<DirectoryEntry>,
         truncated: bool,
         generation: u64,
+        request_token: u64,
         completed_at: Instant,
     },
     Filesystem {
@@ -119,6 +131,7 @@ enum Response {
         completed_at: Instant,
     },
     Snapshots {
+        generation: u64,
         users: Vec<String>,
         groups: Vec<String>,
         passwd_records: Vec<String>,
@@ -136,7 +149,9 @@ enum Response {
         command: String,
         programs: Vec<LoadedProgram>,
         errors: Vec<String>,
+        approximate_bytes: usize,
         generation: u64,
+        complete: bool,
     },
 }
 
@@ -146,16 +161,19 @@ pub struct WorkerClient {
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     filesystem_generation: Arc<AtomicU64>,
+    rule_chunk_ack: Arc<AtomicBool>,
 }
 
 impl WorkerClient {
     pub fn start() -> std::io::Result<Self> {
         let (request_tx, request_rx) = mpsc::sync_channel(MAX_WORKER_REQUESTS);
-        let (response_tx, response_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::sync_channel(MAX_WORKER_RESPONSES);
         let stop = Arc::new(AtomicBool::new(false));
         let filesystem_generation = Arc::new(AtomicU64::new(0));
+        let rule_chunk_ack = Arc::new(AtomicBool::new(true));
         let worker_stop = Arc::clone(&stop);
         let worker_filesystem_generation = Arc::clone(&filesystem_generation);
+        let worker_rule_chunk_ack = Arc::clone(&rule_chunk_ack);
         let handle = thread::Builder::new()
             .name("bashlume-cache".into())
             .stack_size(256 * 1024)
@@ -165,6 +183,7 @@ impl WorkerClient {
                     response_tx,
                     worker_stop,
                     worker_filesystem_generation,
+                    worker_rule_chunk_ack,
                 )
             })?;
         Ok(Self {
@@ -173,6 +192,7 @@ impl WorkerClient {
             handle: Some(handle),
             stop,
             filesystem_generation,
+            rule_chunk_ack,
         })
     }
 
@@ -191,6 +211,10 @@ impl WorkerClient {
 
     fn try_receive(&self) -> Result<Response, TryRecvError> {
         self.responses.try_recv()
+    }
+
+    fn acknowledge_rule_chunk(&self) {
+        self.rule_chunk_ack.store(true, Ordering::Release);
     }
 
     pub fn stop(&mut self) {
@@ -254,7 +278,7 @@ struct ProbeClient {
 impl ProbeClient {
     fn start() -> std::io::Result<Self> {
         let (request_tx, request_rx) = mpsc::sync_channel(MAX_PROBE_WORKER_REQUESTS);
-        let (response_tx, response_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::sync_channel(MAX_PROBE_WORKER_RESPONSES);
         let stop = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
         let worker_stop = Arc::clone(&stop);
@@ -339,7 +363,7 @@ struct FilesystemCacheEntry {
 }
 
 struct RuleCacheEntry {
-    programs: Vec<LoadedProgram>,
+    programs: Arc<Vec<LoadedProgram>>,
     approximate_bytes: usize,
     last_used: u64,
 }
@@ -355,6 +379,13 @@ struct ProbeCacheEntry {
     last_used: u64,
 }
 
+fn owned_strings_bytes(values: &Vec<String>) -> usize {
+    values
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(values.iter().map(String::capacity).sum::<usize>())
+}
+
 fn scan_key_bytes(key: &ScanKey) -> usize {
     std::mem::size_of::<ScanKey>()
         .saturating_add(key.directory.as_os_str().as_bytes().len())
@@ -367,6 +398,44 @@ fn filesystem_key_bytes(key: &FilesystemKey) -> usize {
         .saturating_add(key.request.request_id.capacity())
         .saturating_add(key.request.path.capacity())
         .saturating_add(key.request.operator.as_ref().map_or(0, String::capacity))
+}
+
+fn bounded_configuration_paths(
+    paths: Vec<PathBuf>,
+    remaining_count: &mut usize,
+    remaining_bytes: &mut usize,
+) -> (Vec<PathBuf>, bool) {
+    let mut bounded = Vec::new();
+    let mut truncated = false;
+    for path in paths {
+        let bytes = path.as_os_str().as_bytes().len();
+        if *remaining_count == 0 || bytes > MAX_PATH_COMPONENT_BYTES || bytes > *remaining_bytes {
+            truncated = true;
+            continue;
+        }
+        *remaining_count -= 1;
+        *remaining_bytes -= bytes;
+        bounded.push(path);
+    }
+    (bounded, truncated)
+}
+
+fn rule_command_hash(command: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    command.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn rule_admission_bytes(command: &str) -> usize {
+    2_usize
+        .saturating_mul(std::mem::size_of::<String>().saturating_add(command.len()))
+        .saturating_add(64)
+}
+
+fn probe_cache_hash(cache_key: &ProbeCacheKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn probe_key_bytes(cache_key: &ProbeCacheKey) -> usize {
@@ -390,6 +459,17 @@ fn probe_key_bytes(cache_key: &ProbeCacheKey) -> usize {
                 })
                 .sum::<usize>(),
         )
+}
+
+fn probe_admission_bytes(request: &ProbeRequest, cache_key: &ProbeCacheKey) -> usize {
+    probe_key_bytes(cache_key)
+        .saturating_mul(2)
+        .saturating_add(request.probe_id.capacity())
+        .saturating_add(request.description.as_ref().map_or(0, String::capacity))
+        // Reserve the declared output ceiling while the worker or bounded
+        // response channel owns an outcome that has not yet been consumed.
+        .saturating_add(request.output_limit as usize)
+        .saturating_add(128)
 }
 
 struct SignalMaskGuard {
@@ -477,8 +557,12 @@ pub struct CompletionCache {
     entries: HashMap<ScanKey, CacheEntry>,
     pending: HashSet<ScanKey>,
     scan_deferred: HashSet<ScanKey>,
+    scan_tokens: HashMap<ScanKey, u64>,
+    scan_request_clock: u64,
     directory_generations: HashMap<PathBuf, u64>,
+    directory_generation_clock: u64,
     path_directories: Vec<PathBuf>,
+    path_truncated: bool,
     users: Vec<String>,
     groups: Vec<String>,
     passwd_records: Vec<String>,
@@ -497,22 +581,33 @@ pub struct CompletionCache {
     used_bytes: usize,
     clock: u64,
     max_candidates: usize,
-    snapshots_requested: bool,
+    snapshot_pending: bool,
+    snapshot_deferred: bool,
+    snapshot_generation: u64,
+    snapshot_inflight_generation: Option<u64>,
+    snapshot_home: Option<PathBuf>,
     rule_generation: u64,
     rule_catalog_ready: bool,
     rule_summaries: Vec<PackSummary>,
     rule_entries: HashMap<String, RuleCacheEntry>,
     rule_pending: HashSet<String>,
     rule_deferred: HashSet<String>,
+    rule_rejected: HashSet<u64>,
+    rule_rejection_saturated: bool,
+    rule_chunk_ready_to_ack: bool,
     rule_catalog_deferred: bool,
     rule_errors: Vec<String>,
     rule_configuration: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
     probe_entries: HashMap<ProbeCacheKey, ProbeCacheEntry>,
     probe_pending: HashSet<ProbeCacheKey>,
+    probe_admissions: HashMap<(u64, ProbeCacheKey), usize>,
     probe_pins: HashSet<ProbeCacheKey>,
     probe_fresh: HashSet<ProbeCacheKey>,
+    probe_rejected: HashSet<u64>,
+    probe_rejection_saturated: bool,
     probe_errors: Vec<String>,
     probe_generation: u64,
+    response_generation: u64,
     probe_cancel_pending: Option<u64>,
     probe_signal_mask: Option<SignalMaskGuard>,
 }
@@ -525,8 +620,12 @@ impl CompletionCache {
             entries: HashMap::new(),
             pending: HashSet::new(),
             scan_deferred: HashSet::new(),
+            scan_tokens: HashMap::new(),
+            scan_request_clock: 0,
             directory_generations: HashMap::new(),
+            directory_generation_clock: 0,
             path_directories: Vec::new(),
+            path_truncated: false,
             users: Vec::new(),
             groups: Vec::new(),
             passwd_records: Vec::new(),
@@ -545,49 +644,89 @@ impl CompletionCache {
             used_bytes: 0,
             clock: 0,
             max_candidates,
-            snapshots_requested: false,
+            snapshot_pending: false,
+            snapshot_deferred: false,
+            snapshot_generation: 0,
+            snapshot_inflight_generation: None,
+            snapshot_home: None,
             rule_generation: 0,
             rule_catalog_ready: true,
             rule_summaries: Vec::new(),
             rule_entries: HashMap::new(),
             rule_pending: HashSet::new(),
             rule_deferred: HashSet::new(),
+            rule_rejected: HashSet::new(),
+            rule_rejection_saturated: false,
+            rule_chunk_ready_to_ack: false,
             rule_catalog_deferred: false,
             rule_errors: Vec::new(),
             rule_configuration: None,
             probe_entries: HashMap::new(),
             probe_pending: HashSet::new(),
+            probe_admissions: HashMap::new(),
             probe_pins: HashSet::new(),
             probe_fresh: HashSet::new(),
+            probe_rejected: HashSet::new(),
+            probe_rejection_saturated: false,
             probe_errors: Vec::new(),
             probe_generation: 0,
+            response_generation: 0,
             probe_cancel_pending: None,
             probe_signal_mask: None,
         }
     }
 
     pub fn reconfigure(&mut self, byte_limit: usize, max_candidates: usize) {
+        if self.byte_limit != byte_limit {
+            self.rule_rejected.clear();
+            self.rule_rejection_saturated = false;
+            self.probe_rejected.clear();
+            self.probe_rejection_saturated = false;
+        }
         self.byte_limit = byte_limit;
         self.max_candidates = max_candidates;
         self.evict_to_limit();
     }
 
-    pub fn refresh_path(&mut self, path: &str) {
-        let directories: Vec<_> = path
-            .split(':')
-            .take(MAX_PATH_DIRECTORIES)
-            .map(|part| {
-                if part.is_empty() {
-                    PathBuf::from(".")
+    pub fn refresh_path(&mut self, path: &str, working_directory: &Path) {
+        let mut directories = Vec::new();
+        let mut total_bytes = 0_usize;
+        let mut truncated = false;
+        for (index, part) in path.split(':').enumerate() {
+            if index >= MAX_PATH_DIRECTORIES {
+                truncated = true;
+                break;
+            }
+            if part.len() > MAX_PATH_COMPONENT_BYTES {
+                truncated = true;
+                continue;
+            }
+            let directory = if part.is_empty() {
+                working_directory.join(".")
+            } else {
+                let directory = PathBuf::from(part);
+                if directory.is_absolute() {
+                    directory
                 } else {
-                    PathBuf::from(part)
+                    working_directory.join(directory)
                 }
-            })
-            .collect();
-        if directories == self.path_directories {
-            return;
+            };
+            let path_bytes = directory.as_os_str().as_bytes().len();
+            if path_bytes > MAX_PATH_COMPONENT_BYTES
+                || total_bytes.saturating_add(path_bytes) > MAX_PATH_SNAPSHOT_BYTES
+            {
+                truncated = true;
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(path_bytes);
+            directories.push(directory);
         }
-        self.path_directories = directories;
+        self.path_truncated = truncated;
+        if directories != self.path_directories {
+            self.path_directories = directories;
+        }
+        // Even an unchanged PATH is an age-based refresh boundary. `request`
+        // preserves fresh entries and schedules only expired directory scans.
         for directory in self.path_directories.clone() {
             self.request(ScanKey {
                 directory,
@@ -598,12 +737,39 @@ impl CompletionCache {
     }
 
     pub fn load_snapshots(&mut self, home: Option<PathBuf>) {
-        if self.snapshots_requested {
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.snapshot_home =
+            home.filter(|path| path.as_os_str().as_bytes().len() <= MAX_PATH_COMPONENT_BYTES);
+        if self.snapshot_pending {
+            self.snapshot_deferred = true;
             return;
         }
-        if let Some(worker) = &self.worker {
-            self.snapshots_requested = worker.send(Request::LoadSnapshots { home });
+        self.retry_snapshot();
+    }
+
+    fn retry_snapshot(&mut self) {
+        if self.snapshot_pending {
+            return;
         }
+        let generation = self.snapshot_generation;
+        let sent = self.worker.as_ref().is_some_and(|worker| {
+            worker.send(Request::LoadSnapshots {
+                home: self.snapshot_home.clone(),
+                generation,
+            })
+        });
+        if sent {
+            self.snapshot_pending = true;
+            self.snapshot_deferred = false;
+            self.snapshot_inflight_generation = Some(generation);
+        } else {
+            self.snapshot_deferred = self.worker.is_some();
+            self.snapshot_inflight_generation = None;
+        }
+    }
+
+    pub fn snapshots_pending(&self) -> bool {
+        self.snapshot_pending || self.snapshot_deferred
     }
 
     pub fn filesystem_values(
@@ -690,17 +856,99 @@ impl CompletionCache {
         self.evict_to_limit();
     }
 
+    fn finish_rule_request(&mut self, command: &str) {
+        if self.rule_pending.remove(command) {
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(rule_admission_bytes(command));
+        }
+        self.rule_deferred.remove(command);
+    }
+
+    fn clear_rule_requests(&mut self) {
+        let admission_bytes = self
+            .rule_pending
+            .iter()
+            .map(|command| rule_admission_bytes(command))
+            .sum::<usize>();
+        self.used_bytes = self.used_bytes.saturating_sub(admission_bytes);
+        self.rule_pending.clear();
+        self.rule_deferred.clear();
+    }
+
+    fn reject_rule_command(&mut self, command: &str) {
+        if self.rule_rejected.len() < MAX_RULE_REJECTIONS {
+            self.rule_rejected.insert(rule_command_hash(command));
+        } else {
+            self.rule_rejection_saturated = true;
+        }
+    }
+
+    fn reject_probe(&mut self, cache_key: &ProbeCacheKey) {
+        if self.probe_rejected.len() < MAX_PROBE_REJECTIONS {
+            self.probe_rejected.insert(probe_cache_hash(cache_key));
+        } else {
+            self.probe_rejection_saturated = true;
+        }
+    }
+
+    fn finish_probe_admission(&mut self, generation: u64, cache_key: &ProbeCacheKey) {
+        if let Some(bytes) = self
+            .probe_admissions
+            .remove(&(generation, cache_key.clone()))
+        {
+            self.used_bytes = self.used_bytes.saturating_sub(bytes);
+        }
+    }
+
+    fn finish_probe_generation(&mut self, generation: u64) {
+        let completed = self
+            .probe_admissions
+            .keys()
+            .filter(|(admitted_generation, _)| *admitted_generation < generation)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in completed {
+            if let Some(bytes) = self.probe_admissions.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    fn clear_probe_admissions(&mut self) {
+        let bytes = self.probe_admissions.values().copied().sum::<usize>();
+        self.used_bytes = self.used_bytes.saturating_sub(bytes);
+        self.probe_admissions.clear();
+    }
+
     pub fn configure_rules(&mut self, paths: Vec<PathBuf>, trusted_key_paths: Vec<PathBuf>) {
+        let mut remaining_count = MAX_RULE_CONFIGURATION_PATHS;
+        let mut remaining_bytes = MAX_RULE_CONFIGURATION_BYTES;
+        let (paths, paths_truncated) =
+            bounded_configuration_paths(paths, &mut remaining_count, &mut remaining_bytes);
+        let (trusted_key_paths, keys_truncated) = bounded_configuration_paths(
+            trusted_key_paths,
+            &mut remaining_count,
+            &mut remaining_bytes,
+        );
+        if paths_truncated || keys_truncated {
+            self.record_rule_error("rule configuration paths exceed the bounded limit".into());
+        }
         let configuration = (paths, trusted_key_paths);
         // Configuration is also the explicit reload boundary. The paths can
         // stay unchanged while packs are installed, removed, or replaced.
         self.rule_configuration = Some(configuration.clone());
         let (paths, trusted_key_paths) = configuration;
+        // A consumed non-final response may have left the worker waiting.
+        // Release it before discarding generation-local merge state.
+        self.acknowledge_rule_chunk();
         self.rule_generation = self.rule_generation.wrapping_add(1);
         self.rule_catalog_ready = false;
         self.rule_summaries.clear();
-        self.rule_pending.clear();
-        self.rule_deferred.clear();
+        self.clear_rule_requests();
+        self.rule_rejected.clear();
+        self.rule_rejection_saturated = false;
+        self.rule_chunk_ready_to_ack = false;
         self.rule_catalog_deferred = false;
         for (_, entry) in self.rule_entries.drain() {
             self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
@@ -719,10 +967,72 @@ impl CompletionCache {
         }
     }
 
-    pub fn rule_programs(&mut self, command: &str) -> (Option<&[LoadedProgram]>, bool) {
+    pub fn rule_programs(&mut self, command: &str) -> (Option<Arc<Vec<LoadedProgram>>>, bool) {
         if command.is_empty() {
             return (None, false);
         }
+        if command.len() > MAX_RULE_LOOKUP_BYTES
+            || self.rule_rejection_saturated
+            || self.rule_rejected.contains(&rule_command_hash(command))
+        {
+            return (Some(Arc::new(Vec::new())), false);
+        }
+        if self.rule_catalog_deferred {
+            self.retry_deferred_rules();
+        }
+        let mut backpressured = false;
+        if !self.rule_entries.contains_key(command) && self.rule_catalog_ready {
+            let should_send = if self.rule_deferred.remove(command) {
+                true
+            } else if self.rule_pending.contains(command) {
+                false
+            } else if self.rule_pending.len() >= MAX_PENDING_RULE_REQUESTS {
+                backpressured = true;
+                false
+            } else {
+                let admission_bytes = rule_admission_bytes(command);
+                self.rule_pending.insert(command.to_owned());
+                self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
+                self.evict_to_limit();
+                if self.used_bytes > self.byte_limit {
+                    self.finish_rule_request(command);
+                    self.reject_rule_command(command);
+                    self.record_rule_error(format!(
+                        "{command}: rule lookup exceeds the configured cache limit"
+                    ));
+                    return (Some(Arc::new(Vec::new())), false);
+                }
+                true
+            };
+            if should_send {
+                let generation = self.rule_generation;
+                let sent = self.worker.as_ref().is_some_and(|worker| {
+                    worker.send(Request::LoadRules {
+                        command: command.to_owned(),
+                        generation,
+                    })
+                });
+                if !sent {
+                    if self.worker.is_some() {
+                        self.rule_deferred.insert(command.to_owned());
+                    } else {
+                        self.finish_rule_request(command);
+                    }
+                }
+            }
+        }
+        let pending =
+            backpressured || !self.rule_catalog_ready || self.rule_pending.contains(command);
+        if let Some(entry) = self.rule_entries.get_mut(command) {
+            self.clock = self.clock.wrapping_add(1);
+            entry.last_used = self.clock;
+            (Some(Arc::clone(&entry.programs)), pending)
+        } else {
+            (None, pending && self.worker.is_some())
+        }
+    }
+
+    fn retry_deferred_rules(&mut self) {
         if self.rule_catalog_deferred {
             if let Some((paths, trusted_key_paths)) = self.rule_configuration.clone() {
                 let sent = self.worker.as_ref().is_some_and(|worker| {
@@ -740,48 +1050,22 @@ impl CompletionCache {
                 }
             }
         }
-        let mut backpressured = false;
-        if !self.rule_entries.contains_key(command) && self.rule_catalog_ready {
-            let should_send = if self.rule_deferred.remove(command) {
-                true
-            } else if self.rule_pending.contains(command) {
-                false
-            } else {
-                if self.rule_pending.len() >= MAX_PENDING_RULE_REQUESTS {
-                    if let Some(evicted) = self.rule_deferred.iter().min().cloned() {
-                        self.rule_deferred.remove(&evicted);
-                        self.rule_pending.remove(&evicted);
-                    } else {
-                        backpressured = true;
-                    }
-                }
-                !backpressured && self.rule_pending.insert(command.to_owned())
-            };
-            if should_send {
-                let generation = self.rule_generation;
-                let sent = self.worker.as_ref().is_some_and(|worker| {
-                    worker.send(Request::LoadRules {
-                        command: command.to_owned(),
-                        generation,
-                    })
-                });
-                if !sent {
-                    if self.worker.is_some() {
-                        self.rule_deferred.insert(command.to_owned());
-                    } else {
-                        self.rule_pending.remove(command);
-                    }
-                }
-            }
+        if !self.rule_catalog_ready {
+            return;
         }
-        let pending =
-            backpressured || !self.rule_catalog_ready || self.rule_pending.contains(command);
-        if let Some(entry) = self.rule_entries.get_mut(command) {
-            self.clock = self.clock.wrapping_add(1);
-            entry.last_used = self.clock;
-            (Some(&entry.programs), pending)
-        } else {
-            (None, pending && self.worker.is_some())
+        let Some(command) = self.rule_deferred.iter().min().cloned() else {
+            return;
+        };
+        let sent = self.worker.as_ref().is_some_and(|worker| {
+            worker.send(Request::LoadRules {
+                command: command.clone(),
+                generation: self.rule_generation,
+            })
+        });
+        if sent {
+            self.rule_deferred.remove(&command);
+        } else if self.worker.is_none() {
+            self.finish_rule_request(&command);
         }
     }
 
@@ -804,6 +1088,15 @@ impl CompletionCache {
 
     pub fn background_pending(&self) -> bool {
         self.probe_cancel_pending.is_some()
+            || !self.probe_pending.is_empty()
+            || !self.filesystem_pending.is_empty()
+            || self.snapshot_pending
+            || self.snapshot_deferred
+            || !self.rule_pending.is_empty()
+            || !self.rule_deferred.is_empty()
+            || self.rule_chunk_ready_to_ack
+            || !self.rule_catalog_ready
+            || self.rule_catalog_deferred
     }
 
     pub fn probe_errors(&self) -> &[String] {
@@ -854,6 +1147,7 @@ impl CompletionCache {
             worker.stop();
         }
         self.probe_pending.clear();
+        self.clear_probe_admissions();
         self.probe_pins.clear();
         self.probe_fresh.clear();
         self.probe_cancel_pending = None;
@@ -871,19 +1165,25 @@ impl CompletionCache {
         let (_, pending) = self.probe_values(request);
         let cache_key = ProbeCacheKey::from(request);
         let outcome = self.probe_entries.get(&cache_key).and_then(|entry| {
-            (self.probe_pins.contains(&cache_key) || entry.refreshed_at.elapsed() < entry.ttl).then(
-                || ProbeResult {
+            (!entry.failed
+                && (self.probe_pins.contains(&cache_key)
+                    || entry.refreshed_at.elapsed() < entry.ttl))
+                .then(|| ProbeResult {
                     status: entry.status,
                     values: entry.values.clone(),
                     truncated: entry.truncated,
-                },
-            )
+                })
         });
         (outcome, pending)
     }
 
     pub fn probe_values(&mut self, request: &ProbeRequest) -> (Option<&[String]>, bool) {
         let cache_key = ProbeCacheKey::from(request);
+        if self.probe_rejection_saturated
+            || self.probe_rejected.contains(&probe_cache_hash(&cache_key))
+        {
+            return (None, false);
+        }
         if self.probe_fresh.remove(&cache_key) {
             self.probe_pins.insert(cache_key.clone());
         }
@@ -893,22 +1193,44 @@ impl CompletionCache {
                 .get(&cache_key)
                 .is_none_or(|entry| entry.refreshed_at.elapsed() >= entry.ttl);
         let mut deferred = false;
-        if stale && self.probe_pending.insert(cache_key.clone()) {
-            // Bash's process-wide SIGCHLD handler reaps unknown children. Mask
-            // it on the Readline thread while a bounded probe is active; the
-            // worker also masks it, so waitpid retains the real exit status.
-            if self.probe_signal_mask.is_none() {
-                self.probe_signal_mask = SignalMaskGuard::block_main_probe_sigchld().ok();
-            }
-            let sent = self
-                .probe_worker
-                .as_ref()
-                .is_some_and(|worker| worker.send_probe(request.clone(), self.probe_generation));
-            if !sent {
-                self.probe_pending.remove(&cache_key);
+        if stale && !self.probe_pending.contains(&cache_key) {
+            if self.probe_pending.len() >= MAX_PENDING_PROBES {
                 deferred = self.probe_worker.is_some();
-                if self.probe_pending.is_empty() && self.probe_cancel_pending.is_none() {
-                    self.probe_signal_mask.take();
+            } else if self.probe_worker.is_some() {
+                let admission_bytes = probe_admission_bytes(request, &cache_key);
+                self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
+                self.probe_admissions
+                    .insert((self.probe_generation, cache_key.clone()), admission_bytes);
+                self.evict_to_limit();
+                if self.used_bytes > self.byte_limit {
+                    self.finish_probe_admission(self.probe_generation, &cache_key);
+                    self.reject_probe(&cache_key);
+                    self.probe_errors.push(format!(
+                        "{}: probe request exceeds the configured cache limit",
+                        request.probe_id
+                    ));
+                    if self.probe_errors.len() > 128 {
+                        self.probe_errors.drain(..self.probe_errors.len() - 128);
+                    }
+                } else {
+                    self.probe_pending.insert(cache_key.clone());
+                    // Bash's process-wide SIGCHLD handler reaps unknown children. Mask
+                    // it on the Readline thread while a bounded probe is active; the
+                    // worker also masks it, so waitpid retains the real exit status.
+                    if self.probe_signal_mask.is_none() {
+                        self.probe_signal_mask = SignalMaskGuard::block_main_probe_sigchld().ok();
+                    }
+                    let sent = self.probe_worker.as_ref().is_some_and(|worker| {
+                        worker.send_probe(request.clone(), self.probe_generation)
+                    });
+                    if !sent {
+                        self.probe_pending.remove(&cache_key);
+                        self.finish_probe_admission(self.probe_generation, &cache_key);
+                        deferred = self.probe_worker.is_some();
+                        if self.probe_pending.is_empty() && self.probe_cancel_pending.is_none() {
+                            self.probe_signal_mask.take();
+                        }
+                    }
                 }
             }
         }
@@ -930,11 +1252,28 @@ impl CompletionCache {
     }
 
     pub fn refresh_directory(&mut self, directory: PathBuf) -> ScanKey {
-        let generation = self
-            .directory_generations
-            .entry(directory.clone())
-            .or_insert(0);
-        *generation = generation.wrapping_add(1);
+        if directory.as_os_str().as_bytes().len() > MAX_PATH_COMPONENT_BYTES {
+            return ScanKey {
+                directory: PathBuf::new(),
+                prefix: "\0bashlume:oversized-directory".into(),
+                executable_only: false,
+            };
+        }
+        if !self.directory_generations.contains_key(&directory)
+            && self.directory_generations.len() >= MAX_DIRECTORY_CACHE_ENTRIES
+        {
+            let entries = &self.entries;
+            let pending = &self.pending;
+            let deferred = &self.scan_deferred;
+            self.directory_generations.retain(|known, _| {
+                entries.keys().any(|key| &key.directory == known)
+                    || pending.iter().any(|key| &key.directory == known)
+                    || deferred.iter().any(|key| &key.directory == known)
+            });
+        }
+        self.directory_generation_clock = self.directory_generation_clock.wrapping_add(1);
+        self.directory_generations
+            .insert(directory.clone(), self.directory_generation_clock);
 
         // Prefix-specific entries are snapshots of this same directory. Drop
         // all of them at a new prompt so stale paths cannot become ghost text
@@ -951,6 +1290,7 @@ impl CompletionCache {
             }
             self.pending.remove(&key);
             self.scan_deferred.remove(&key);
+            self.scan_tokens.remove(&key);
         }
 
         let key = ScanKey {
@@ -963,11 +1303,21 @@ impl CompletionCache {
         // is always enqueued; stale responses must not clear this marker.
         self.pending.remove(&key);
         self.scan_deferred.remove(&key);
+        self.scan_tokens.remove(&key);
         self.enqueue(key.clone(), true);
         key
     }
 
     pub fn request_directory(&mut self, directory: PathBuf, prefix: &str) -> ScanKey {
+        if directory.as_os_str().as_bytes().len() > MAX_PATH_COMPONENT_BYTES
+            || prefix.len() > MAX_PATH_COMPONENT_BYTES
+        {
+            return ScanKey {
+                directory: PathBuf::new(),
+                prefix: "\0bashlume:oversized-directory-query".into(),
+                executable_only: false,
+            };
+        }
         let exact = ScanKey {
             directory: directory.clone(),
             prefix: prefix.to_owned(),
@@ -1033,6 +1383,7 @@ impl CompletionCache {
                 if let Some(victim) = victim {
                     self.pending.remove(&victim);
                     self.scan_deferred.remove(&victim);
+                    self.scan_tokens.remove(&victim);
                 }
             }
             self.pending.insert(key.clone());
@@ -1045,11 +1396,15 @@ impl CompletionCache {
                 .copied()
                 .unwrap_or(0)
         };
+        self.scan_request_clock = self.scan_request_clock.wrapping_add(1);
+        let request_token = self.scan_request_clock;
+        self.scan_tokens.insert(key.clone(), request_token);
         let sent = self.worker.as_ref().is_some_and(|worker| {
             worker.send(Request::Scan {
                 key: key.clone(),
                 max_candidates: self.max_candidates,
                 generation,
+                request_token,
             })
         });
         if !sent {
@@ -1057,6 +1412,7 @@ impl CompletionCache {
                 self.scan_deferred.insert(key);
             } else {
                 self.pending.remove(&key);
+                self.scan_tokens.remove(&key);
             }
         }
     }
@@ -1070,24 +1426,33 @@ impl CompletionCache {
                     self.worker = None;
                     self.pending.clear();
                     self.scan_deferred.clear();
+                    self.scan_tokens.clear();
                     self.filesystem_pending.clear();
                     self.filesystem_pins.clear();
                     self.filesystem_limit_exceeded = false;
-                    self.rule_pending.clear();
-                    self.rule_deferred.clear();
+                    self.snapshot_pending = false;
+                    self.snapshot_deferred = false;
+                    self.snapshot_inflight_generation = None;
+                    self.clear_rule_requests();
+                    self.rule_chunk_ready_to_ack = false;
                     self.rule_catalog_deferred = false;
                     self.rule_catalog_ready = true;
                     break;
                 }
             };
+            self.response_generation = self.response_generation.wrapping_add(1);
             match response {
                 Response::Scan {
                     key,
                     entries,
                     truncated,
                     generation,
+                    request_token,
                     completed_at,
                 } => {
+                    if self.scan_tokens.get(&key) != Some(&request_token) {
+                        continue;
+                    }
                     let current_generation = if key.executable_only {
                         0
                     } else {
@@ -1101,6 +1466,7 @@ impl CompletionCache {
                     }
                     self.pending.remove(&key);
                     self.scan_deferred.remove(&key);
+                    self.scan_tokens.remove(&key);
                     let approximate_bytes = scan_key_bytes(&key)
                         .saturating_add(std::mem::size_of::<CacheEntry>())
                         .saturating_add(
@@ -1170,6 +1536,7 @@ impl CompletionCache {
                     }
                 }
                 Response::Snapshots {
+                    generation,
                     users,
                     groups,
                     passwd_records,
@@ -1179,6 +1546,14 @@ impl CompletionCache {
                     process_names,
                     network_interfaces,
                 } => {
+                    if self.snapshot_inflight_generation == Some(generation) {
+                        self.snapshot_pending = false;
+                        self.snapshot_inflight_generation = None;
+                    }
+                    if generation != self.snapshot_generation {
+                        self.snapshot_deferred = true;
+                        continue;
+                    }
                     self.used_bytes = self.used_bytes.saturating_sub(self.snapshot_bytes);
                     self.snapshot_bytes = [
                         &users,
@@ -1191,8 +1566,7 @@ impl CompletionCache {
                         &network_interfaces,
                     ]
                     .into_iter()
-                    .flatten()
-                    .map(String::capacity)
+                    .map(owned_strings_bytes)
                     .sum();
                     self.users = users;
                     self.groups = groups;
@@ -1204,6 +1578,19 @@ impl CompletionCache {
                     self.network_interfaces = network_interfaces;
                     self.used_bytes = self.used_bytes.saturating_add(self.snapshot_bytes);
                     self.evict_to_limit();
+                    if self.used_bytes > self.byte_limit {
+                        self.used_bytes = self.used_bytes.saturating_sub(self.snapshot_bytes);
+                        self.snapshot_bytes = 0;
+                        self.users = Vec::new();
+                        self.groups = Vec::new();
+                        self.passwd_records = Vec::new();
+                        self.group_records = Vec::new();
+                        self.hosts = Vec::new();
+                        self.process_ids = Vec::new();
+                        self.process_names = Vec::new();
+                        self.network_interfaces = Vec::new();
+                        self.evict_to_limit();
+                    }
                 }
                 Response::RuleCatalog {
                     summaries,
@@ -1220,36 +1607,94 @@ impl CompletionCache {
                     command,
                     programs,
                     errors,
+                    approximate_bytes,
                     generation,
+                    complete,
                 } => {
+                    if !complete {
+                        self.rule_chunk_ready_to_ack = true;
+                    }
                     if generation != self.rule_generation {
                         continue;
                     }
-                    self.rule_pending.remove(&command);
-                    self.rule_deferred.remove(&command);
-                    let approximate_bytes = approximate_rule_bytes(&programs)
-                        .saturating_add(std::mem::size_of::<RuleCacheEntry>())
-                        .saturating_add(command.capacity());
+                    if self.rule_rejection_saturated
+                        || self.rule_rejected.contains(&rule_command_hash(&command))
+                    {
+                        if complete {
+                            self.finish_rule_request(&command);
+                        }
+                        continue;
+                    }
+                    if complete {
+                        self.finish_rule_request(&command);
+                    }
+                    let chunk_bytes = approximate_bytes;
+                    let previous = self.rule_entries.remove(&command);
+                    let (mut combined, approximate_bytes) = previous.map_or_else(
+                        || {
+                            (
+                                Arc::new(Vec::new()),
+                                chunk_bytes
+                                    .saturating_add(std::mem::size_of::<RuleCacheEntry>())
+                                    .saturating_add(std::mem::size_of::<Vec<LoadedProgram>>())
+                                    .saturating_add(2 * std::mem::size_of::<usize>())
+                                    .saturating_add(command.capacity()),
+                            )
+                        },
+                        |previous| {
+                            self.used_bytes =
+                                self.used_bytes.saturating_sub(previous.approximate_bytes);
+                            (
+                                previous.programs,
+                                previous.approximate_bytes.saturating_add(chunk_bytes),
+                            )
+                        },
+                    );
+                    {
+                        let combined_programs: &mut Vec<LoadedProgram> =
+                            Arc::make_mut(&mut combined);
+                        combined_programs.extend(programs);
+                        sort_loaded_programs(combined_programs);
+                    }
                     self.clock = self.clock.wrapping_add(1);
-                    if let Some(previous) = self.rule_entries.insert(
+                    let command_key = command.clone();
+                    self.rule_entries.insert(
                         command,
                         RuleCacheEntry {
-                            programs,
+                            programs: combined,
                             approximate_bytes,
                             last_used: self.clock,
                         },
-                    ) {
-                        self.used_bytes =
-                            self.used_bytes.saturating_sub(previous.approximate_bytes);
-                    }
+                    );
                     self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
                     self.rule_errors.extend(errors);
                     if self.rule_errors.len() > 128 {
                         self.rule_errors.drain(..self.rule_errors.len() - 128);
                     }
+                    if approximate_bytes > self.byte_limit {
+                        if let Some(entry) = self.rule_entries.remove(&command_key) {
+                            self.used_bytes =
+                                self.used_bytes.saturating_sub(entry.approximate_bytes);
+                        }
+                        self.reject_rule_command(&command_key);
+                        self.record_rule_error(format!(
+                            "{command_key}: decoded rules exceed the configured cache limit"
+                        ));
+                        continue;
+                    }
                     self.evict_to_limit();
+                    if complete && !self.rule_entries.contains_key(&command_key) {
+                        self.reject_rule_command(&command_key);
+                        self.record_rule_error(format!(
+                            "{command_key}: decoded rules exceed the configured cache limit"
+                        ));
+                    }
                 }
             }
+        }
+        self.retry_deferred_rules();
+        if self.snapshot_deferred {
+            self.retry_snapshot();
         }
         self.poll_probe_responses();
     }
@@ -1262,6 +1707,7 @@ impl CompletionCache {
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.probe_worker = None;
                     self.probe_pending.clear();
+                    self.clear_probe_admissions();
                     self.probe_pins.clear();
                     self.probe_fresh.clear();
                     self.probe_cancel_pending = None;
@@ -1269,6 +1715,7 @@ impl CompletionCache {
                     break;
                 }
             };
+            self.response_generation = self.response_generation.wrapping_add(1);
             match response {
                 ProbeResponse::Outcome {
                     request,
@@ -1279,16 +1726,20 @@ impl CompletionCache {
                     error,
                     completed_at,
                 } => {
+                    let request = *request;
+                    let cache_key = ProbeCacheKey::from(&request);
+                    self.finish_probe_admission(generation, &cache_key);
                     if generation != self.probe_generation {
                         continue;
                     }
-                    let request = *request;
-                    let cache_key = ProbeCacheKey::from(&request);
                     self.probe_pending.remove(&cache_key);
                     if self.probe_pending.is_empty() && self.probe_cancel_pending.is_none() {
                         self.probe_signal_mask.take();
                     }
-                    let failed = error.is_some() || status != 0;
+                    // A non-zero process status is a successful semantic
+                    // outcome for shell conditions; only supervisor failures
+                    // make the cached outcome unavailable.
+                    let failed = error.is_some();
                     if let Some(error) = error {
                         self.probe_errors
                             .push(format!("{}: {error}", request.probe_id));
@@ -1307,7 +1758,7 @@ impl CompletionCache {
                     self.clock = self.clock.wrapping_add(1);
                     self.probe_fresh.insert(cache_key.clone());
                     if let Some(previous) = self.probe_entries.insert(
-                        cache_key,
+                        cache_key.clone(),
                         ProbeCacheEntry {
                             values,
                             status,
@@ -1328,8 +1779,29 @@ impl CompletionCache {
                     }
                     self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
                     self.evict_to_limit();
+                    if (self.used_bytes > self.byte_limit
+                        || self.probe_entries.len() > MAX_PROBE_CACHE_ENTRIES)
+                        && self.probe_entries.contains_key(&cache_key)
+                    {
+                        if let Some(entry) = self.probe_entries.remove(&cache_key) {
+                            self.used_bytes =
+                                self.used_bytes.saturating_sub(entry.approximate_bytes);
+                        }
+                        self.probe_fresh.remove(&cache_key);
+                        self.probe_pins.remove(&cache_key);
+                        self.reject_probe(&cache_key);
+                        self.probe_errors.push(format!(
+                            "{}: probe result exceeds the configured cache limit",
+                            request.probe_id
+                        ));
+                        if self.probe_errors.len() > 128 {
+                            self.probe_errors.drain(..self.probe_errors.len() - 128);
+                        }
+                        self.evict_to_limit();
+                    }
                 }
                 ProbeResponse::Cancelled { generation } => {
+                    self.finish_probe_generation(generation);
                     if self.probe_cancel_pending == Some(generation) {
                         self.probe_cancel_pending = None;
                         if self.probe_pending.is_empty() {
@@ -1338,6 +1810,24 @@ impl CompletionCache {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) const fn response_generation(&self) -> u64 {
+        self.response_generation
+    }
+
+    pub(super) const fn replay_byte_limit(&self) -> usize {
+        self.byte_limit
+    }
+
+    pub(super) fn acknowledge_rule_chunk(&mut self) {
+        if !self.rule_chunk_ready_to_ack {
+            return;
+        }
+        self.rule_chunk_ready_to_ack = false;
+        if let Some(worker) = &self.worker {
+            worker.acknowledge_rule_chunk();
         }
     }
 
@@ -1350,6 +1840,9 @@ impl CompletionCache {
     }
 
     pub fn for_each_command(&mut self, query: &str, mut visitor: impl FnMut(&str) -> bool) -> bool {
+        if query.len() > MAX_PATH_COMPONENT_BYTES {
+            return false;
+        }
         let directories = self.path_directories.clone();
         let mut pending = false;
         for directory in directories {
@@ -1387,8 +1880,11 @@ impl CompletionCache {
     }
 
     pub fn command_available(&mut self, name: &str) -> Option<bool> {
+        if name.len() > MAX_PATH_COMPONENT_BYTES {
+            return None;
+        }
         let directories = self.path_directories.clone();
-        let mut complete = true;
+        let mut complete = !self.path_truncated;
         for directory in directories {
             let broad = ScanKey {
                 directory: directory.clone(),
@@ -1435,7 +1931,10 @@ impl CompletionCache {
     }
 
     pub fn command_known(&self, name: &str) -> Option<bool> {
-        let mut complete = true;
+        if name.len() > MAX_PATH_COMPONENT_BYTES {
+            return None;
+        }
+        let mut complete = !self.path_truncated;
         for directory in &self.path_directories {
             let key = ScanKey {
                 directory: directory.clone(),
@@ -1517,6 +2016,7 @@ impl CompletionCache {
         self.filesystem_pins.clear();
         self.filesystem_limit_exceeded = false;
         self.probe_pending.clear();
+        self.clear_probe_admissions();
         self.probe_pins.clear();
         self.probe_fresh.clear();
         self.probe_cancel_pending = None;
@@ -1556,6 +2056,7 @@ impl CompletionCache {
             let Some(key) = self
                 .rule_entries
                 .iter()
+                .filter(|(command, _)| !self.rule_pending.contains(*command))
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| key.clone())
             else {
@@ -1569,6 +2070,9 @@ impl CompletionCache {
             let Some(key) = self
                 .probe_entries
                 .iter()
+                .filter(|(key, _)| {
+                    !self.probe_pins.contains(*key) && !self.probe_fresh.contains(*key)
+                })
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| key.clone())
             else {
@@ -1603,11 +2107,15 @@ impl CompletionCache {
             let oldest_rule = self
                 .rule_entries
                 .iter()
+                .filter(|(command, _)| !self.rule_pending.contains(*command))
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, entry)| (key.clone(), entry.last_used));
             let oldest_probe = self
                 .probe_entries
                 .iter()
+                .filter(|(key, _)| {
+                    !self.probe_pins.contains(*key) && !self.probe_fresh.contains(*key)
+                })
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, entry)| (key.clone(), entry.last_used));
             let Some(minimum_clock) = oldest_directory
@@ -1659,9 +2167,29 @@ impl CompletionCache {
     }
 }
 
+fn send_probe_response(
+    responses: &SyncSender<ProbeResponse>,
+    stop: &AtomicBool,
+    mut response: ProbeResponse,
+) -> bool {
+    loop {
+        match responses.try_send(response) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                response = returned;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 fn probe_worker_loop(
     requests: Receiver<ProbeWorkerRequest>,
-    responses: Sender<ProbeResponse>,
+    responses: SyncSender<ProbeResponse>,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) {
@@ -1679,12 +2207,13 @@ fn probe_worker_loop(
             probes.cancel_all();
             probe_generations.clear();
             observed_generation = current_generation;
-            if responses
-                .send(ProbeResponse::Cancelled {
+            if !send_probe_response(
+                &responses,
+                &stop,
+                ProbeResponse::Cancelled {
                     generation: current_generation,
-                })
-                .is_err()
-            {
+                },
+            ) {
                 break;
             }
         }
@@ -1714,8 +2243,10 @@ fn probe_worker_loop(
                     let cache_key = ProbeCacheKey::from(&request);
                     if probes.submit(request.clone()) {
                         probe_generations.insert(cache_key, generation);
-                    } else if responses
-                        .send(ProbeResponse::Outcome {
+                    } else if !send_probe_response(
+                        &responses,
+                        &stop,
+                        ProbeResponse::Outcome {
                             request: Box::new(request),
                             generation,
                             status: 1,
@@ -1723,9 +2254,8 @@ fn probe_worker_loop(
                             truncated: false,
                             error: Some("probe queue rejected the request".into()),
                             completed_at: Instant::now(),
-                        })
-                        .is_err()
-                    {
+                        },
+                    ) {
                         break;
                     }
                 }
@@ -1741,8 +2271,10 @@ fn probe_worker_loop(
             let Some(generation) = probe_generations.remove(&cache_key) else {
                 continue;
             };
-            if responses
-                .send(ProbeResponse::Outcome {
+            if !send_probe_response(
+                &responses,
+                &stop,
+                ProbeResponse::Outcome {
                     request: Box::new(outcome.request),
                     generation,
                     status: outcome.status,
@@ -1750,20 +2282,40 @@ fn probe_worker_loop(
                     truncated: outcome.truncated,
                     error: outcome.error,
                     completed_at: outcome.completed_at,
-                })
-                .is_err()
-            {
+                },
+            ) {
                 return;
             }
         }
     }
 }
 
+fn send_worker_response(
+    responses: &SyncSender<Response>,
+    stop: &AtomicBool,
+    mut response: Response,
+) -> bool {
+    loop {
+        match responses.try_send(response) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                if stop.load(Ordering::Acquire) {
+                    return false;
+                }
+                response = returned;
+                thread::sleep(Duration::from_micros(250));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 fn worker_loop(
     requests: Receiver<Request>,
-    responses: Sender<Response>,
+    responses: SyncSender<Response>,
     stop: Arc<AtomicBool>,
     filesystem_generation: Arc<AtomicU64>,
+    rule_chunk_ack: Arc<AtomicBool>,
 ) {
     // Never let Bash's process-wide SIGCHLD handler run on a Rust worker.
     let _signal_mask = SignalMaskGuard::block_sigchld().ok();
@@ -1773,7 +2325,14 @@ fn worker_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let request = if let Some(request) = deferred.pop_front() {
+        let request = if let Some(index) = deferred
+            .iter()
+            .position(|request| matches!(request, Request::LoadRules { .. }))
+        {
+            deferred
+                .remove(index)
+                .expect("indexed deferred rule request exists")
+        } else if let Some(request) = deferred.pop_front() {
             request
         } else {
             match requests.recv() {
@@ -1789,6 +2348,7 @@ fn worker_loop(
                 mut key,
                 mut max_candidates,
                 mut generation,
+                mut request_token,
             } => {
                 // Prompt refreshes can supersede the same scan faster than
                 // a slow filesystem responds. Coalesce matching work from
@@ -1800,11 +2360,13 @@ fn worker_loop(
                             key: queued_key,
                             max_candidates: queued_max,
                             generation: queued_generation,
+                            request_token: queued_token,
                         } if queued_key == key => {
-                            if queued_generation >= generation {
+                            if queued_token >= request_token {
                                 key = queued_key;
                                 max_candidates = queued_max;
                                 generation = queued_generation;
+                                request_token = queued_token;
                             }
                         }
                         Request::Stop => return,
@@ -1821,11 +2383,13 @@ fn worker_loop(
                             key: queued_key,
                             max_candidates: queued_max,
                             generation: queued_generation,
+                            request_token: queued_token,
                         } if queued_key == key => {
-                            if queued_generation >= generation {
+                            if queued_token >= request_token {
                                 key = queued_key;
                                 max_candidates = queued_max;
                                 generation = queued_generation;
+                                request_token = queued_token;
                             }
                         }
                         Request::Stop => return,
@@ -1835,28 +2399,45 @@ fn worker_loop(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                if deferred
+                    .iter()
+                    .any(|request| matches!(request, Request::LoadRules { .. }))
+                {
+                    deferred.push_back(Request::Scan {
+                        key,
+                        max_candidates,
+                        generation,
+                        request_token,
+                    });
+                    continue;
+                }
                 let (entries, truncated) = scan_directory(&key, max_candidates);
-                if responses
-                    .send(Response::Scan {
+                if !send_worker_response(
+                    &responses,
+                    &stop,
+                    Response::Scan {
                         key,
                         entries,
                         truncated,
                         generation,
+                        request_token,
                         completed_at: Instant::now(),
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     break;
                 }
             }
-            Request::LoadSnapshots { home } => {
+            Request::LoadSnapshots { home, generation } => {
                 let (users, passwd_records) = load_users();
                 let (groups, group_records) = load_groups();
                 let hosts = load_hosts(home.as_deref());
                 let (process_ids, process_names) = load_processes();
                 let network_interfaces = load_network_interfaces();
-                if responses
-                    .send(Response::Snapshots {
+                if !send_worker_response(
+                    &responses,
+                    &stop,
+                    Response::Snapshots {
+                        generation,
                         users,
                         groups,
                         passwd_records,
@@ -1865,9 +2446,8 @@ fn worker_loop(
                         process_ids,
                         process_names,
                         network_interfaces,
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     break;
                 }
             }
@@ -1879,15 +2459,16 @@ fn worker_loop(
                     &key.request,
                     &key.working_directory,
                 );
-                if responses
-                    .send(Response::Filesystem {
+                if !send_worker_response(
+                    &responses,
+                    &stop,
+                    Response::Filesystem {
                         key,
                         values,
                         generation,
                         completed_at: Instant::now(),
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     break;
                 }
             }
@@ -1897,13 +2478,14 @@ fn worker_loop(
                 generation,
             } => {
                 rules = RuleStore::discover(&paths, &trusted_key_paths);
-                if responses
-                    .send(Response::RuleCatalog {
+                if !send_worker_response(
+                    &responses,
+                    &stop,
+                    Response::RuleCatalog {
                         summaries: rules.summaries().to_vec(),
                         generation,
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     break;
                 }
             }
@@ -1911,22 +2493,74 @@ fn worker_loop(
                 command,
                 generation,
             } => {
-                let (programs, errors) = rules.load_command(&command);
-                if responses
-                    .send(Response::Rules {
-                        command,
-                        programs,
-                        errors,
-                        generation,
-                    })
-                    .is_err()
-                {
+                let mut connected = true;
+                rules.load_command_incremental(&command, |programs, errors, complete| {
+                    let approximate_bytes = approximate_rule_bytes(&programs);
+                    if !complete {
+                        rule_chunk_ack.store(false, Ordering::Release);
+                    }
+                    connected = send_worker_response(
+                        &responses,
+                        &stop,
+                        Response::Rules {
+                            command: command.clone(),
+                            programs,
+                            errors,
+                            approximate_bytes,
+                            generation,
+                            complete,
+                        },
+                    );
+                    if connected && !complete {
+                        while !rule_chunk_ack.load(Ordering::Acquire)
+                            && !stop.load(Ordering::Acquire)
+                        {
+                            thread::sleep(Duration::from_micros(250));
+                        }
+                        connected = !stop.load(Ordering::Acquire);
+                    }
+                    connected
+                });
+                if !connected {
                     break;
                 }
             }
             Request::Stop => break,
         }
     }
+}
+
+fn predicate_heap_bytes(predicate: &crate::rules::ir::PredicateOp) -> usize {
+    use crate::rules::ir::PredicateOp;
+    match predicate {
+        PredicateOp::CurrentWordEquals(value)
+        | PredicateOp::CurrentWordStartsWith(value)
+        | PredicateOp::PreviousWordEquals(value)
+        | PredicateOp::AnyWordEquals(value)
+        | PredicateOp::WordNotPresent(value)
+        | PredicateOp::EnvironmentSet(value) => value.capacity(),
+        PredicateOp::CommandPathEquals(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(values.iter().map(String::capacity).sum::<usize>()),
+        PredicateOp::EnvironmentEquals { name, value } => {
+            name.capacity().saturating_add(value.capacity())
+        }
+        PredicateOp::True
+        | PredicateOp::False
+        | PredicateOp::Not
+        | PredicateOp::And
+        | PredicateOp::Or
+        | PredicateOp::WordIndexEquals(_)
+        | PredicateOp::WordIndexAtLeast(_) => 0,
+    }
+}
+
+fn predicate_program_bytes(predicates: &[crate::rules::ir::PredicateOp]) -> usize {
+    predicates
+        .len()
+        .saturating_mul(std::mem::size_of::<crate::rules::ir::PredicateOp>())
+        .saturating_add(predicates.iter().map(predicate_heap_bytes).sum::<usize>())
 }
 
 fn approximate_rule_bytes(programs: &[LoadedProgram]) -> usize {
@@ -1943,54 +2577,98 @@ fn approximate_rule_bytes(programs: &[LoadedProgram]) -> usize {
             .saturating_add(
                 program
                     .registrations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                program
+                    .registrations
                     .iter()
-                    .map(|value| value.capacity())
+                    .map(String::capacity)
                     .sum::<usize>(),
             )
             .saturating_add(
                 loaded
                     .required_commands
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                loaded
+                    .required_commands
                     .iter()
-                    .map(|value| std::mem::size_of::<String>() + value.capacity())
+                    .map(String::capacity)
                     .sum::<usize>(),
             );
-        let rules = program.static_rules.iter().fold(0_usize, |size, rule| {
-            size.saturating_add(std::mem::size_of_val(rule))
-                .saturating_add(
-                    rule.when.len() * std::mem::size_of::<crate::rules::ir::PredicateOp>(),
-                )
-                .saturating_add(rule.candidates.iter().fold(
-                    0_usize,
-                    |candidate_size, candidate| {
-                        candidate_size
-                            .saturating_add(std::mem::size_of_val(candidate))
-                            .saturating_add(candidate.value.capacity())
-                            .saturating_add(candidate.display.capacity())
-                            .saturating_add(
-                                candidate.description.as_ref().map_or(0, String::capacity),
-                            )
-                    },
-                ))
-        });
-        let probes = program.probes.iter().fold(0_usize, |size, probe| {
-            size.saturating_add(std::mem::size_of_val(probe))
-                .saturating_add(probe.id.capacity())
-                .saturating_add(probe.executable.capacity())
-                .saturating_add(
-                    probe
-                        .arguments
-                        .iter()
-                        .map(|value| value.capacity())
-                        .sum::<usize>(),
-                )
-        });
+        let rules =
+            program
+                .static_rules
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::rules::ir::StaticRule>())
+                .saturating_add(program.static_rules.iter().fold(0_usize, |size, rule| {
+                    size.saturating_add(predicate_program_bytes(&rule.when))
+                        .saturating_add(rule.candidates.capacity().saturating_mul(
+                            std::mem::size_of::<crate::rules::ir::CandidateTemplate>(),
+                        ))
+                        .saturating_add(rule.candidates.iter().fold(
+                            0_usize,
+                            |candidate_size, candidate| {
+                                candidate_size
+                                    .saturating_add(candidate.value.capacity())
+                                    .saturating_add(candidate.display.capacity())
+                                    .saturating_add(
+                                        candidate.description.as_ref().map_or(0, String::capacity),
+                                    )
+                            },
+                        ))
+                }));
+        let probes = program
+            .probes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<crate::rules::ir::ProbeSpec>())
+            .saturating_add(program.probes.iter().fold(0_usize, |size, probe| {
+                size.saturating_add(probe.id.capacity())
+                    .saturating_add(predicate_program_bytes(&probe.when))
+                    .saturating_add(probe.executable.capacity())
+                    .saturating_add(
+                        probe
+                            .arguments
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                    )
+                    .saturating_add(probe.arguments.iter().map(String::capacity).sum::<usize>())
+                    .saturating_add(
+                        probe
+                            .environment
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(String, String)>()),
+                    )
+                    .saturating_add(probe.environment.iter().fold(
+                        0_usize,
+                        |environment_size, (name, value)| {
+                            environment_size
+                                .saturating_add(name.capacity())
+                                .saturating_add(value.capacity())
+                        },
+                    ))
+                    .saturating_add(probe.description.as_ref().map_or(0, String::capacity))
+            }));
         let scripts = program
             .scripts
-            .iter()
-            .map(crate::rules::script::ScriptModule::approximate_bytes)
-            .sum::<usize>();
+            .capacity()
+            .saturating_sub(program.scripts.len())
+            .saturating_mul(std::mem::size_of::<crate::rules::script::ScriptModule>())
+            .saturating_add(
+                program
+                    .scripts
+                    .iter()
+                    .map(crate::rules::script::ScriptModule::approximate_bytes)
+                    .sum::<usize>(),
+            );
         total
             .saturating_add(std::mem::size_of_val(loaded))
+            .saturating_add(std::mem::size_of::<crate::rules::ir::CommandProgram>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
             .saturating_add(metadata)
             .saturating_add(rules)
             .saturating_add(probes)
@@ -2499,8 +3177,135 @@ mod tests {
             .map(|index| format!("/snapshot/{index}"))
             .collect::<Vec<_>>()
             .join(":");
-        cache.refresh_path(&path);
+        cache.refresh_path(&path, Path::new("/working"));
         assert_eq!(cache.path_directories.len(), MAX_PATH_DIRECTORIES);
+        assert!(cache.path_truncated);
+        assert_eq!(cache.command_known("outside-bound"), None);
+    }
+
+    #[test]
+    fn unchanged_path_refreshes_expired_executable_scans() {
+        let (request_tx, request_rx) = mpsc::sync_channel(4);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        let directory = PathBuf::from("/unchanged");
+        let key = ScanKey {
+            directory: directory.clone(),
+            prefix: String::new(),
+            executable_only: true,
+        };
+        cache.path_directories = vec![directory];
+        cache.entries.insert(
+            key.clone(),
+            CacheEntry {
+                entries: Vec::new(),
+                truncated: false,
+                approximate_bytes: 0,
+                last_used: 0,
+                refreshed_at: Instant::now() - Duration::from_secs(3),
+            },
+        );
+        cache.refresh_path("/unchanged", Path::new("/"));
+        assert!(cache.pending.contains(&key));
+        assert!(matches!(request_rx.try_recv(), Ok(Request::Scan { .. })));
+    }
+
+    #[test]
+    fn stale_scan_response_cannot_complete_a_newer_request() {
+        let (request_tx, request_rx) = mpsc::sync_channel(4);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        let key = ScanKey {
+            directory: PathBuf::from("/token"),
+            prefix: String::new(),
+            executable_only: true,
+        };
+        cache.enqueue(key.clone(), true);
+        let old_token = match request_rx.try_recv().unwrap() {
+            Request::Scan { request_token, .. } => request_token,
+            request => panic!("unexpected request: {request:?}"),
+        };
+        cache.pending.remove(&key);
+        cache.scan_tokens.remove(&key);
+        cache.enqueue(key.clone(), true);
+        let new_token = match request_rx.try_recv().unwrap() {
+            Request::Scan { request_token, .. } => request_token,
+            request => panic!("unexpected request: {request:?}"),
+        };
+        assert_ne!(old_token, new_token);
+        response_tx
+            .send(Response::Scan {
+                key: key.clone(),
+                entries: vec![DirectoryEntry {
+                    name: "old".into(),
+                    kind: EntryKind::Executable,
+                }],
+                truncated: false,
+                generation: 0,
+                request_token: old_token,
+                completed_at: Instant::now(),
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.pending.contains(&key));
+        assert!(!cache.entries.contains_key(&key));
+        response_tx
+            .send(Response::Scan {
+                key: key.clone(),
+                entries: vec![DirectoryEntry {
+                    name: "new".into(),
+                    kind: EntryKind::Executable,
+                }],
+                truncated: false,
+                generation: 0,
+                request_token: new_token,
+                completed_at: Instant::now(),
+            })
+            .unwrap();
+        cache.poll();
+        assert!(!cache.pending.contains(&key));
+        assert_eq!(cache.entries[&key].entries[0].name, "new");
+    }
+
+    #[test]
+    fn relative_path_components_are_rebound_after_directory_changes() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker.take();
+        cache.refresh_path(":tools:/absolute", Path::new("/first"));
+        assert_eq!(
+            cache.path_directories,
+            [
+                PathBuf::from("/first/."),
+                PathBuf::from("/first/tools"),
+                PathBuf::from("/absolute")
+            ]
+        );
+
+        cache.refresh_path(":tools:/absolute", Path::new("/second"));
+        assert_eq!(
+            cache.path_directories,
+            [
+                PathBuf::from("/second/."),
+                PathBuf::from("/second/tools"),
+                PathBuf::from("/absolute")
+            ]
+        );
     }
 
     #[test]
@@ -2645,6 +3450,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         };
         let mut cache = CompletionCache::new(1024 * 1024, 128);
         cache.worker = Some(worker);
@@ -2678,6 +3484,118 @@ mod tests {
         assert!(values.is_none());
         assert!(pending);
         assert!(!limited);
+    }
+
+    #[test]
+    fn background_poll_retries_abandoned_deferred_rule_loads() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        request_tx.try_send(Request::Stop).unwrap();
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        assert!(cache.rule_programs("deferred").1);
+        assert!(cache.rule_deferred.contains("deferred"));
+        assert!(matches!(request_rx.try_recv(), Ok(Request::Stop)));
+
+        cache.poll();
+        assert!(!cache.rule_deferred.contains("deferred"));
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::LoadRules { command, .. }) if command == "deferred"
+        ));
+    }
+
+    #[test]
+    fn oversized_snapshot_home_is_not_retained_or_dispatched() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        cache.load_snapshots(Some(PathBuf::from(
+            "x".repeat(MAX_PATH_COMPONENT_BYTES + 1),
+        )));
+        assert!(cache.snapshot_home.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::LoadSnapshots { home: None, .. })
+        ));
+    }
+
+    #[test]
+    fn latest_snapshot_home_is_retried_and_stale_response_is_ignored() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        cache.load_snapshots(Some(PathBuf::from("/old-home")));
+        cache.load_snapshots(Some(PathBuf::from("/new-home")));
+        let old_generation = match request_rx.try_recv().unwrap() {
+            Request::LoadSnapshots { home, generation } => {
+                assert_eq!(home, Some(PathBuf::from("/old-home")));
+                generation
+            }
+            request => panic!("unexpected request: {request:?}"),
+        };
+        response_tx
+            .send(Response::Snapshots {
+                generation: old_generation,
+                users: Vec::new(),
+                groups: Vec::new(),
+                passwd_records: Vec::new(),
+                group_records: Vec::new(),
+                hosts: vec!["old.example".into()],
+                process_ids: Vec::new(),
+                process_names: Vec::new(),
+                network_interfaces: Vec::new(),
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.hosts().is_empty());
+        assert!(cache.snapshots_pending());
+        let new_generation = match request_rx.try_recv().unwrap() {
+            Request::LoadSnapshots { home, generation } => {
+                assert_eq!(home, Some(PathBuf::from("/new-home")));
+                generation
+            }
+            request => panic!("unexpected request: {request:?}"),
+        };
+        response_tx
+            .send(Response::Snapshots {
+                generation: new_generation,
+                users: Vec::new(),
+                groups: Vec::new(),
+                passwd_records: Vec::new(),
+                group_records: Vec::new(),
+                hosts: vec!["new.example".into()],
+                process_ids: Vec::new(),
+                process_names: Vec::new(),
+                network_interfaces: Vec::new(),
+            })
+            .unwrap();
+        cache.poll();
+        assert_eq!(cache.hosts(), ["new.example"]);
+        assert!(!cache.snapshots_pending());
     }
 
     #[test]
@@ -2756,6 +3674,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(cache.filesystem_generation)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         cache.filesystem_pending.insert(key.clone());
         response_tx
@@ -2772,6 +3691,180 @@ mod tests {
         assert!(!pending);
         assert!(limited);
         assert_eq!(cache.filesystem_entries.len(), 1);
+    }
+
+    #[test]
+    fn oversized_rule_load_is_terminal_instead_of_requeued() {
+        let mut cache = CompletionCache::new(1, 128);
+        cache.worker.take();
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::channel();
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(false)),
+        });
+        cache.rule_pending.insert("huge".into());
+        cache.acknowledge_rule_chunk();
+        assert!(
+            !cache
+                .worker
+                .as_ref()
+                .unwrap()
+                .rule_chunk_ack
+                .load(Ordering::Acquire)
+        );
+        response_tx
+            .send(Response::Rules {
+                command: "huge".into(),
+                programs: Vec::new(),
+                errors: Vec::new(),
+                approximate_bytes: 1024,
+                generation: cache.rule_generation,
+                complete: false,
+            })
+            .unwrap();
+
+        cache.poll();
+        assert!(cache.rule_chunk_ready_to_ack);
+        cache.acknowledge_rule_chunk();
+        assert!(!cache.rule_chunk_ready_to_ack);
+        assert!(
+            cache
+                .worker
+                .as_ref()
+                .unwrap()
+                .rule_chunk_ack
+                .load(Ordering::Acquire)
+        );
+        let (programs, pending) = cache.rule_programs("huge");
+        assert!(!pending);
+        assert!(programs.is_some_and(|programs| programs.is_empty()));
+        assert!(cache.rule_rejected.contains(&rule_command_hash("huge")));
+        assert!(cache.rule_pending.contains("huge"));
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        response_tx
+            .send(Response::Rules {
+                command: "huge".into(),
+                programs: Vec::new(),
+                errors: Vec::new(),
+                approximate_bytes: 0,
+                generation: cache.rule_generation,
+                complete: true,
+            })
+            .unwrap();
+        cache.poll();
+        assert!(!cache.rule_pending.contains("huge"));
+    }
+
+    #[test]
+    fn oversized_probe_request_is_rejected_before_dispatch() {
+        let mut cache = CompletionCache::new(1, 128);
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "printf".into(),
+                arguments: vec!["value".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:admission".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1000,
+            output_limit: 4096,
+            cache_ttl_ms: 1000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        let cache_key = ProbeCacheKey::from(&request);
+        let (values, pending) = cache.probe_values(&request);
+        assert!(values.is_none());
+        assert!(!pending);
+        assert!(cache.probe_pending.is_empty());
+        assert!(cache.probe_admissions.is_empty());
+        assert!(cache.probe_rejected.contains(&probe_cache_hash(&cache_key)));
+        assert!(cache.used_bytes <= cache.byte_limit);
+    }
+
+    #[test]
+    fn rule_reload_releases_a_consumed_chunk_ack() {
+        let (request_tx, _request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let acknowledgement = Arc::new(AtomicBool::new(false));
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::clone(&acknowledgement),
+        });
+        cache.rule_chunk_ready_to_ack = true;
+        cache.configure_rules(Vec::new(), Vec::new());
+        assert!(acknowledgement.load(Ordering::Acquire));
+        assert!(!cache.rule_chunk_ready_to_ack);
+    }
+
+    #[test]
+    fn oversized_fresh_probe_result_is_terminal_without_preconsumption_eviction() {
+        let mut cache = CompletionCache::new(1, 128);
+        cache.probe_worker.take();
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::channel();
+        cache.probe_worker = Some(ProbeClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(cache.probe_generation)),
+        });
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "printf".into(),
+                arguments: vec!["large".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:oversized".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1000,
+            output_limit: 4096,
+            cache_ttl_ms: 10_000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        let cache_key = ProbeCacheKey::from(&request);
+        cache.probe_pending.insert(cache_key.clone());
+        response_tx
+            .send(ProbeResponse::Outcome {
+                request: Box::new(request.clone()),
+                generation: cache.probe_generation,
+                status: 0,
+                values: vec!["x".repeat(1024)],
+                truncated: false,
+                error: None,
+                completed_at: Instant::now(),
+            })
+            .unwrap();
+
+        cache.poll();
+        assert!(!cache.probe_entries.contains_key(&cache_key));
+        assert!(!cache.probe_fresh.contains(&cache_key));
+        assert!(cache.probe_rejected.contains(&probe_cache_hash(&cache_key)));
+        assert_eq!(cache.probe_values(&request), (None, false));
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -2927,7 +4020,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_probe_is_not_replayed_as_a_successful_empty_result() {
+    fn nonzero_probe_status_is_replayed_as_a_semantic_outcome() {
         let mut cache = CompletionCache::new(1024 * 1024, 128);
         let request = ProbeRequest {
             key: ProbeKey {
@@ -2957,7 +4050,7 @@ mod tests {
                 let outcome = outcome.expect("failed probes retain an explicit VM outcome");
                 assert_eq!(outcome.status, 1);
                 assert!(outcome.values.is_empty());
-                assert!(cache.probe_values(&request).0.is_none());
+                assert_eq!(cache.probe_values(&request).0, Some([].as_slice()));
                 break;
             }
             assert!(Instant::now() < deadline);

@@ -63,12 +63,18 @@ impl CompletionEngine {
         self.cache.configure_rules(paths, trusted_key_paths);
     }
 
+    pub fn prefetch_rules(&mut self, context: &CompletionContext) {
+        if let Some(command) = context.command_name.as_deref() {
+            let _ = self.cache.rule_programs(command);
+        }
+    }
+
     pub fn refresh(&mut self, shell: &ShellSnapshot) {
         self.cache.poll();
         // Prime the current directory before PATH directories so ordinary
         // path completion wins the worker queue at a fresh prompt.
         self.cache.refresh_directory(shell.cwd.clone());
-        self.cache.refresh_path(&shell.path);
+        self.cache.refresh_path(&shell.path, &shell.cwd);
         self.cache.load_snapshots(shell.home.clone());
     }
 
@@ -99,6 +105,7 @@ impl CompletionEngine {
     ) -> CompletionResult {
         self.cache.poll();
         if context.line.len() > MAX_COMPLETION_CONTEXT_BYTES {
+            self.cache.acknowledge_rule_chunk();
             return CompletionResult {
                 candidates: Vec::new(),
                 pending: false,
@@ -119,11 +126,13 @@ impl CompletionEngine {
             pending |= status.pending;
             path_completion = path_completion.merge(status.path_completion);
         }
+        self.cache.acknowledge_rule_chunk();
         if !pending {
             self.cache.finish_dynamic_replay();
         }
+        let candidates = sink.finish();
         CompletionResult {
-            candidates: sink.finish(),
+            candidates,
             pending,
         }
     }
@@ -217,8 +226,10 @@ impl CompletionEngine {
     }
 
     pub fn poll_background(&mut self) -> bool {
+        let generation = self.cache.response_generation();
         self.cache.poll();
-        self.cache.background_pending()
+        self.cache.acknowledge_rule_chunk();
+        self.cache.response_generation() != generation
     }
 
     pub fn background_pending(&self) -> bool {

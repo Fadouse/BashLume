@@ -3,7 +3,9 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 
@@ -15,6 +17,9 @@ use super::script::{
 
 pub const MAX_DISCOVERED_PACKS: usize = 128;
 pub const MAX_TRUSTED_KEYS: usize = 64;
+const MAX_DISCOVERY_PATHS: usize = 128;
+const MAX_DISCOVERY_PATH_BYTES: usize = 4096;
+const MAX_DISCOVERY_PATHS_BYTES: usize = 512 * 1024;
 pub const SUPPORTED_REQUIRED_OPCODES: u64 = 0;
 pub const ENGINE_VERSION: [u16; 3] = [0, 2, 0];
 
@@ -42,7 +47,7 @@ pub struct LoadedProgram {
     pub source: SourceKind,
     pub trust: TrustStatus,
     pub required_commands: Vec<String>,
-    pub program: CommandProgram,
+    pub program: Arc<CommandProgram>,
 }
 
 #[derive(Default)]
@@ -51,10 +56,30 @@ pub struct RuleStore {
     summaries: Vec<PackSummary>,
 }
 
+fn bounded_discovery_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut total_bytes = 0_usize;
+    paths
+        .iter()
+        .filter_map(|path| {
+            let bytes = path.as_os_str().as_bytes().len();
+            if bytes > MAX_DISCOVERY_PATH_BYTES
+                || total_bytes.saturating_add(bytes) > MAX_DISCOVERY_PATHS_BYTES
+            {
+                return None;
+            }
+            total_bytes = total_bytes.saturating_add(bytes);
+            Some(path.clone())
+        })
+        .take(MAX_DISCOVERY_PATHS)
+        .collect()
+}
+
 impl RuleStore {
     pub fn discover(paths: &[PathBuf], trusted_key_paths: &[PathBuf]) -> Self {
-        let (trusted_keys, key_errors) = load_trusted_keys(trusted_key_paths);
-        let mut files = discover_files(paths);
+        let trusted_key_paths = bounded_discovery_paths(trusted_key_paths);
+        let paths = bounded_discovery_paths(paths);
+        let (trusted_keys, key_errors) = load_trusted_keys(&trusted_key_paths);
+        let mut files = discover_files(&paths);
         files.sort_unstable();
         files.dedup();
         files.truncate(MAX_DISCOVERED_PACKS);
@@ -116,50 +141,100 @@ impl RuleStore {
         &self.summaries
     }
 
+    pub(crate) fn load_command_incremental(
+        &self,
+        command: &str,
+        mut emit: impl FnMut(Vec<LoadedProgram>, Vec<String>, bool) -> bool,
+    ) {
+        let mut matching = self
+            .packs
+            .iter()
+            .filter(|pack| pack.contains_command(command))
+            .collect::<Vec<_>>();
+        // Incremental consumers can use candidates from any source while the
+        // remaining sources decode. Prefer directly evaluable user/Zsh blocks
+        // for latency; consumers restore semantic source priority when merging
+        // each chunk.
+        matching.sort_by_key(|pack| match pack.source_kind() {
+            SourceKind::User => 0_u8,
+            SourceKind::Zsh => 1,
+            SourceKind::Fish => 2,
+            SourceKind::Bash => 3,
+        });
+        if matching.is_empty() {
+            let _ = emit(Vec::new(), Vec::new(), true);
+            return;
+        }
+        let last = matching.len() - 1;
+        for (index, pack) in matching.into_iter().enumerate() {
+            let (programs, errors) = load_pack_command(pack, command);
+            if !emit(programs, errors, index == last) {
+                return;
+            }
+        }
+    }
+
     pub fn load_command(&self, command: &str) -> (Vec<LoadedProgram>, Vec<String>) {
         let mut programs = Vec::new();
         let mut errors = Vec::new();
-        for pack in &self.packs {
-            if !pack.contains_command(command) {
-                continue;
-            }
-            let dialect = match pack.source_kind() {
-                SourceKind::Bash => ScriptDialect::Bash,
-                SourceKind::Zsh => ScriptDialect::Zsh,
-                SourceKind::Fish => ScriptDialect::Fish,
-                SourceKind::User => ScriptDialect::Bash,
-            };
-            match pack.load_matching_commands(command) {
-                Ok(matches) => {
-                    for program in matches {
-                        if !program
-                            .registrations
-                            .iter()
-                            .any(|name| registration_matches(dialect, name, command))
-                        {
-                            errors.push(format!(
-                                "{}: command block does not register {command}",
-                                pack.path().display()
-                            ));
-                            continue;
-                        }
-                        let required_commands = required_commands(&program);
-                        programs.push(LoadedProgram {
-                            pack_id: pack.pack_id(),
-                            pack_name: pack.manifest().pack_id.clone(),
-                            pack_version: pack.manifest().pack_version.clone(),
-                            source: pack.source_kind(),
-                            trust: pack.trust(),
-                            required_commands,
-                            program,
-                        });
-                    }
-                }
-                Err(error) => errors.push(format!("{}: {error}", pack.path().display())),
-            }
-        }
+        self.load_command_incremental(command, |loaded, load_errors, _| {
+            programs.extend(loaded);
+            errors.extend(load_errors);
+            true
+        });
+        sort_loaded_programs(&mut programs);
         (programs, errors)
     }
+}
+
+pub(crate) fn sort_loaded_programs(programs: &mut [LoadedProgram]) {
+    programs.sort_by(|left, right| {
+        right
+            .source
+            .priority()
+            .cmp(&left.source.priority())
+            .then_with(|| left.pack_name.cmp(&right.pack_name))
+    });
+}
+
+fn load_pack_command(pack: &PackFile, command: &str) -> (Vec<LoadedProgram>, Vec<String>) {
+    let dialect = match pack.source_kind() {
+        SourceKind::Bash => ScriptDialect::Bash,
+        SourceKind::Zsh => ScriptDialect::Zsh,
+        SourceKind::Fish => ScriptDialect::Fish,
+        SourceKind::User => ScriptDialect::Bash,
+    };
+    let mut programs = Vec::new();
+    let mut errors = Vec::new();
+    match pack.load_matching_commands(command) {
+        Ok(matches) => {
+            for program in matches {
+                if !program
+                    .registrations
+                    .iter()
+                    .any(|name| registration_matches(dialect, name, command))
+                {
+                    errors.push(format!(
+                        "{}: command block does not register {command}",
+                        pack.path().display()
+                    ));
+                    continue;
+                }
+                let required_commands = required_commands(&program);
+                programs.push(LoadedProgram {
+                    pack_id: pack.pack_id(),
+                    pack_name: pack.manifest().pack_id.clone(),
+                    pack_version: pack.manifest().pack_version.clone(),
+                    source: pack.source_kind(),
+                    trust: pack.trust(),
+                    required_commands,
+                    program: Arc::new(program),
+                });
+            }
+        }
+        Err(error) => errors.push(format!("{}: {error}", pack.path().display())),
+    }
+    (programs, errors)
 }
 
 fn required_commands(program: &CommandProgram) -> Vec<String> {
@@ -472,6 +547,50 @@ mod tests {
         assert!(version_at_least([1, 0, 0], [0, 99, 99]));
         assert!(version_at_least([0, 2, 1], [0, 2, 0]));
         assert!(!version_at_least([0, 1, 9], [0, 2, 0]));
+    }
+
+    #[test]
+    fn decoded_chunks_are_restored_to_semantic_source_priority() {
+        fn loaded(source: SourceKind, name: &str) -> LoadedProgram {
+            LoadedProgram {
+                pack_id: [source.priority(); 32],
+                pack_name: name.into(),
+                pack_version: "test".into(),
+                source,
+                trust: TrustStatus::Unsigned,
+                required_commands: Vec::new(),
+                program: Arc::new(CommandProgram {
+                    canonical_name: "demo".into(),
+                    registrations: vec!["demo".into()],
+                    source_path: "demo".into(),
+                    source_commit: "test".into(),
+                    license: "test".into(),
+                    static_rules: Vec::new(),
+                    probes: Vec::new(),
+                    scripts: Vec::new(),
+                }),
+            }
+        }
+
+        let mut programs = vec![
+            loaded(SourceKind::Zsh, "zsh"),
+            loaded(SourceKind::Fish, "fish"),
+            loaded(SourceKind::User, "user"),
+            loaded(SourceKind::Bash, "bash"),
+        ];
+        sort_loaded_programs(&mut programs);
+        assert_eq!(
+            programs
+                .iter()
+                .map(|program| program.source)
+                .collect::<Vec<_>>(),
+            [
+                SourceKind::User,
+                SourceKind::Bash,
+                SourceKind::Fish,
+                SourceKind::Zsh
+            ]
+        );
     }
 
     #[test]

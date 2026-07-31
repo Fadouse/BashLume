@@ -25,6 +25,7 @@ class Session:
         trusted_key: pathlib.Path | None,
         *,
         loader: pathlib.Path | None = None,
+        preload_commands: bytes | None = None,
     ) -> None:
         if (library is None) == (loader is None):
             raise ValueError("exactly one of library or loader is required")
@@ -58,11 +59,18 @@ class Session:
         self.output = bytearray()
         os.set_blocking(fd, False)
         self.read_for(0.2)
+        if preload_commands is not None:
+            self.send(preload_commands, 0.3)
         if loader is not None:
-            self.send(f"source {shlex.quote(str(loader))}\n".encode(), 0.5)
+            load_command = f"source {shlex.quote(str(loader))}\n".encode()
         else:
             assert library is not None
-            self.send(f"enable -f {library} bashlume\n".encode(), 0.5)
+            load_command = f"enable -f {library} bashlume\n".encode()
+        if preload_commands is not None:
+            # A preload may intentionally replace self-insert for Space. Use
+            # Readline quoted-insert so the plugin load command remains data.
+            load_command = load_command.replace(b" ", b"\x16 ")
+        self.send(load_command, 0.5)
 
     def read_for(self, seconds: float) -> bytes:
         start = len(self.output)
@@ -401,6 +409,8 @@ def main() -> int:
             session.send(b"printf '<%s>\\n' My", 0.2)
             session.send(b"\t", 0.3)
             quoted = session.send(b"\n", 0.4)
+            if b"<My File>" not in quoted:
+                quoted += session.send(b"\n", 0.4)
             require(
                 b"<My File>" in quoted,
                 "path containing a space was not quoted safely",
@@ -450,6 +460,10 @@ def main() -> int:
         session.send(b"zz_bashlume_al", 0.2)
         session.send(b"\t", 0.3)
         alias_result = session.send(b"\n", 0.4)
+        if b"ALIAS_OK" not in alias_result:
+            # A still-pending menu uses the first Enter to accept its selected
+            # candidate; the next Enter crosses the command boundary.
+            alias_result += session.send(b"\n", 0.4)
         require(b"ALIAS_OK" in alias_result, "alias completion was not refreshed", session.output)
 
         session.send(b"set -o vi\n", 0.3)
@@ -462,13 +476,123 @@ def main() -> int:
         searched = session.send(b"\n", 0.4)
         require(b"BASHLUME_SEARCH_OK" in searched, "Ctrl-R history search was broken", session.output)
 
-        session.send(b"enable -d bashlume\n", 0.4)
+        removed = session.send(
+            b"enable -d bashlume\n"
+            b"if [[ -z $(type -t bashlume) ]]; then printf 'BASHLUME_REMOVED_OK\\n'; fi\n",
+            0.4,
+        )
+        require(
+            b"BASHLUME_REMOVED_OK" in removed,
+            "enable -d did not remove the BashLume builtin",
+            session.output,
+        )
         unloaded = session.send(b"printf 'BASHLUME_UNLOAD_OK\\n'\n", 0.3)
         require(b"BASHLUME_UNLOAD_OK" in unloaded, "unload did not restore Readline", session.output)
+        forked = session.send(b"/bin/true\nprintf 'BASHLUME_POST_UNLOAD_FORK_OK\\n'\n", 0.4)
+        require(
+            b"BASHLUME_POST_UNLOAD_FORK_OK" in forked,
+            "post-unload atfork callback referenced unmapped code",
+            session.output,
+        )
+        session.send(b"bind '\"\\C-x\\C-b\": bashlume-enter'\n", 0.2)
+        session.send(b"printf 'BASHLUME_POST_UNLOAD_DEFUN_OK\\n'", 0.1)
+        defun = session.send(b"\x18\x02", 0.4)
+        require(
+            b"BASHLUME_POST_UNLOAD_DEFUN_OK" in defun,
+            "post-unload Readline defun callback was unsafe",
+            session.output,
+        )
+        # NODELETE intentionally keeps defuns callable. If a user binds Enter
+        # to that retained wrapper, a reload must not save the wrapper itself
+        # as its own fallback and recurse.
+        library_arg = shlex.quote(str(library)).encode()
+        session.send(b"bind '\"\\C-M\": bashlume-enter'\n", 0.2)
+        session.send(b"enable -f " + library_arg + b" bashlume\n", 0.4)
+        reloaded = session.send(b"printf 'BASHLUME_RELOAD_FALLBACK_OK\\n'\n", 0.4)
+        require(
+            b"BASHLUME_RELOAD_FALLBACK_OK" in reloaded,
+            "reload created a self-recursive Readline fallback",
+            session.output,
+        )
+        session.send(b"enable -d bashlume\n", 0.3)
+        session.send(
+            b"bind '\"\\C-i\": bashlume-enter'\n"
+            b"bind '\"\\C-M\": bashlume-complete'\n",
+            0.3,
+        )
+        session.send(b"enable -f " + library_arg + b" bashlume\n", 0.4)
+        session.send(b"bashlume disable\n", 0.3)
+        session.send(b"\t\x15", 0.2)
+        cycle = session.send(b"printf 'BASHLUME_CROSS_FALLBACK_OK\\n'\n", 0.4)
+        require(
+            b"BASHLUME_CROSS_FALLBACK_OK" in cycle,
+            "cross-bound retained defuns formed a recursive fallback cycle",
+            session.output,
+        )
+        session.send(b"enable -d bashlume\n", 0.3)
     finally:
         session.close()
         if temporary_rules is not None:
             temporary_rules.cleanup()
+
+    custom_binding_session = Session(
+        library,
+        bash,
+        None,
+        None,
+        preload_commands=(
+            b"bind '\"\\e\": backward-char'\n"
+            b"bind '\" \": \"_\"'\n"
+        ),
+    )
+    try:
+        prefix_binding = custom_binding_session.send(
+            b"bind\x16 -q\x16 backward-char\n", 0.3
+        )
+        require(
+            b'"\\e"' in prefix_binding,
+            "loading BashLume replaced a proper-prefix Readline binding",
+            custom_binding_session.output,
+        )
+        custom_line = custom_binding_session.send(b"echo SPACE_MACRO", 0.3)
+        require(
+            b"echo_SPACE_MACRO" in custom_line,
+            "loading BashLume replaced a pre-existing Readline space macro",
+            custom_binding_session.output,
+        )
+        custom_binding_session.send(b"\x15", 0.1)
+        custom_binding_session.send(b"enable\x16 -d\x16 bashlume\n", 0.3)
+        restored_prefix = custom_binding_session.send(
+            b"bind\x16 -q\x16 backward-char\n", 0.3
+        )
+        require(
+            b'"\\e"' in restored_prefix,
+            "unloading BashLume failed to preserve a proper-prefix binding",
+            custom_binding_session.output,
+        )
+    finally:
+        custom_binding_session.close()
+
+    abort_binding_session = Session(
+        library,
+        bash,
+        None,
+        None,
+        preload_commands=b"bind '\"\\C-i\": abort'\n",
+    )
+    try:
+        abort_binding_session.send(b"printf ABORT_FALLBACK", 0.1)
+        abort_binding_session.send(b"\t\x15", 0.2)
+        alive = abort_binding_session.send(
+            b"printf 'BASHLUME_ABORT_FALLBACK_OK\\n'\n", 0.4
+        )
+        require(
+            b"BASHLUME_ABORT_FALLBACK_OK" in alive,
+            "an intercepted saved abort binding crossed Rust frames",
+            abort_binding_session.output,
+        )
+    finally:
+        abort_binding_session.close()
 
     print("PTY smoke test passed")
     return 0
