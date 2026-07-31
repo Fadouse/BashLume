@@ -276,18 +276,24 @@ struct ProbeClient {
 }
 
 impl ProbeClient {
-    fn start() -> std::io::Result<Self> {
+    fn start(initial_generation: u64) -> std::io::Result<Self> {
         let (request_tx, request_rx) = mpsc::sync_channel(MAX_PROBE_WORKER_REQUESTS);
         let (response_tx, response_rx) = mpsc::sync_channel(MAX_PROBE_WORKER_RESPONSES);
         let stop = Arc::new(AtomicBool::new(false));
-        let generation = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(initial_generation));
         let worker_stop = Arc::clone(&stop);
         let worker_generation = Arc::clone(&generation);
         let handle = thread::Builder::new()
             .name("bashlume-probes".into())
             .stack_size(256 * 1024)
             .spawn(move || {
-                probe_worker_loop(request_rx, response_tx, worker_stop, worker_generation)
+                probe_worker_loop(
+                    request_rx,
+                    response_tx,
+                    worker_stop,
+                    worker_generation,
+                    initial_generation,
+                )
             })?;
         Ok(Self {
             requests: Some(request_tx),
@@ -616,7 +622,7 @@ impl CompletionCache {
     pub fn new(byte_limit: usize, max_candidates: usize) -> Self {
         Self {
             worker: WorkerClient::start().ok(),
-            probe_worker: ProbeClient::start().ok(),
+            probe_worker: None,
             entries: HashMap::new(),
             pending: HashSet::new(),
             scan_deferred: HashSet::new(),
@@ -1158,7 +1164,7 @@ impl CompletionCache {
         if self.probe_errors.len() > 128 {
             self.probe_errors.drain(..self.probe_errors.len() - 128);
         }
-        self.probe_worker = ProbeClient::start().ok();
+        self.probe_worker = ProbeClient::start(0).ok();
     }
 
     pub fn probe_outcome(&mut self, request: &ProbeRequest) -> (Option<ProbeResult>, bool) {
@@ -1192,6 +1198,9 @@ impl CompletionCache {
                 .probe_entries
                 .get(&cache_key)
                 .is_none_or(|entry| entry.refreshed_at.elapsed() >= entry.ttl);
+        if stale && self.probe_worker.is_none() {
+            self.probe_worker = ProbeClient::start(self.probe_generation).ok();
+        }
         let mut deferred = false;
         if stale && !self.probe_pending.contains(&cache_key) {
             if self.probe_pending.len() >= MAX_PENDING_PROBES {
@@ -2192,11 +2201,12 @@ fn probe_worker_loop(
     responses: SyncSender<ProbeResponse>,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    initial_generation: u64,
 ) {
     let _signal_mask = SignalMaskGuard::block_sigchld().ok();
     let mut probes = ProbeSupervisor::default();
     let mut probe_generations = HashMap::<ProbeCacheKey, u64>::new();
-    let mut observed_generation = 0_u64;
+    let mut observed_generation = initial_generation;
     loop {
         if stop.load(Ordering::Acquire) {
             probes.cancel_all();
@@ -3865,6 +3875,66 @@ mod tests {
         assert!(cache.probe_rejected.contains(&probe_cache_hash(&cache_key)));
         assert_eq!(cache.probe_values(&request), (None, false));
         assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn newly_started_probe_worker_acknowledges_an_immediate_cancel() {
+        let mut worker = ProbeClient::start(7).unwrap();
+        let cancelled_generation = worker.cancel();
+        assert_eq!(cancelled_generation, 8);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match worker.try_receive() {
+                Ok(ProbeResponse::Cancelled { generation }) => {
+                    assert_eq!(generation, cancelled_generation);
+                    break;
+                }
+                Ok(ProbeResponse::Outcome { .. }) | Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => panic!("probe worker disconnected"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker.stop();
+    }
+
+    #[test]
+    fn lazy_probe_worker_inherits_the_cache_generation() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        assert!(cache.probe_worker.is_none());
+        cache.probe_generation = 7;
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "printf".into(),
+                arguments: vec!["generation\n".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:lazy-generation".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1000,
+            output_limit: 4096,
+            cache_ttl_ms: 10_000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        assert!(cache.probe_values(&request).1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cache.poll();
+            let (values, pending) = cache.probe_values(&request);
+            if let Some(values) = values {
+                assert_eq!(values, ["generation"]);
+                assert!(!pending);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

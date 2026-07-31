@@ -385,6 +385,14 @@ impl CompletionProvider for RuleProvider {
         let Some(programs) = programs else {
             return status;
         };
+        if programs.is_empty() {
+            self.replay_states.clear();
+            self.quick_provisional = Arc::default();
+            self.quick_path_completion = PathCompletion::Inherit;
+            self.quick_redraws = 0;
+            self.quick_evaluated = false;
+            return status;
+        }
         status.pending |= cache.snapshots_pending();
         let fish_program_count = programs
             .iter()
@@ -1426,6 +1434,9 @@ fn complete_nested_rules(
     let Some(programs) = programs else {
         return status;
     };
+    if programs.is_empty() {
+        return status;
+    }
     let (mut available_commands, shell_commands, command_snapshot_pending) =
         command_snapshot(shell, cache);
     status.pending |= command_snapshot_pending;
