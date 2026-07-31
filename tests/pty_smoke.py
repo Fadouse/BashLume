@@ -137,6 +137,12 @@ def require(condition: bool, message: str, output: bytes) -> None:
     raise AssertionError(f"{message}\n--- PTY transcript ---\n{rendered}")
 
 
+def readline_binding_report(output: bytes, function: bytes) -> bytes | None:
+    marker = function + b" can be invoked via "
+    reports = [line.rstrip(b"\r") for line in output.splitlines() if marker in line]
+    return reports[-1] if reports else None
+
+
 def signal_mask(pid: int) -> int:
     for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines():
         if line.startswith("SigBlk:"):
@@ -542,15 +548,25 @@ def main() -> int:
         None,
         preload_commands=(
             b"bind '\"\\e\": backward-char'\n"
+            b"bind -q backward-char\n"
             b"bind '\" \": \"_\"'\n"
         ),
     )
     try:
+        original_prefix_binding = readline_binding_report(
+            custom_binding_session.output, b"backward-char"
+        )
+        require(
+            original_prefix_binding is not None,
+            "could not observe the pre-load proper-prefix Readline binding",
+            custom_binding_session.output,
+        )
         prefix_binding = custom_binding_session.send(
             b"bind\x16 -q\x16 backward-char\n", 0.3
         )
         require(
-            b'"\\e"' in prefix_binding,
+            readline_binding_report(prefix_binding, b"backward-char")
+            == original_prefix_binding,
             "loading BashLume replaced a proper-prefix Readline binding",
             custom_binding_session.output,
         )
@@ -566,7 +582,8 @@ def main() -> int:
             b"bind\x16 -q\x16 backward-char\n", 0.3
         )
         require(
-            b'"\\e"' in restored_prefix,
+            readline_binding_report(restored_prefix, b"backward-char")
+            == original_prefix_binding,
             "unloading BashLume failed to preserve a proper-prefix binding",
             custom_binding_session.output,
         )
