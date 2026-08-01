@@ -202,6 +202,9 @@ impl PluginState {
             self.config.rule_paths.clone(),
             self.config.trusted_rule_key_paths.clone(),
         );
+        if !self.config.ghost_enabled {
+            self.last_ghost = None;
+        }
         unsafe { self.sync_event_hook() };
     }
 
@@ -317,7 +320,7 @@ impl PluginState {
             self.refresh_menu(&line, &context);
         }
 
-        if !vi_command_mode {
+        if !vi_command_mode && self.config.ghost_enabled {
             self.last_ghost = self
                 .menu
                 .as_ref()
@@ -327,6 +330,8 @@ impl PluginState {
                     self.completion
                         .ghost(&context, &self.shell, self.config.max_candidates)
                 });
+        } else {
+            self.last_ghost = None;
         }
 
         if !self.syntax_attempted && !line.is_empty() {

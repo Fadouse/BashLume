@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `BASHLUME_GHOST=off` to disable ghost suggestions while retaining Tab completion.
 - Pin the published Bash, Fish, and Zsh v0.2.0 Stable packs by immutable release URL and SHA-256.
 - Add signature-verifying Nix outputs for each Stable pack, the default core-plus-Bash package, and an optional all-rules package.
 - Make `bashlume reload` rediscover unchanged rule paths so pack installation, rollback, and restoration take effect immediately.

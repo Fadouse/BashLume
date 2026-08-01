@@ -157,6 +157,9 @@ BASHLUME_CACHE_MIB=64
 BASHLUME_MAX_CANDIDATES=4096
 BASHLUME_MENU_ROWS=10
 
+# on (default) | off
+BASHLUME_GHOST=on
+
 # selected (default) | inline | off
 BASHLUME_MENU_DESCRIPTIONS=selected
 

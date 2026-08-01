@@ -54,6 +54,7 @@ pub struct Theme {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub enabled: bool,
+    pub ghost_enabled: bool,
     pub colors_enabled: bool,
     pub highlight: HighlightMode,
     pub diagnostics: DiagnosticsMode,
@@ -71,6 +72,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
+            ghost_enabled: true,
             colors_enabled: true,
             highlight: HighlightMode::Errors,
             diagnostics: DiagnosticsMode::Marker,
@@ -117,6 +119,9 @@ impl Config {
 
         if let Some(value) = unsafe { shell_var("BASHLUME_ENABLED") } {
             config.enabled = parse_bool(&value, true);
+        }
+        if let Some(value) = unsafe { shell_var("BASHLUME_GHOST") } {
+            config.ghost_enabled = parse_bool(&value, true);
         }
         let no_color = unsafe { shell_var("NO_COLOR") }.is_some()
             || unsafe { shell_var("BASHLUME_NO_COLOR") }
@@ -363,6 +368,15 @@ mod tests {
         assert_eq!(parse_highlight_mode("errors"), HighlightMode::Errors);
         assert_eq!(parse_highlight_mode("full"), HighlightMode::Full);
         assert_eq!(parse_highlight_mode("off"), HighlightMode::Off);
+    }
+
+    #[test]
+    fn boolean_configuration_recognizes_disabled_values() {
+        for value in ["0", "false", "no", "off"] {
+            assert!(!parse_bool(value, true));
+        }
+        assert!(parse_bool("on", true));
+        assert!(parse_bool("", true));
     }
 
     #[test]

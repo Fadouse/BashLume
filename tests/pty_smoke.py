@@ -34,6 +34,7 @@ class Session:
             environment = os.environ.copy()
             for name in (
                 "BASHLUME_DISABLE",
+                "BASHLUME_GHOST",
                 "BASHLUME_LIBRARY",
                 "BASHLUME_RULE_PATH",
                 "BASHLUME_TRUSTED_KEY_PATHS",
@@ -371,6 +372,32 @@ def main() -> int:
         )
         session.send(b"\x15", 0.2)
         session.send(b"BASHLUME_DIAGNOSTICS=marker bashlume reload\n", 0.3)
+
+        session.send(b"echo BASHLUME_GHOST_DISABLED_SUFFIX\n", 0.3)
+        session.send(b"BASHLUME_GHOST=off bashlume reload\n", 0.3)
+        disabled_ghost = session.send(b"echo BASHLUME_GHOST_DIS", 0.4)
+        require(
+            b"ABLED_SUFFIX" not in disabled_ghost,
+            "ghost suggestion was rendered while disabled",
+            session.output,
+        )
+        session.send(b"\x1b[C", 0.1)
+        disabled_accept = session.send(b"\n", 0.4)
+        require(
+            b"BASHLUME_GHOST_DISABLED_SUFFIX" not in disabled_accept,
+            "Right Arrow accepted a ghost suggestion while disabled",
+            session.output,
+        )
+        disabled_menu = session.send(b"who", 0.2) + session.send(b"\t", 0.5)
+        if b"whoami" not in disabled_menu:
+            disabled_menu += session.send(b"\t", 0.4)
+        require(
+            b"whoami" in disabled_menu,
+            "disabling ghost suggestions also disabled Tab completion",
+            session.output,
+        )
+        session.send(b"\x07\x15", 0.2)
+        session.send(b"BASHLUME_GHOST=on bashlume reload\n", 0.3)
 
         session.send(b"echo BASHLUME_HISTORY_ACCEPTED\n", 0.3)
         ghost = session.send(b"echo BASHLUME_HIST", 0.4)
