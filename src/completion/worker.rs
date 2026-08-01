@@ -6,21 +6,30 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::matcher::match_score;
-use crate::rules::loader::{LoadedProgram, PackSummary, RuleStore, sort_loaded_programs};
-use crate::rules::probe::ProbeSupervisor;
+use crate::rules::loader::{
+    LoadedProgram, PackSummary, RuleStore, pack_summaries_bytes, sort_loaded_programs,
+};
+use crate::rules::probe::{MAX_PARSED_PROBE_VALUES, MAX_PROBE_VALUE_BYTES, ProbeSupervisor};
 use crate::rules::vm::{FilesystemRequest, ProbeKey, ProbeRequest, ProbeResult};
 
 const MAX_PATH_DIRECTORIES: usize = 256;
 const MAX_PATH_COMPONENT_BYTES: usize = 4096;
 const MAX_PATH_SNAPSHOT_BYTES: usize = 512 * 1024;
+// Covers simultaneous account records, host collection/hash state, bounded
+// process metadata, network names, and one response while the previous
+// retained snapshot remains live.
+const MAX_SNAPSHOT_LOAD_RESERVATION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RULE_CONFIGURATION_PATHS: usize = 128;
 const MAX_RULE_CONFIGURATION_BYTES: usize = 512 * 1024;
+const MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES: usize = 2 * std::mem::size_of::<Vec<PathBuf>>()
+    + MAX_RULE_CONFIGURATION_PATHS * std::mem::size_of::<PathBuf>()
+    + MAX_RULE_CONFIGURATION_BYTES;
 const MAX_FILESYSTEM_CACHE_ENTRIES: usize = 128;
 const FILESYSTEM_CACHE_TTL: Duration = Duration::from_secs(2);
 const MAX_DIRECTORY_CACHE_ENTRIES: usize = 4096;
@@ -31,15 +40,54 @@ const MAX_WORKER_RESPONSES: usize = 8;
 const MAX_PENDING_SCANS: usize = 512;
 const MAX_PENDING_RULE_REQUESTS: usize = 512;
 const MAX_RULE_LOOKUP_BYTES: usize = 4096;
+const MAX_RULE_ADMISSION_BYTES: usize =
+    2 * (std::mem::size_of::<String>() + MAX_RULE_LOOKUP_BYTES) + 64;
 const MAX_RULE_REJECTIONS: usize = 4096;
 const MAX_PROBE_REJECTIONS: usize = 1024;
 const MAX_PROBE_WORKER_REQUESTS: usize = 8;
 const MAX_PROBE_WORKER_RESPONSES: usize = 8;
 const MAX_PENDING_PROBES: usize = 32;
 const PROBE_CANCELLATION_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const MIN_RULE_BYTES_FOR_ALLOCATOR_TRIM: usize = 1024 * 1024;
+const MAX_PROBE_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAX_PROBE_DIAGNOSTIC_FIELD_BYTES: usize = 2048;
+const MAX_REPLAY_RESERVATION_BYTES: usize = 8 * 1024 * 1024;
 
 static MAIN_PROBE_MASK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MAIN_PROBE_SIGCHLD_WAS_BLOCKED: AtomicBool = AtomicBool::new(false);
+static DETACHED_PROBE_BYTES: AtomicUsize = AtomicUsize::new(0);
+const PROBE_CLEANUP_FINISHED: usize = usize::MAX;
+
+fn retain_detached_probe_bytes(state: &AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    DETACHED_PROBE_BYTES.fetch_add(bytes, Ordering::AcqRel);
+    if state
+        .compare_exchange(0, bytes, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // The worker completed between is_finished() and reservation transfer.
+        DETACHED_PROBE_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+fn release_detached_probe_bytes(state: &AtomicUsize) {
+    let bytes = state.swap(PROBE_CLEANUP_FINISHED, Ordering::AcqRel);
+    if bytes != 0 && bytes != PROBE_CLEANUP_FINISHED {
+        DETACHED_PROBE_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+struct ProbeCleanupReservation {
+    state: Arc<AtomicUsize>,
+}
+
+impl Drop for ProbeCleanupReservation {
+    fn drop(&mut self) {
+        release_detached_probe_bytes(&self.state);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
@@ -106,10 +154,12 @@ enum Request {
         paths: Vec<PathBuf>,
         trusted_key_paths: Vec<PathBuf>,
         generation: u64,
+        byte_limit: usize,
     },
     LoadRules {
         command: String,
         generation: u64,
+        byte_limit: usize,
     },
     Stop,
 }
@@ -143,6 +193,7 @@ enum Response {
     },
     RuleCatalog {
         summaries: Vec<PackSummary>,
+        approximate_bytes: usize,
         generation: u64,
     },
     Rules {
@@ -152,6 +203,7 @@ enum Response {
         approximate_bytes: usize,
         generation: u64,
         complete: bool,
+        rejected: bool,
     },
 }
 
@@ -161,6 +213,7 @@ pub struct WorkerClient {
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     filesystem_generation: Arc<AtomicU64>,
+    rule_generation: Arc<AtomicU64>,
     rule_chunk_ack: Arc<AtomicBool>,
 }
 
@@ -170,10 +223,16 @@ impl WorkerClient {
         let (response_tx, response_rx) = mpsc::sync_channel(MAX_WORKER_RESPONSES);
         let stop = Arc::new(AtomicBool::new(false));
         let filesystem_generation = Arc::new(AtomicU64::new(0));
+        let rule_generation = Arc::new(AtomicU64::new(0));
         let rule_chunk_ack = Arc::new(AtomicBool::new(true));
         let worker_stop = Arc::clone(&stop);
         let worker_filesystem_generation = Arc::clone(&filesystem_generation);
+        let worker_rule_generation = Arc::clone(&rule_generation);
         let worker_rule_chunk_ack = Arc::clone(&rule_chunk_ack);
+        // Block before pthread creation so the new thread cannot receive a
+        // process-directed SIGCHLD in the gap before worker_loop installs its
+        // lifetime mask.
+        let spawn_signal_mask = SignalMaskGuard::block_sigchld()?;
         let handle = thread::Builder::new()
             .name("bashlume-cache".into())
             .stack_size(256 * 1024)
@@ -183,15 +242,18 @@ impl WorkerClient {
                     response_tx,
                     worker_stop,
                     worker_filesystem_generation,
+                    worker_rule_generation,
                     worker_rule_chunk_ack,
                 )
             })?;
+        drop(spawn_signal_mask);
         Ok(Self {
             requests: Some(request_tx),
             responses: response_rx,
             handle: Some(handle),
             stop,
             filesystem_generation,
+            rule_generation,
             rule_chunk_ack,
         })
     }
@@ -207,6 +269,15 @@ impl WorkerClient {
         self.filesystem_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
+    }
+
+    fn set_filesystem_generation(&self, generation: u64) {
+        self.filesystem_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn set_rule_generation(&self, generation: u64) {
+        self.rule_generation.store(generation, Ordering::Release);
     }
 
     fn try_receive(&self) -> Result<Response, TryRecvError> {
@@ -273,6 +344,7 @@ struct ProbeClient {
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    cleanup_reservation: Arc<AtomicUsize>,
 }
 
 impl ProbeClient {
@@ -283,10 +355,16 @@ impl ProbeClient {
         let generation = Arc::new(AtomicU64::new(initial_generation));
         let worker_stop = Arc::clone(&stop);
         let worker_generation = Arc::clone(&generation);
+        let cleanup_reservation = Arc::new(AtomicUsize::new(0));
+        let worker_cleanup_reservation = Arc::clone(&cleanup_reservation);
+        let spawn_signal_mask = SignalMaskGuard::block_sigchld()?;
         let handle = thread::Builder::new()
             .name("bashlume-probes".into())
             .stack_size(256 * 1024)
             .spawn(move || {
+                let _cleanup_reservation = ProbeCleanupReservation {
+                    state: worker_cleanup_reservation,
+                };
                 probe_worker_loop(
                     request_rx,
                     response_tx,
@@ -295,12 +373,14 @@ impl ProbeClient {
                     initial_generation,
                 )
             })?;
+        drop(spawn_signal_mask);
         Ok(Self {
             requests: Some(request_tx),
             responses: response_rx,
             handle: Some(handle),
             stop,
             generation,
+            cleanup_reservation,
         })
     }
 
@@ -330,7 +410,7 @@ impl ProbeClient {
         self.responses.try_recv()
     }
 
-    fn stop(&mut self) {
+    fn stop_with_reservation(&mut self, reservation_bytes: usize) {
         let Some(handle) = self.handle.take() else {
             return;
         };
@@ -342,7 +422,21 @@ impl ProbeClient {
                 Err(TrySendError::Full(_)) => {}
             }
         }
-        let _ = handle.join();
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            // A target in uninterruptible sleep must not extend the 250 ms
+            // command-acceptance boundary. Detach this cleanup owner: its
+            // helper anchors, memory reservation, and process-global slots
+            // remain live until it can finish. A replacement worker observes
+            // both global limits.
+            retain_detached_probe_bytes(&self.cleanup_reservation, reservation_bytes);
+            drop(handle);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop_with_reservation(0);
     }
 }
 
@@ -368,10 +462,45 @@ struct FilesystemCacheEntry {
     refreshed_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RuleLoadReservation {
+    generation: u64,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuleCatalogReservation {
+    generation: u64,
+    bytes: usize,
+}
+
 struct RuleCacheEntry {
     programs: Arc<Vec<LoadedProgram>>,
     approximate_bytes: usize,
     last_used: u64,
+    revision: u64,
+}
+
+struct PendingRuleChunks {
+    programs: Vec<LoadedProgram>,
+    errors: Vec<String>,
+    approximate_program_bytes: usize,
+}
+
+impl PendingRuleChunks {
+    fn approximate_bytes(&self, command: &str) -> usize {
+        self.approximate_program_bytes
+            .saturating_add(
+                self.programs
+                    .capacity()
+                    .saturating_sub(self.programs.len())
+                    .saturating_mul(std::mem::size_of::<LoadedProgram>()),
+            )
+            .saturating_add(owned_strings_bytes(&self.errors))
+            .saturating_add(command.len())
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
+    }
 }
 
 struct ProbeCacheEntry {
@@ -383,6 +512,17 @@ struct ProbeCacheEntry {
     ttl: Duration,
     approximate_bytes: usize,
     last_used: u64,
+}
+
+fn bounded_utf8_prefix(value: &str, maximum: usize) -> &str {
+    if value.len() <= maximum {
+        return value;
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn owned_strings_bytes(values: &Vec<String>) -> usize {
@@ -413,7 +553,7 @@ fn bounded_configuration_paths(
 ) -> (Vec<PathBuf>, bool) {
     let mut bounded = Vec::new();
     let mut truncated = false;
-    for path in paths {
+    for mut path in paths {
         let bytes = path.as_os_str().as_bytes().len();
         if *remaining_count == 0 || bytes > MAX_PATH_COMPONENT_BYTES || bytes > *remaining_bytes {
             truncated = true;
@@ -421,9 +561,30 @@ fn bounded_configuration_paths(
         }
         *remaining_count -= 1;
         *remaining_bytes -= bytes;
+        // Do not retain an attacker-controlled spare OsString capacity.
+        path.shrink_to_fit();
         bounded.push(path);
     }
+    bounded.shrink_to_fit();
     (bounded, truncated)
+}
+
+fn rule_configuration_bytes(paths: &[PathBuf], trusted_key_paths: &[PathBuf]) -> usize {
+    2_usize
+        .saturating_mul(std::mem::size_of::<Vec<PathBuf>>())
+        .saturating_add(
+            paths
+                .len()
+                .saturating_add(trusted_key_paths.len())
+                .saturating_mul(std::mem::size_of::<PathBuf>()),
+        )
+        .saturating_add(
+            paths
+                .iter()
+                .chain(trusted_key_paths)
+                .map(|path| path.as_os_str().as_bytes().len())
+                .sum::<usize>(),
+        )
 }
 
 fn rule_command_hash(command: &str) -> u64 {
@@ -468,14 +629,31 @@ fn probe_key_bytes(cache_key: &ProbeCacheKey) -> usize {
 }
 
 fn probe_admission_bytes(request: &ProbeRequest, cache_key: &ProbeCacheKey) -> usize {
+    let output_bytes = request.output_limit as usize;
+    // Invalid UTF-8 can expand to one three-byte replacement character per
+    // input byte before accepted fields are copied into owned strings. The
+    // parsed vector is independently bounded by count and per-value length.
+    let parsed_string_bytes = output_bytes
+        .saturating_mul(char::REPLACEMENT_CHARACTER.len_utf8())
+        .min(MAX_PARSED_PROBE_VALUES.saturating_mul(MAX_PROBE_VALUE_BYTES));
+    let parsed_slots = MAX_PARSED_PROBE_VALUES.saturating_mul(
+        std::mem::size_of::<String>().saturating_add(2 * std::mem::size_of::<usize>()),
+    );
+    // During execution the same identity is retained by the main-thread
+    // pending/admission maps, the worker request or active record, the
+    // supervisor de-duplication set, and the generation map. Reserve all of
+    // those bounded copies rather than accounting only the raw output bytes.
     probe_key_bytes(cache_key)
-        .saturating_mul(2)
+        .saturating_mul(5)
         .saturating_add(request.probe_id.capacity())
         .saturating_add(request.description.as_ref().map_or(0, String::capacity))
-        // Reserve the declared output ceiling while the worker or bounded
-        // response channel owns an outcome that has not yet been consumed.
-        .saturating_add(request.output_limit as usize)
-        .saturating_add(128)
+        // Parsing can simultaneously retain the bounded raw byte vector, a
+        // lossy UTF-8 buffer, and copied accepted strings. Reserve all three
+        // representations rather than only the largest one.
+        .saturating_add(output_bytes)
+        .saturating_add(parsed_string_bytes.saturating_mul(2))
+        .saturating_add(parsed_slots)
+        .saturating_add(256)
 }
 
 struct SignalMaskGuard {
@@ -585,25 +763,33 @@ pub struct CompletionCache {
     filesystem_generation: u64,
     byte_limit: usize,
     used_bytes: usize,
+    replay_reserved_bytes: usize,
     clock: u64,
     max_candidates: usize,
     snapshot_pending: bool,
     snapshot_deferred: bool,
+    snapshot_unavailable: bool,
     snapshot_generation: u64,
     snapshot_inflight_generation: Option<u64>,
+    snapshot_reservation: Option<(u64, usize)>,
     snapshot_home: Option<PathBuf>,
     rule_generation: u64,
     rule_catalog_ready: bool,
     rule_summaries: Vec<PackSummary>,
+    rule_store_bytes: usize,
     rule_entries: HashMap<String, RuleCacheEntry>,
+    pending_rule_chunks: HashMap<String, PendingRuleChunks>,
     rule_pending: HashSet<String>,
     rule_deferred: HashSet<String>,
+    rule_load_reservation: Option<RuleLoadReservation>,
     rule_rejected: HashSet<u64>,
     rule_rejection_saturated: bool,
     rule_chunk_ready_to_ack: bool,
     rule_catalog_deferred: bool,
+    rule_catalog_reservation: Option<RuleCatalogReservation>,
     rule_errors: Vec<String>,
     rule_configuration: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
+    rule_configuration_bytes: usize,
     probe_entries: HashMap<ProbeCacheKey, ProbeCacheEntry>,
     probe_pending: HashSet<ProbeCacheKey>,
     probe_admissions: HashMap<(u64, ProbeCacheKey), usize>,
@@ -648,25 +834,33 @@ impl CompletionCache {
             filesystem_generation: 0,
             byte_limit,
             used_bytes: 0,
+            replay_reserved_bytes: 0,
             clock: 0,
             max_candidates,
             snapshot_pending: false,
             snapshot_deferred: false,
+            snapshot_unavailable: false,
             snapshot_generation: 0,
             snapshot_inflight_generation: None,
+            snapshot_reservation: None,
             snapshot_home: None,
             rule_generation: 0,
             rule_catalog_ready: true,
             rule_summaries: Vec::new(),
+            rule_store_bytes: 0,
             rule_entries: HashMap::new(),
+            pending_rule_chunks: HashMap::new(),
             rule_pending: HashSet::new(),
             rule_deferred: HashSet::new(),
+            rule_load_reservation: None,
             rule_rejected: HashSet::new(),
             rule_rejection_saturated: false,
             rule_chunk_ready_to_ack: false,
             rule_catalog_deferred: false,
+            rule_catalog_reservation: None,
             rule_errors: Vec::new(),
             rule_configuration: None,
+            rule_configuration_bytes: 0,
             probe_entries: HashMap::new(),
             probe_pending: HashSet::new(),
             probe_admissions: HashMap::new(),
@@ -682,8 +876,38 @@ impl CompletionCache {
         }
     }
 
+    fn restart_worker_for_rule_boundary(&mut self) {
+        let retry_snapshot =
+            self.snapshot_pending || self.snapshot_deferred || self.snapshot_reservation.is_some();
+        if let Some(mut worker) = self.worker.take() {
+            worker.stop();
+        }
+        self.worker = WorkerClient::start().ok();
+        if let Some(worker) = &self.worker {
+            worker.set_filesystem_generation(self.filesystem_generation);
+            worker.set_rule_generation(self.rule_generation);
+        }
+        self.rule_load_reservation = None;
+        self.rule_catalog_reservation = None;
+        self.snapshot_reservation = None;
+        self.snapshot_pending = false;
+        self.snapshot_inflight_generation = None;
+        self.snapshot_deferred = retry_snapshot && self.worker.is_some();
+        self.pending.clear();
+        self.scan_deferred.clear();
+        self.scan_tokens.clear();
+        self.filesystem_pending.clear();
+        self.filesystem_pins.clear();
+        self.used_bytes = self.used_bytes.saturating_sub(self.rule_store_bytes);
+        self.rule_store_bytes = 0;
+        self.rule_summaries.clear();
+        self.clear_rule_requests();
+        self.clear_pending_rule_chunks();
+    }
+
     pub fn reconfigure(&mut self, byte_limit: usize, max_candidates: usize) {
-        if self.byte_limit != byte_limit {
+        let limit_changed = self.byte_limit != byte_limit;
+        if limit_changed {
             self.rule_rejected.clear();
             self.rule_rejection_saturated = false;
             self.probe_rejected.clear();
@@ -692,6 +916,59 @@ impl CompletionCache {
         self.byte_limit = byte_limit;
         self.max_candidates = max_candidates;
         self.evict_to_limit();
+        if self.capacity_accounted_bytes() > self.byte_limit && self.snapshot_bytes != 0 {
+            self.clear_snapshot_values();
+            self.evict_to_limit();
+        }
+        let retained_store_cannot_be_replaced = self.rule_store_bytes
+            > self
+                .rule_discovery_budget()
+                .saturating_sub(self.rule_configuration_bytes);
+        if limit_changed
+            && (self.capacity_accounted_bytes() > self.byte_limit
+                || retained_store_cannot_be_replaced)
+            && (self.rule_store_bytes != 0
+                || self.rule_load_reservation.is_some()
+                || self.rule_catalog_reservation.is_some()
+                || self.snapshot_reservation.is_some())
+        {
+            // A lower limit is a hard boundary, not transient pressure. Stop
+            // the worker so every old store/decode allocation is dropped,
+            // then rediscover under the new aggregate budget below.
+            self.restart_worker_for_rule_boundary();
+        }
+        if limit_changed {
+            let snapshot_intrinsically_unavailable = MAX_SNAPSHOT_LOAD_RESERVATION_BYTES
+                .saturating_add(MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES)
+                .saturating_add(MAX_RULE_ADMISSION_BYTES)
+                > self.byte_limit;
+            if snapshot_intrinsically_unavailable {
+                self.snapshot_pending = false;
+                self.snapshot_deferred = false;
+                self.snapshot_inflight_generation = None;
+                self.snapshot_reservation = None;
+                self.snapshot_unavailable = true;
+                self.clear_snapshot_values();
+            } else if self.snapshot_unavailable {
+                self.snapshot_unavailable = false;
+                self.snapshot_deferred = self.worker.is_some();
+            }
+        }
+        if limit_changed {
+            if let Some((paths, trusted_key_paths)) = self.rule_configuration.take() {
+                // The generation atomic cancels a decode using the old budget
+                // before its next command block allocation. Move the retained
+                // configuration instead of transiently cloning its full cap.
+                self.configure_rules(paths, trusted_key_paths);
+            } else {
+                self.rule_generation = self.rule_generation.wrapping_add(1);
+                if let Some(worker) = &self.worker {
+                    worker.set_rule_generation(self.rule_generation);
+                }
+                self.clear_rule_requests();
+                self.clear_pending_rule_chunks();
+            }
+        }
     }
 
     pub fn refresh_path(&mut self, path: &str, working_directory: &Path) {
@@ -742,8 +1019,26 @@ impl CompletionCache {
         }
     }
 
+    fn clear_snapshot_values(&mut self) {
+        if self.snapshot_bytes == 0 {
+            return;
+        }
+        self.used_bytes = self.used_bytes.saturating_sub(self.snapshot_bytes);
+        self.snapshot_bytes = 0;
+        self.users = Vec::new();
+        self.groups = Vec::new();
+        self.passwd_records = Vec::new();
+        self.group_records = Vec::new();
+        self.hosts = Vec::new();
+        self.process_ids = Vec::new();
+        self.process_names = Vec::new();
+        self.network_interfaces = Vec::new();
+        self.response_generation = self.response_generation.wrapping_add(1);
+    }
+
     pub fn load_snapshots(&mut self, home: Option<PathBuf>) {
         self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.snapshot_unavailable = false;
         self.snapshot_home =
             home.filter(|path| path.as_os_str().as_bytes().len() <= MAX_PATH_COMPONENT_BYTES);
         if self.snapshot_pending {
@@ -754,10 +1049,33 @@ impl CompletionCache {
     }
 
     fn retry_snapshot(&mut self) {
-        if self.snapshot_pending {
+        if self.snapshot_pending || self.snapshot_reservation.is_some() {
+            return;
+        }
+        if MAX_SNAPSHOT_LOAD_RESERVATION_BYTES
+            .saturating_add(MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES)
+            .saturating_add(MAX_RULE_ADMISSION_BYTES)
+            > self.byte_limit
+        {
+            self.snapshot_deferred = false;
+            self.snapshot_inflight_generation = None;
+            self.snapshot_unavailable = true;
+            self.clear_snapshot_values();
+            return;
+        }
+        self.evict_to_limit();
+        if self
+            .capacity_accounted_bytes()
+            .saturating_add(MAX_SNAPSHOT_LOAD_RESERVATION_BYTES)
+            > self.byte_limit
+        {
+            self.snapshot_deferred = self.worker.is_some();
+            self.snapshot_inflight_generation = None;
             return;
         }
         let generation = self.snapshot_generation;
+        // Reserve before cloning HOME into the bounded worker request.
+        self.snapshot_reservation = Some((generation, MAX_SNAPSHOT_LOAD_RESERVATION_BYTES));
         let sent = self.worker.as_ref().is_some_and(|worker| {
             worker.send(Request::LoadSnapshots {
                 home: self.snapshot_home.clone(),
@@ -767,15 +1085,22 @@ impl CompletionCache {
         if sent {
             self.snapshot_pending = true;
             self.snapshot_deferred = false;
+            self.snapshot_unavailable = false;
             self.snapshot_inflight_generation = Some(generation);
         } else {
+            self.snapshot_reservation = None;
             self.snapshot_deferred = self.worker.is_some();
+            self.snapshot_unavailable = self.worker.is_none();
             self.snapshot_inflight_generation = None;
         }
     }
 
     pub fn snapshots_pending(&self) -> bool {
         self.snapshot_pending || self.snapshot_deferred
+    }
+
+    pub fn snapshots_unavailable(&self) -> bool {
+        self.snapshot_unavailable
     }
 
     pub fn filesystem_values(
@@ -871,6 +1196,24 @@ impl CompletionCache {
         self.rule_deferred.remove(command);
     }
 
+    fn discard_pending_rule_chunks(&mut self, command: &str) {
+        if let Some(pending) = self.pending_rule_chunks.remove(command) {
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(pending.approximate_bytes(command));
+        }
+    }
+
+    fn clear_pending_rule_chunks(&mut self) {
+        let bytes = self
+            .pending_rule_chunks
+            .iter()
+            .map(|(command, pending)| pending.approximate_bytes(command))
+            .sum::<usize>();
+        self.used_bytes = self.used_bytes.saturating_sub(bytes);
+        self.pending_rule_chunks.clear();
+    }
+
     fn clear_rule_requests(&mut self) {
         let admission_bytes = self
             .rule_pending
@@ -880,6 +1223,9 @@ impl CompletionCache {
         self.used_bytes = self.used_bytes.saturating_sub(admission_bytes);
         self.rule_pending.clear();
         self.rule_deferred.clear();
+        // A cancelled worker decode can still own its old-generation budget.
+        // Its terminal cancellation response releases this reservation only
+        // after the in-flight allocation has been dropped.
     }
 
     fn reject_rule_command(&mut self, command: &str) {
@@ -927,6 +1273,102 @@ impl CompletionCache {
         self.probe_admissions.clear();
     }
 
+    fn rule_configuration_growth_reserve(&self) -> usize {
+        MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES.saturating_sub(self.rule_configuration_bytes)
+    }
+
+    fn rule_admission_reserve(&self) -> usize {
+        if self.rule_pending.is_empty() {
+            MAX_RULE_ADMISSION_BYTES
+        } else {
+            0
+        }
+    }
+
+    fn rule_discovery_budget(&self) -> usize {
+        self.byte_limit.saturating_sub(
+            self.capacity_accounted_bytes()
+                .saturating_sub(self.rule_store_bytes),
+        )
+    }
+
+    fn rule_configuration_intrinsically_exceeds_limit(&self) -> bool {
+        // The retained configuration-growth and next-lookup reserves coexist
+        // with the worker-request copy. No eviction or in-flight completion
+        // can reduce this floor.
+        MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES
+            .saturating_add(MAX_RULE_ADMISSION_BYTES)
+            .saturating_add(self.rule_configuration_bytes)
+            > self.byte_limit
+    }
+
+    fn finish_intrinsically_rejected_rule_configuration(&mut self) {
+        // Configuration is a hard trust/reload boundary. The previous worker
+        // store must not remain queryable under the new generation.
+        self.restart_worker_for_rule_boundary();
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(self.rule_configuration_bytes);
+        self.rule_configuration_bytes = 0;
+        self.rule_configuration = None;
+        self.rule_catalog_deferred = false;
+        self.rule_catalog_ready = true;
+        self.record_rule_error("rule configuration exceeds the configured cache limit".into());
+    }
+
+    fn try_send_rule_discovery(&mut self) -> bool {
+        if self.worker.is_none()
+            || self.rule_configuration.is_none()
+            || self.rule_load_reservation.is_some()
+            || self.rule_catalog_reservation.is_some()
+        {
+            return false;
+        }
+        self.evict_to_limit();
+        let request_bytes = self.rule_configuration_bytes;
+        if self
+            .capacity_accounted_bytes()
+            .saturating_add(request_bytes)
+            > self.byte_limit
+        {
+            return false;
+        }
+        let byte_limit = self.rule_discovery_budget().saturating_sub(request_bytes);
+        let replaced_store_bytes = self.rule_store_bytes;
+        if byte_limit < replaced_store_bytes {
+            return false;
+        }
+        let generation = self.rule_generation;
+        // This reservation substitutes for the old store while its request is
+        // queued, then for the complete replacement allocation while the
+        // worker discovers sealed mappings and metadata.
+        self.used_bytes = self.used_bytes.saturating_sub(replaced_store_bytes);
+        self.rule_store_bytes = 0;
+        self.rule_catalog_reservation = Some(RuleCatalogReservation {
+            generation,
+            bytes: request_bytes.saturating_add(byte_limit),
+        });
+        let (paths, trusted_key_paths) = self
+            .rule_configuration
+            .as_ref()
+            .map(|(paths, keys)| (paths.clone(), keys.clone()))
+            .expect("rule configuration exists");
+        let sent = self.worker.as_ref().is_some_and(|worker| {
+            worker.send(Request::DiscoverRules {
+                paths,
+                trusted_key_paths,
+                generation,
+                byte_limit,
+            })
+        });
+        if !sent {
+            self.rule_catalog_reservation = None;
+            self.rule_store_bytes = replaced_store_bytes;
+            self.used_bytes = self.used_bytes.saturating_add(replaced_store_bytes);
+        }
+        sent
+    }
+
     pub fn configure_rules(&mut self, paths: Vec<PathBuf>, trusted_key_paths: Vec<PathBuf>) {
         let mut remaining_count = MAX_RULE_CONFIGURATION_PATHS;
         let mut remaining_bytes = MAX_RULE_CONFIGURATION_BYTES;
@@ -941,17 +1383,42 @@ impl CompletionCache {
             self.record_rule_error("rule configuration paths exceed the bounded limit".into());
         }
         let configuration = (paths, trusted_key_paths);
+        let configuration_bytes = rule_configuration_bytes(&configuration.0, &configuration.1);
+        // Retained configuration bytes and the reserved room for future
+        // growth sum to the same absolute cap, so replacement itself cannot
+        // consume capacity that an in-flight operation was allowed to use.
+        let projected_bytes = self.capacity_accounted_bytes();
+        if projected_bytes > self.byte_limit
+            && (self.rule_store_bytes != 0
+                || self.rule_load_reservation.is_some()
+                || self.rule_catalog_reservation.is_some()
+                || self.snapshot_reservation.is_some())
+        {
+            // Rebase a coalesced reload before retaining a larger latest
+            // configuration. The old worker allocation/reservation was sized
+            // for the superseded payload and cannot cover its growth.
+            self.restart_worker_for_rule_boundary();
+        }
         // Configuration is also the explicit reload boundary. The paths can
         // stay unchanged while packs are installed, removed, or replaced.
-        self.rule_configuration = Some(configuration.clone());
-        let (paths, trusted_key_paths) = configuration;
-        // A consumed non-final response may have left the worker waiting.
-        // Release it before discarding generation-local merge state.
-        self.acknowledge_rule_chunk();
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(self.rule_configuration_bytes);
+        self.rule_configuration_bytes = configuration_bytes;
+        self.used_bytes = self.used_bytes.saturating_add(configuration_bytes);
+        self.rule_configuration = Some(configuration);
+        // Publish cancellation before releasing a worker that may be waiting
+        // on a consumed non-final chunk. It must observe the new generation
+        // before it can begin another old-budget block allocation.
         self.rule_generation = self.rule_generation.wrapping_add(1);
+        if let Some(worker) = &self.worker {
+            worker.set_rule_generation(self.rule_generation);
+        }
+        self.acknowledge_rule_chunk();
         self.rule_catalog_ready = false;
         self.rule_summaries.clear();
         self.clear_rule_requests();
+        self.clear_pending_rule_chunks();
         self.rule_rejected.clear();
         self.rule_rejection_saturated = false;
         self.rule_chunk_ready_to_ack = false;
@@ -959,17 +1426,19 @@ impl CompletionCache {
         for (_, entry) in self.rule_entries.drain() {
             self.used_bytes = self.used_bytes.saturating_sub(entry.approximate_bytes);
         }
-        let generation = self.rule_generation;
-        let sent = self.worker.as_ref().is_some_and(|worker| {
-            worker.send(Request::DiscoverRules {
-                paths,
-                trusted_key_paths,
-                generation,
-            })
-        });
+        self.evict_to_limit();
+        if self.capacity_accounted_bytes() > self.byte_limit {
+            self.finish_intrinsically_rejected_rule_configuration();
+            return;
+        }
+        let sent = self.try_send_rule_discovery();
         if !sent {
-            self.rule_catalog_deferred = self.worker.is_some();
-            self.rule_catalog_ready = !self.rule_catalog_deferred;
+            if self.rule_configuration_intrinsically_exceeds_limit() {
+                self.finish_intrinsically_rejected_rule_configuration();
+            } else {
+                self.rule_catalog_deferred = self.worker.is_some();
+                self.rule_catalog_ready = !self.rule_catalog_deferred;
+            }
         }
     }
 
@@ -989,41 +1458,74 @@ impl CompletionCache {
         let mut backpressured = false;
         if !self.rule_entries.contains_key(command) && self.rule_catalog_ready {
             let should_send = if self.rule_deferred.remove(command) {
-                true
+                if self.rule_load_reservation.is_none() && self.snapshot_reservation.is_none() {
+                    true
+                } else {
+                    self.rule_deferred.insert(command.to_owned());
+                    false
+                }
             } else if self.rule_pending.contains(command) {
                 false
-            } else if self.rule_pending.len() >= MAX_PENDING_RULE_REQUESTS {
+            } else if self.rule_load_reservation.is_some()
+                || self.snapshot_reservation.is_some()
+                || self.rule_pending.len() >= MAX_PENDING_RULE_REQUESTS
+            {
                 backpressured = true;
                 false
             } else {
                 let admission_bytes = rule_admission_bytes(command);
-                self.rule_pending.insert(command.to_owned());
-                self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
-                self.evict_to_limit();
-                if self.used_bytes > self.byte_limit {
-                    self.finish_rule_request(command);
+                if admission_bytes.saturating_add(MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES)
+                    > self.byte_limit
+                {
                     self.reject_rule_command(command);
                     self.record_rule_error(format!(
-                        "{command}: rule lookup exceeds the configured cache limit"
+                        "{command}: rule request exceeds the configured cache limit"
                     ));
-                    return (Some(Arc::new(Vec::new())), false);
+                    false
+                } else {
+                    self.evict_to_limit();
+                    let projected_bytes = self
+                        .capacity_accounted_bytes()
+                        .saturating_sub(self.rule_admission_reserve())
+                        .saturating_add(admission_bytes);
+                    if projected_bytes > self.byte_limit {
+                        // Replay/probe reservations are transient pressure,
+                        // not a deterministic command failure. Do not poison
+                        // this command; a later redraw can retry after pressure
+                        // falls.
+                        backpressured = true;
+                        false
+                    } else {
+                        self.rule_pending.insert(command.to_owned());
+                        self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
+                        if self.rule_load_reservation.is_none() && self.rule_deferred.is_empty() {
+                            true
+                        } else {
+                            self.rule_deferred.insert(command.to_owned());
+                            false
+                        }
+                    }
                 }
-                true
             };
             if should_send {
                 let generation = self.rule_generation;
+                let byte_limit = self.rule_load_budget();
                 let sent = self.worker.as_ref().is_some_and(|worker| {
                     worker.send(Request::LoadRules {
                         command: command.to_owned(),
                         generation,
+                        byte_limit,
                     })
                 });
-                if !sent {
-                    if self.worker.is_some() {
-                        self.rule_deferred.insert(command.to_owned());
-                    } else {
-                        self.finish_rule_request(command);
-                    }
+                if sent {
+                    self.rule_load_reservation = Some(RuleLoadReservation {
+                        generation,
+                        bytes: byte_limit,
+                    });
+                } else if self.worker.is_some() {
+                    self.rule_deferred.insert(command.to_owned());
+                } else {
+                    self.finish_rule_request(command);
                 }
             }
         }
@@ -1038,41 +1540,78 @@ impl CompletionCache {
         }
     }
 
+    fn rule_load_budget(&self) -> usize {
+        // Cancellation clears every pending command admission before the old
+        // generation drops its decode reservation. Leave room for the one
+        // maximum lookup reserve that reappears at that boundary.
+        self.byte_limit
+            .saturating_sub(self.capacity_accounted_bytes())
+            .saturating_sub(MAX_RULE_ADMISSION_BYTES)
+    }
+
     fn retry_deferred_rules(&mut self) {
         if self.rule_catalog_deferred {
-            if let Some((paths, trusted_key_paths)) = self.rule_configuration.clone() {
-                let sent = self.worker.as_ref().is_some_and(|worker| {
-                    worker.send(Request::DiscoverRules {
-                        paths,
-                        trusted_key_paths,
-                        generation: self.rule_generation,
-                    })
-                });
-                if sent {
-                    self.rule_catalog_deferred = false;
-                } else if self.worker.is_none() {
-                    self.rule_catalog_deferred = false;
-                    self.rule_catalog_ready = true;
-                }
+            if self.try_send_rule_discovery() {
+                self.rule_catalog_deferred = false;
+            } else if self.rule_configuration_intrinsically_exceeds_limit() {
+                self.finish_intrinsically_rejected_rule_configuration();
+            } else if self.worker.is_none() {
+                self.rule_catalog_deferred = false;
+                self.rule_catalog_ready = true;
             }
         }
-        if !self.rule_catalog_ready {
+        if !self.rule_catalog_ready
+            || self.rule_load_reservation.is_some()
+            || self.snapshot_reservation.is_some()
+        {
             return;
         }
         let Some(command) = self.rule_deferred.iter().min().cloned() else {
             return;
         };
+        let byte_limit = self.rule_load_budget();
         let sent = self.worker.as_ref().is_some_and(|worker| {
             worker.send(Request::LoadRules {
                 command: command.clone(),
                 generation: self.rule_generation,
+                byte_limit,
             })
         });
         if sent {
             self.rule_deferred.remove(&command);
+            self.rule_load_reservation = Some(RuleLoadReservation {
+                generation: self.rule_generation,
+                bytes: byte_limit,
+            });
         } else if self.worker.is_none() {
             self.finish_rule_request(&command);
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_rule_chunk_for_test(
+        &mut self,
+        command: &str,
+        programs: Vec<LoadedProgram>,
+        pending: bool,
+        revision: u64,
+    ) {
+        self.worker = None;
+        self.rule_catalog_ready = true;
+        if pending {
+            self.rule_pending.insert(command.to_owned());
+        } else {
+            self.rule_pending.remove(command);
+        }
+        self.rule_entries.insert(
+            command.to_owned(),
+            RuleCacheEntry {
+                programs: Arc::new(programs),
+                approximate_bytes: 0,
+                last_used: 0,
+                revision,
+            },
+        );
     }
 
     pub fn rule_summaries(&self) -> &[PackSummary] {
@@ -1084,11 +1623,74 @@ impl CompletionCache {
     }
 
     pub fn record_rule_error(&mut self, error: String) {
-        if !self.rule_errors.contains(&error) {
-            self.rule_errors.push(error);
-            if self.rule_errors.len() > 128 {
-                self.rule_errors.drain(..self.rule_errors.len() - 128);
-            }
+        let error = bounded_utf8_prefix(&error, MAX_RULE_LOOKUP_BYTES);
+        if self.rule_errors.iter().any(|existing| existing == error) {
+            return;
+        }
+        let previous_bytes = owned_strings_bytes(&self.rule_errors);
+        self.rule_errors.push(error.to_owned());
+        if self.rule_errors.len() > 128 {
+            self.rule_errors.drain(..self.rule_errors.len() - 128);
+        }
+        self.rule_errors.shrink_to_fit();
+        let mut current_bytes = owned_strings_bytes(&self.rule_errors);
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(current_bytes);
+        while self.capacity_accounted_bytes() > self.byte_limit && !self.rule_errors.is_empty() {
+            self.rule_errors.remove(0);
+            self.rule_errors.shrink_to_fit();
+            let next_bytes = owned_strings_bytes(&self.rule_errors);
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(current_bytes)
+                .saturating_add(next_bytes);
+            current_bytes = next_bytes;
+        }
+    }
+
+    fn record_probe_error(&mut self, probe_id: Option<&str>, detail: &str) {
+        let probe_id =
+            probe_id.map(|value| bounded_utf8_prefix(value, MAX_PROBE_DIAGNOSTIC_FIELD_BYTES));
+        let detail = bounded_utf8_prefix(detail, MAX_PROBE_DIAGNOSTIC_FIELD_BYTES);
+        let message = probe_id.map_or_else(
+            || detail.to_owned(),
+            |probe_id| format!("{probe_id}: {detail}"),
+        );
+        if self.probe_errors.contains(&message) {
+            return;
+        }
+        let previous_bytes = owned_strings_bytes(&self.probe_errors);
+        while !self.probe_errors.is_empty()
+            && (self.probe_errors.len() >= 128
+                || owned_strings_bytes(&self.probe_errors)
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(message.capacity())
+                    > MAX_PROBE_DIAGNOSTIC_BYTES)
+        {
+            self.probe_errors.remove(0);
+        }
+        if std::mem::size_of::<String>().saturating_add(message.capacity())
+            <= MAX_PROBE_DIAGNOSTIC_BYTES
+        {
+            self.probe_errors.push(message);
+        }
+        self.probe_errors.shrink_to_fit();
+        let mut current_bytes = owned_strings_bytes(&self.probe_errors);
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(current_bytes);
+        while self.capacity_accounted_bytes() > self.byte_limit && !self.probe_errors.is_empty() {
+            self.probe_errors.remove(0);
+            self.probe_errors.shrink_to_fit();
+            let next_bytes = owned_strings_bytes(&self.probe_errors);
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(current_bytes)
+                .saturating_add(next_bytes);
+            current_bytes = next_bytes;
         }
     }
 
@@ -1150,7 +1752,8 @@ impl CompletionCache {
         // supervisor, which kills/reaps its process groups, before restoring
         // the main thread's original mask and starting a fresh supervisor.
         if let Some(mut worker) = self.probe_worker.take() {
-            worker.stop();
+            let reservation_bytes = self.probe_admissions.values().copied().sum();
+            worker.stop_with_reservation(reservation_bytes);
         }
         self.probe_pending.clear();
         self.clear_probe_admissions();
@@ -1159,11 +1762,10 @@ impl CompletionCache {
         self.probe_cancel_pending = None;
         self.probe_signal_mask.take();
         self.probe_generation = 0;
-        self.probe_errors
-            .push("probe cancellation acknowledgement timed out; supervisor restarted".into());
-        if self.probe_errors.len() > 128 {
-            self.probe_errors.drain(..self.probe_errors.len() - 128);
-        }
+        self.record_probe_error(
+            None,
+            "probe cancellation acknowledgement timed out; supervisor restarted",
+        );
         self.probe_worker = ProbeClient::start(0).ok();
     }
 
@@ -1207,21 +1809,27 @@ impl CompletionCache {
                 deferred = self.probe_worker.is_some();
             } else if self.probe_worker.is_some() {
                 let admission_bytes = probe_admission_bytes(request, &cache_key);
-                self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
-                self.probe_admissions
-                    .insert((self.probe_generation, cache_key.clone()), admission_bytes);
                 self.evict_to_limit();
-                if self.used_bytes > self.byte_limit {
-                    self.finish_probe_admission(self.probe_generation, &cache_key);
+                if admission_bytes.saturating_add(MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES)
+                    > self.byte_limit
+                {
                     self.reject_probe(&cache_key);
-                    self.probe_errors.push(format!(
-                        "{}: probe request exceeds the configured cache limit",
-                        request.probe_id
-                    ));
-                    if self.probe_errors.len() > 128 {
-                        self.probe_errors.drain(..self.probe_errors.len() - 128);
-                    }
+                    self.record_probe_error(
+                        Some(&request.probe_id),
+                        "probe request exceeds the configured cache limit",
+                    );
+                } else if self
+                    .capacity_accounted_bytes()
+                    .saturating_add(admission_bytes)
+                    > self.byte_limit
+                {
+                    // Existing replay, load, probe, or detached-cleanup bytes
+                    // are transient pressure. Keep this request retryable.
+                    deferred = true;
                 } else {
+                    self.used_bytes = self.used_bytes.saturating_add(admission_bytes);
+                    self.probe_admissions
+                        .insert((self.probe_generation, cache_key.clone()), admission_bytes);
                     self.probe_pending.insert(cache_key.clone());
                     // Bash's process-wide SIGCHLD handler reaps unknown children. Mask
                     // it on the Readline thread while a bounded probe is active; the
@@ -1433,23 +2041,30 @@ impl CompletionCache {
                 Some(Err(TryRecvError::Empty)) | None => break,
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.worker = None;
+                    self.used_bytes = self.used_bytes.saturating_sub(self.rule_store_bytes);
+                    self.rule_store_bytes = 0;
+                    self.rule_summaries.clear();
                     self.pending.clear();
                     self.scan_deferred.clear();
                     self.scan_tokens.clear();
                     self.filesystem_pending.clear();
                     self.filesystem_pins.clear();
                     self.filesystem_limit_exceeded = false;
+                    self.snapshot_unavailable |= self.snapshot_pending || self.snapshot_deferred;
                     self.snapshot_pending = false;
                     self.snapshot_deferred = false;
                     self.snapshot_inflight_generation = None;
+                    self.snapshot_reservation = None;
+                    self.rule_load_reservation = None;
+                    self.rule_catalog_reservation = None;
                     self.clear_rule_requests();
+                    self.clear_pending_rule_chunks();
                     self.rule_chunk_ready_to_ack = false;
                     self.rule_catalog_deferred = false;
                     self.rule_catalog_ready = true;
                     break;
                 }
             };
-            self.response_generation = self.response_generation.wrapping_add(1);
             match response {
                 Response::Scan {
                     key,
@@ -1490,6 +2105,7 @@ impl CompletionCache {
                                 .sum::<usize>(),
                         );
                     self.clock = self.clock.wrapping_add(1);
+                    let entry_key = key.clone();
                     if let Some(previous) = self.entries.insert(
                         key,
                         CacheEntry {
@@ -1505,6 +2121,9 @@ impl CompletionCache {
                     }
                     self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
                     self.evict_to_limit();
+                    if self.entries.contains_key(&entry_key) {
+                        self.response_generation = self.response_generation.wrapping_add(1);
+                    }
                 }
                 Response::Filesystem {
                     key,
@@ -1542,6 +2161,8 @@ impl CompletionCache {
                     if !self.filesystem_entries.contains_key(&key) {
                         self.filesystem_pins.remove(&key);
                         self.filesystem_limit_exceeded = true;
+                    } else {
+                        self.response_generation = self.response_generation.wrapping_add(1);
                     }
                 }
                 Response::Snapshots {
@@ -1555,6 +2176,12 @@ impl CompletionCache {
                     process_names,
                     network_interfaces,
                 } => {
+                    if self
+                        .snapshot_reservation
+                        .is_some_and(|(reserved, _)| reserved == generation)
+                    {
+                        self.snapshot_reservation = None;
+                    }
                     if self.snapshot_inflight_generation == Some(generation) {
                         self.snapshot_pending = false;
                         self.snapshot_inflight_generation = None;
@@ -1563,6 +2190,7 @@ impl CompletionCache {
                         self.snapshot_deferred = true;
                         continue;
                     }
+                    self.snapshot_unavailable = false;
                     self.used_bytes = self.used_bytes.saturating_sub(self.snapshot_bytes);
                     self.snapshot_bytes = [
                         &users,
@@ -1587,28 +2215,33 @@ impl CompletionCache {
                     self.network_interfaces = network_interfaces;
                     self.used_bytes = self.used_bytes.saturating_add(self.snapshot_bytes);
                     self.evict_to_limit();
-                    if self.used_bytes > self.byte_limit {
-                        self.used_bytes = self.used_bytes.saturating_sub(self.snapshot_bytes);
-                        self.snapshot_bytes = 0;
-                        self.users = Vec::new();
-                        self.groups = Vec::new();
-                        self.passwd_records = Vec::new();
-                        self.group_records = Vec::new();
-                        self.hosts = Vec::new();
-                        self.process_ids = Vec::new();
-                        self.process_names = Vec::new();
-                        self.network_interfaces = Vec::new();
+                    if self.capacity_accounted_bytes() > self.byte_limit {
+                        self.clear_snapshot_values();
                         self.evict_to_limit();
+                    } else {
+                        self.response_generation = self.response_generation.wrapping_add(1);
                     }
                 }
                 Response::RuleCatalog {
                     summaries,
+                    approximate_bytes,
                     generation,
                 } => {
+                    if self
+                        .rule_catalog_reservation
+                        .is_some_and(|reservation| reservation.generation == generation)
+                    {
+                        self.rule_catalog_reservation = None;
+                    }
                     if generation != self.rule_generation {
                         continue;
                     }
+                    self.used_bytes = self.used_bytes.saturating_sub(self.rule_store_bytes);
+                    self.rule_store_bytes = approximate_bytes;
+                    self.used_bytes = self.used_bytes.saturating_add(self.rule_store_bytes);
                     self.rule_summaries = summaries;
+                    self.evict_to_limit();
+                    self.response_generation = self.response_generation.wrapping_add(1);
                     self.rule_catalog_ready = true;
                     self.rule_catalog_deferred = false;
                 }
@@ -1619,84 +2252,175 @@ impl CompletionCache {
                     approximate_bytes,
                     generation,
                     complete,
+                    rejected,
                 } => {
-                    if !complete {
-                        self.rule_chunk_ready_to_ack = true;
+                    // Every rule response owns decoded bytes until the main
+                    // cache has accounted or rejected it. Release worker-side
+                    // credit only after this response is consumed, including
+                    // terminal and rejected responses.
+                    self.rule_chunk_ready_to_ack = true;
+                    if complete
+                        && self
+                            .rule_load_reservation
+                            .is_some_and(|reservation| reservation.generation == generation)
+                    {
+                        self.rule_load_reservation = None;
                     }
                     if generation != self.rule_generation {
+                        continue;
+                    }
+                    if rejected {
+                        self.discard_pending_rule_chunks(&command);
+                        self.finish_rule_request(&command);
+                        self.reject_rule_command(&command);
+                        for error in errors {
+                            self.record_rule_error(error);
+                        }
                         continue;
                     }
                     if self.rule_rejection_saturated
                         || self.rule_rejected.contains(&rule_command_hash(&command))
                     {
+                        self.discard_pending_rule_chunks(&command);
                         if complete {
                             self.finish_rule_request(&command);
                         }
                         continue;
                     }
-                    if complete {
-                        self.finish_rule_request(&command);
+                    let previous_pending_bytes = self
+                        .pending_rule_chunks
+                        .get(&command)
+                        .map_or(0, |pending| pending.approximate_bytes(&command));
+                    self.used_bytes = self.used_bytes.saturating_sub(previous_pending_bytes);
+                    let mut pending =
+                        self.pending_rule_chunks
+                            .remove(&command)
+                            .unwrap_or(PendingRuleChunks {
+                                programs: Vec::new(),
+                                errors: Vec::new(),
+                                approximate_program_bytes: 0,
+                            });
+                    let oversized = pending.programs.len().saturating_add(programs.len())
+                        > MAX_RULE_CACHE_ENTRIES
+                        || pending.errors.len().saturating_add(errors.len()) > MAX_RULE_REJECTIONS;
+                    if oversized {
+                        self.reject_rule_command(&command);
+                        self.record_rule_error(format!(
+                            "{command}: decoded rules exceed the bounded rule limit"
+                        ));
+                        if complete {
+                            self.finish_rule_request(&command);
+                        }
+                        continue;
                     }
-                    let chunk_bytes = approximate_bytes;
-                    let previous = self.rule_entries.remove(&command);
-                    let (mut combined, approximate_bytes) = previous.map_or_else(
-                        || {
-                            (
-                                Arc::new(Vec::new()),
-                                chunk_bytes
-                                    .saturating_add(std::mem::size_of::<RuleCacheEntry>())
-                                    .saturating_add(std::mem::size_of::<Vec<LoadedProgram>>())
-                                    .saturating_add(2 * std::mem::size_of::<usize>())
-                                    .saturating_add(command.capacity()),
-                            )
-                        },
-                        |previous| {
-                            self.used_bytes =
-                                self.used_bytes.saturating_sub(previous.approximate_bytes);
-                            (
-                                previous.programs,
-                                previous.approximate_bytes.saturating_add(chunk_bytes),
-                            )
-                        },
-                    );
+                    pending.approximate_program_bytes = pending
+                        .approximate_program_bytes
+                        .saturating_add(approximate_bytes);
+                    pending.programs.extend(programs);
+                    pending.errors.extend(errors);
+                    let pending_bytes = pending.approximate_bytes(&command);
+                    let rule_limit = self.byte_limit.min(64 * 1024 * 1024);
+                    if pending_bytes > rule_limit
+                        || self
+                            .capacity_accounted_bytes()
+                            .saturating_add(pending_bytes)
+                            > self.byte_limit
                     {
-                        let combined_programs: &mut Vec<LoadedProgram> =
-                            Arc::make_mut(&mut combined);
-                        combined_programs.extend(programs);
-                        sort_loaded_programs(combined_programs);
+                        self.reject_rule_command(&command);
+                        self.record_rule_error(format!(
+                            "{command}: decoded rules exceed the configured cache limit"
+                        ));
+                        if complete {
+                            self.finish_rule_request(&command);
+                        }
+                        continue;
+                    }
+                    if !complete {
+                        self.used_bytes = self.used_bytes.saturating_add(pending_bytes);
+                        self.pending_rule_chunks.insert(command, pending);
+                        continue;
+                    }
+                    self.finish_rule_request(&command);
+
+                    let existing_programs = self
+                        .rule_entries
+                        .get(&command)
+                        .map(|entry| Arc::clone(&entry.programs));
+                    let existing_count = existing_programs.as_ref().map_or(0, |items| items.len());
+                    if existing_count.saturating_add(pending.programs.len())
+                        > MAX_RULE_CACHE_ENTRIES
+                    {
+                        self.reject_rule_command(&command);
+                        self.record_rule_error(format!(
+                            "{command}: decoded rules exceed the bounded rule limit"
+                        ));
+                        continue;
+                    }
+                    let mut combined =
+                        Vec::with_capacity(existing_count.saturating_add(pending.programs.len()));
+                    if let Some(existing) = &existing_programs {
+                        combined.extend(existing.iter().cloned());
+                    }
+                    combined.extend(pending.programs);
+                    sort_loaded_programs(&mut combined);
+                    let approximate_bytes = approximate_rule_bytes(&combined)
+                        .saturating_add(
+                            combined
+                                .capacity()
+                                .saturating_sub(combined.len())
+                                .saturating_mul(std::mem::size_of::<LoadedProgram>()),
+                        )
+                        .saturating_add(std::mem::size_of::<RuleCacheEntry>())
+                        .saturating_add(std::mem::size_of::<Vec<LoadedProgram>>())
+                        .saturating_add(2 * std::mem::size_of::<usize>())
+                        .saturating_add(command.capacity());
+                    let previous_bytes = self
+                        .rule_entries
+                        .get(&command)
+                        .map_or(0, |entry| entry.approximate_bytes);
+                    if approximate_bytes > rule_limit
+                        || self
+                            .capacity_accounted_bytes()
+                            .saturating_sub(previous_bytes)
+                            .saturating_add(approximate_bytes)
+                            > self.byte_limit
+                    {
+                        self.reject_rule_command(&command);
+                        self.record_rule_error(format!(
+                            "{command}: decoded rules exceed the configured cache limit"
+                        ));
+                        continue;
+                    }
+                    if let Some(previous) = self.rule_entries.remove(&command) {
+                        self.used_bytes =
+                            self.used_bytes.saturating_sub(previous.approximate_bytes);
                     }
                     self.clock = self.clock.wrapping_add(1);
                     let command_key = command.clone();
                     self.rule_entries.insert(
                         command,
                         RuleCacheEntry {
-                            programs: combined,
+                            programs: Arc::new(combined),
                             approximate_bytes,
                             last_used: self.clock,
+                            revision: 0,
                         },
                     );
                     self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
-                    self.rule_errors.extend(errors);
-                    if self.rule_errors.len() > 128 {
-                        self.rule_errors.drain(..self.rule_errors.len() - 128);
+                    for error in pending.errors {
+                        self.record_rule_error(error);
                     }
-                    if approximate_bytes > self.byte_limit {
-                        if let Some(entry) = self.rule_entries.remove(&command_key) {
-                            self.used_bytes =
-                                self.used_bytes.saturating_sub(entry.approximate_bytes);
-                        }
+                    self.evict_to_limit();
+                    if !self.rule_entries.contains_key(&command_key) {
                         self.reject_rule_command(&command_key);
                         self.record_rule_error(format!(
                             "{command_key}: decoded rules exceed the configured cache limit"
                         ));
                         continue;
                     }
-                    self.evict_to_limit();
-                    if complete && !self.rule_entries.contains_key(&command_key) {
-                        self.reject_rule_command(&command_key);
-                        self.record_rule_error(format!(
-                            "{command_key}: decoded rules exceed the configured cache limit"
-                        ));
+                    if let Some(entry) = self.rule_entries.get_mut(&command_key) {
+                        self.response_generation = self.response_generation.wrapping_add(1);
+                        entry.revision = self.response_generation;
                     }
                 }
             }
@@ -1724,7 +2448,6 @@ impl CompletionCache {
                     break;
                 }
             };
-            self.response_generation = self.response_generation.wrapping_add(1);
             match response {
                 ProbeResponse::Outcome {
                     request,
@@ -1750,11 +2473,7 @@ impl CompletionCache {
                     // make the cached outcome unavailable.
                     let failed = error.is_some();
                     if let Some(error) = error {
-                        self.probe_errors
-                            .push(format!("{}: {error}", request.probe_id));
-                        if self.probe_errors.len() > 128 {
-                            self.probe_errors.drain(..self.probe_errors.len() - 128);
-                        }
+                        self.record_probe_error(Some(&request.probe_id), &error);
                     }
                     let approximate_bytes = probe_key_bytes(&cache_key)
                         .saturating_add(std::mem::size_of::<ProbeCacheEntry>())
@@ -1788,7 +2507,7 @@ impl CompletionCache {
                     }
                     self.used_bytes = self.used_bytes.saturating_add(approximate_bytes);
                     self.evict_to_limit();
-                    if (self.used_bytes > self.byte_limit
+                    if (self.capacity_accounted_bytes() > self.byte_limit
                         || self.probe_entries.len() > MAX_PROBE_CACHE_ENTRIES)
                         && self.probe_entries.contains_key(&cache_key)
                     {
@@ -1799,14 +2518,13 @@ impl CompletionCache {
                         self.probe_fresh.remove(&cache_key);
                         self.probe_pins.remove(&cache_key);
                         self.reject_probe(&cache_key);
-                        self.probe_errors.push(format!(
-                            "{}: probe result exceeds the configured cache limit",
-                            request.probe_id
-                        ));
-                        if self.probe_errors.len() > 128 {
-                            self.probe_errors.drain(..self.probe_errors.len() - 128);
-                        }
+                        self.record_probe_error(
+                            Some(&request.probe_id),
+                            "probe result exceeds the configured cache limit",
+                        );
                         self.evict_to_limit();
+                    } else if self.probe_entries.contains_key(&cache_key) {
+                        self.response_generation = self.response_generation.wrapping_add(1);
                     }
                 }
                 ProbeResponse::Cancelled { generation } => {
@@ -1826,8 +2544,22 @@ impl CompletionCache {
         self.response_generation
     }
 
-    pub(super) const fn replay_byte_limit(&self) -> usize {
+    pub(super) fn rule_program_revision(&self, command: &str) -> Option<u64> {
+        self.rule_entries.get(command).map(|entry| entry.revision)
+    }
+
+    pub(super) fn replay_byte_limit(&self) -> usize {
         self.byte_limit
+            .saturating_sub(self.base_accounted_bytes())
+            .saturating_sub(self.rule_configuration_growth_reserve())
+            .saturating_sub(MAX_RULE_ADMISSION_BYTES)
+    }
+
+    pub(super) fn set_replay_reservation(&mut self, bytes: usize) {
+        self.replay_reserved_bytes = bytes
+            .min(MAX_REPLAY_RESERVATION_BYTES)
+            .min(self.replay_byte_limit());
+        self.evict_to_limit();
     }
 
     pub(super) fn acknowledge_rule_chunk(&mut self) {
@@ -1999,8 +2731,33 @@ impl CompletionCache {
         &self.network_interfaces
     }
 
-    pub fn used_bytes(&self) -> usize {
+    fn base_accounted_bytes(&self) -> usize {
         self.used_bytes
+            .saturating_add(
+                self.rule_load_reservation
+                    .map_or(0, |reservation| reservation.bytes),
+            )
+            .saturating_add(self.snapshot_reservation.map_or(0, |(_, bytes)| bytes))
+            .saturating_add(
+                self.rule_catalog_reservation
+                    .map_or(0, |reservation| reservation.bytes),
+            )
+            .saturating_add(DETACHED_PROBE_BYTES.load(Ordering::Acquire))
+    }
+
+    fn accounted_bytes(&self) -> usize {
+        self.base_accounted_bytes()
+            .saturating_add(self.replay_reserved_bytes)
+    }
+
+    fn capacity_accounted_bytes(&self) -> usize {
+        self.accounted_bytes()
+            .saturating_add(self.rule_configuration_growth_reserve())
+            .saturating_add(self.rule_admission_reserve())
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.accounted_bytes()
     }
 
     pub fn entry_count(&self) -> usize {
@@ -2018,9 +2775,19 @@ impl CompletionCache {
         if let Some(mut worker) = self.worker.take() {
             worker.stop();
         }
+        self.rule_load_reservation = None;
+        self.rule_catalog_reservation = None;
+        self.snapshot_reservation = None;
+        self.used_bytes = self.used_bytes.saturating_sub(self.rule_store_bytes);
+        self.rule_store_bytes = 0;
+        self.replay_reserved_bytes = 0;
+        self.rule_summaries.clear();
         if let Some(mut worker) = self.probe_worker.take() {
-            worker.stop();
+            let reservation_bytes = self.probe_admissions.values().copied().sum();
+            worker.stop_with_reservation(reservation_bytes);
         }
+        self.clear_rule_requests();
+        self.clear_pending_rule_chunks();
         self.filesystem_pending.clear();
         self.filesystem_pins.clear();
         self.filesystem_limit_exceeded = false;
@@ -2093,7 +2860,7 @@ impl CompletionCache {
                 self.probe_fresh.remove(&key);
             }
         }
-        while self.used_bytes > self.byte_limit
+        while self.capacity_accounted_bytes() > self.byte_limit
             && self
                 .entries
                 .len()
@@ -2173,6 +2940,25 @@ impl CompletionCache {
                 break;
             }
         }
+        while self.capacity_accounted_bytes() > self.byte_limit
+            && (!self.rule_errors.is_empty() || !self.probe_errors.is_empty())
+        {
+            let previous_bytes = owned_strings_bytes(&self.rule_errors)
+                .saturating_add(owned_strings_bytes(&self.probe_errors));
+            if !self.rule_errors.is_empty() {
+                self.rule_errors.remove(0);
+                self.rule_errors.shrink_to_fit();
+            } else {
+                self.probe_errors.remove(0);
+                self.probe_errors.shrink_to_fit();
+            }
+            let current_bytes = owned_strings_bytes(&self.rule_errors)
+                .saturating_add(owned_strings_bytes(&self.probe_errors));
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(current_bytes);
+        }
     }
 }
 
@@ -2228,7 +3014,7 @@ fn probe_worker_loop(
             }
         }
         let request = if probes.has_work() {
-            match requests.recv_timeout(Duration::from_millis(10)) {
+            match requests.recv_timeout(Duration::from_millis(1)) {
                 Ok(request) => Some(request),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -2320,11 +3106,24 @@ fn send_worker_response(
     }
 }
 
+fn trim_system_allocator() {
+    // Rule decoding transiently allocates multi-megabyte decompression and
+    // serde buffers on the worker arena. glibc otherwise retains those free
+    // pages indefinitely, making one complex completion look permanently as
+    // large as its decode peak. This is command-agnostic and runs only after a
+    // bounded load has released its temporary buffers.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 fn worker_loop(
     requests: Receiver<Request>,
     responses: SyncSender<Response>,
     stop: Arc<AtomicBool>,
     filesystem_generation: Arc<AtomicU64>,
+    rule_generation: Arc<AtomicU64>,
     rule_chunk_ack: Arc<AtomicBool>,
 ) {
     // Never let Bash's process-wide SIGCHLD handler run on a Rust worker.
@@ -2486,13 +3285,66 @@ fn worker_loop(
                 paths,
                 trusted_key_paths,
                 generation,
+                byte_limit,
             } => {
-                rules = RuleStore::discover(&paths, &trusted_key_paths);
+                if rule_generation.load(Ordering::Acquire) != generation {
+                    // The main cache's catalog reservation replaced the old
+                    // store accounting when this request was admitted. Drop
+                    // that store before reporting cancellation.
+                    drop(rules);
+                    rules = RuleStore::default();
+                    if !send_worker_response(
+                        &responses,
+                        &stop,
+                        Response::RuleCatalog {
+                            summaries: Vec::new(),
+                            approximate_bytes: 0,
+                            generation,
+                        },
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                // Release the previous sealed mappings before constructing a
+                // replacement store, so reload does not transiently retain two
+                // complete pack sets.
+                drop(rules);
+                rules = RuleStore::discover_bounded_while(
+                    &paths,
+                    &trusted_key_paths,
+                    byte_limit,
+                    || {
+                        !stop.load(Ordering::Acquire)
+                            && rule_generation.load(Ordering::Acquire) == generation
+                    },
+                );
+                if rule_generation.load(Ordering::Acquire) != generation {
+                    drop(rules);
+                    rules = RuleStore::default();
+                    if !send_worker_response(
+                        &responses,
+                        &stop,
+                        Response::RuleCatalog {
+                            summaries: Vec::new(),
+                            approximate_bytes: 0,
+                            generation,
+                        },
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                let summaries = rules.summaries().to_vec();
+                let approximate_bytes = rules
+                    .approximate_bytes()
+                    .saturating_add(pack_summaries_bytes(&summaries));
                 if !send_worker_response(
                     &responses,
                     &stop,
                     Response::RuleCatalog {
-                        summaries: rules.summaries().to_vec(),
+                        summaries,
+                        approximate_bytes,
                         generation,
                     },
                 ) {
@@ -2502,35 +3354,178 @@ fn worker_loop(
             Request::LoadRules {
                 command,
                 generation,
+                byte_limit,
             } => {
-                let mut connected = true;
-                rules.load_command_incremental(&command, |programs, errors, complete| {
-                    let approximate_bytes = approximate_rule_bytes(&programs);
-                    if !complete {
-                        rule_chunk_ack.store(false, Ordering::Release);
+                if rule_generation.load(Ordering::Acquire) != generation {
+                    rule_chunk_ack.store(false, Ordering::Release);
+                    if !send_worker_response(
+                        &responses,
+                        &stop,
+                        Response::Rules {
+                            command,
+                            programs: Vec::new(),
+                            errors: Vec::new(),
+                            approximate_bytes: 0,
+                            generation,
+                            complete: true,
+                            rejected: false,
+                        },
+                    ) {
+                        break;
                     }
+                    while !rule_chunk_ack.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_micros(250));
+                    }
+                    continue;
+                }
+                let mut connected = true;
+                let mut terminal_sent = false;
+                let mut should_trim_allocator = false;
+                let mut retained_bytes = 0_usize;
+                let mut retained_programs = 0_usize;
+                let mut staged_programs = Vec::new();
+                let mut staged_errors = Vec::new();
+                let mut staged_error_bytes = 0_usize;
+                let rule_limit = byte_limit.min(64 * 1024 * 1024);
+                rules.load_command_incremental(
+                    &command,
+                    rule_limit,
+                    || {
+                        !stop.load(Ordering::Acquire)
+                            && rule_generation.load(Ordering::Acquire) == generation
+                    },
+                    |mut programs, errors, complete, loader_limit_exceeded| {
+                        let approximate_bytes = approximate_rule_bytes(&programs);
+                        should_trim_allocator |= approximate_bytes
+                            >= MIN_RULE_BYTES_FOR_ALLOCATOR_TRIM
+                            || !errors.is_empty();
+                        let next_bytes = retained_bytes.saturating_add(approximate_bytes);
+                        let next_programs = retained_programs.saturating_add(programs.len());
+                        let rejected = loader_limit_exceeded
+                            || next_bytes.saturating_add(staged_error_bytes) > rule_limit
+                            || next_programs > MAX_RULE_CACHE_ENTRIES;
+                        for error in errors {
+                            if staged_errors.len() >= 128 {
+                                break;
+                            }
+                            let error = bounded_utf8_prefix(&error, MAX_RULE_LOOKUP_BYTES);
+                            if staged_errors.iter().any(|existing| existing == error) {
+                                continue;
+                            }
+                            let error_bytes =
+                                std::mem::size_of::<String>().saturating_add(error.len());
+                            if staged_error_bytes.saturating_add(error_bytes) > 64 * 1024
+                                || next_bytes
+                                    .saturating_add(staged_error_bytes)
+                                    .saturating_add(error_bytes)
+                                    > rule_limit
+                            {
+                                break;
+                            }
+                            staged_error_bytes = staged_error_bytes.saturating_add(error_bytes);
+                            staged_errors.push(error.to_owned());
+                        }
+                        if rejected {
+                            should_trim_allocator |= next_bytes.saturating_add(staged_error_bytes)
+                                >= MIN_RULE_BYTES_FOR_ALLOCATOR_TRIM;
+                            const LIMIT_ERROR: &str = "decoded rules exceed the worker rule limit";
+                            let error_bytes =
+                                std::mem::size_of::<String>().saturating_add(LIMIT_ERROR.len());
+                            if staged_errors.len() < 128
+                                && !staged_errors.iter().any(|error| error == LIMIT_ERROR)
+                                && staged_error_bytes.saturating_add(error_bytes) <= 64 * 1024
+                                && staged_error_bytes.saturating_add(error_bytes) <= rule_limit
+                            {
+                                staged_error_bytes = staged_error_bytes.saturating_add(error_bytes);
+                                staged_errors.push(LIMIT_ERROR.to_owned());
+                            }
+                            staged_programs.clear();
+                        } else {
+                            retained_bytes = next_bytes;
+                            retained_programs = next_programs;
+                            staged_programs.append(&mut programs);
+                        }
+                        if !complete && !rejected {
+                            return Some(
+                                rule_limit
+                                    .saturating_sub(retained_bytes)
+                                    .saturating_sub(staged_error_bytes),
+                            );
+                        }
+                        terminal_sent = true;
+                        rule_chunk_ack.store(false, Ordering::Release);
+                        connected = send_worker_response(
+                            &responses,
+                            &stop,
+                            Response::Rules {
+                                command: command.clone(),
+                                programs: if rejected {
+                                    Vec::new()
+                                } else {
+                                    std::mem::take(&mut staged_programs)
+                                },
+                                errors: std::mem::take(&mut staged_errors),
+                                approximate_bytes: if rejected { 0 } else { retained_bytes },
+                                generation,
+                                complete: true,
+                                rejected,
+                            },
+                        );
+                        if connected {
+                            // Serialize terminal responses across generations.
+                            // Otherwise an ACK for a stale cancellation could
+                            // release a newer response that has not been consumed.
+                            while !rule_chunk_ack.load(Ordering::Acquire)
+                                && !stop.load(Ordering::Acquire)
+                            {
+                                thread::sleep(Duration::from_micros(250));
+                            }
+                        }
+                        let current = rule_generation.load(Ordering::Acquire) == generation;
+                        connected
+                            .then_some(())
+                            .filter(|_| current && !rejected)
+                            .map(|()| {
+                                rule_limit
+                                    .saturating_sub(retained_bytes)
+                                    .saturating_sub(staged_error_bytes)
+                            })
+                    },
+                );
+                if !terminal_sent && connected {
+                    // Cancellation can return between block callbacks without
+                    // an ordinary terminal chunk. Drop every staged byte first,
+                    // then acknowledge the old generation so the main cache can
+                    // safely release its reservation.
+                    should_trim_allocator |= retained_bytes.saturating_add(staged_error_bytes)
+                        >= MIN_RULE_BYTES_FOR_ALLOCATOR_TRIM;
+                    drop(staged_programs);
+                    drop(staged_errors);
+                    rule_chunk_ack.store(false, Ordering::Release);
                     connected = send_worker_response(
                         &responses,
                         &stop,
                         Response::Rules {
-                            command: command.clone(),
-                            programs,
-                            errors,
-                            approximate_bytes,
+                            command,
+                            programs: Vec::new(),
+                            errors: Vec::new(),
+                            approximate_bytes: 0,
                             generation,
-                            complete,
+                            complete: true,
+                            rejected: false,
                         },
                     );
-                    if connected && !complete {
+                    if connected {
                         while !rule_chunk_ack.load(Ordering::Acquire)
                             && !stop.load(Ordering::Acquire)
                         {
                             thread::sleep(Duration::from_micros(250));
                         }
-                        connected = !stop.load(Ordering::Acquire);
                     }
-                    connected
-                });
+                }
+                if should_trim_allocator {
+                    trim_system_allocator();
+                }
                 if !connected {
                     break;
                 }
@@ -2540,149 +3535,9 @@ fn worker_loop(
     }
 }
 
-fn predicate_heap_bytes(predicate: &crate::rules::ir::PredicateOp) -> usize {
-    use crate::rules::ir::PredicateOp;
-    match predicate {
-        PredicateOp::CurrentWordEquals(value)
-        | PredicateOp::CurrentWordStartsWith(value)
-        | PredicateOp::PreviousWordEquals(value)
-        | PredicateOp::AnyWordEquals(value)
-        | PredicateOp::WordNotPresent(value)
-        | PredicateOp::EnvironmentSet(value) => value.capacity(),
-        PredicateOp::CommandPathEquals(values) => values
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(values.iter().map(String::capacity).sum::<usize>()),
-        PredicateOp::EnvironmentEquals { name, value } => {
-            name.capacity().saturating_add(value.capacity())
-        }
-        PredicateOp::True
-        | PredicateOp::False
-        | PredicateOp::Not
-        | PredicateOp::And
-        | PredicateOp::Or
-        | PredicateOp::WordIndexEquals(_)
-        | PredicateOp::WordIndexAtLeast(_) => 0,
-    }
-}
-
-fn predicate_program_bytes(predicates: &[crate::rules::ir::PredicateOp]) -> usize {
-    predicates
-        .len()
-        .saturating_mul(std::mem::size_of::<crate::rules::ir::PredicateOp>())
-        .saturating_add(predicates.iter().map(predicate_heap_bytes).sum::<usize>())
-}
-
 fn approximate_rule_bytes(programs: &[LoadedProgram]) -> usize {
     programs.iter().fold(0_usize, |total, loaded| {
-        let program = &loaded.program;
-        let metadata = loaded
-            .pack_name
-            .capacity()
-            .saturating_add(loaded.pack_version.capacity())
-            .saturating_add(program.canonical_name.capacity())
-            .saturating_add(program.source_path.capacity())
-            .saturating_add(program.source_commit.capacity())
-            .saturating_add(program.license.capacity())
-            .saturating_add(
-                program
-                    .registrations
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                program
-                    .registrations
-                    .iter()
-                    .map(String::capacity)
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                loaded
-                    .required_commands
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
-            .saturating_add(
-                loaded
-                    .required_commands
-                    .iter()
-                    .map(String::capacity)
-                    .sum::<usize>(),
-            );
-        let rules =
-            program
-                .static_rules
-                .capacity()
-                .saturating_mul(std::mem::size_of::<crate::rules::ir::StaticRule>())
-                .saturating_add(program.static_rules.iter().fold(0_usize, |size, rule| {
-                    size.saturating_add(predicate_program_bytes(&rule.when))
-                        .saturating_add(rule.candidates.capacity().saturating_mul(
-                            std::mem::size_of::<crate::rules::ir::CandidateTemplate>(),
-                        ))
-                        .saturating_add(rule.candidates.iter().fold(
-                            0_usize,
-                            |candidate_size, candidate| {
-                                candidate_size
-                                    .saturating_add(candidate.value.capacity())
-                                    .saturating_add(candidate.display.capacity())
-                                    .saturating_add(
-                                        candidate.description.as_ref().map_or(0, String::capacity),
-                                    )
-                            },
-                        ))
-                }));
-        let probes = program
-            .probes
-            .capacity()
-            .saturating_mul(std::mem::size_of::<crate::rules::ir::ProbeSpec>())
-            .saturating_add(program.probes.iter().fold(0_usize, |size, probe| {
-                size.saturating_add(probe.id.capacity())
-                    .saturating_add(predicate_program_bytes(&probe.when))
-                    .saturating_add(probe.executable.capacity())
-                    .saturating_add(
-                        probe
-                            .arguments
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<String>()),
-                    )
-                    .saturating_add(probe.arguments.iter().map(String::capacity).sum::<usize>())
-                    .saturating_add(
-                        probe
-                            .environment
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<(String, String)>()),
-                    )
-                    .saturating_add(probe.environment.iter().fold(
-                        0_usize,
-                        |environment_size, (name, value)| {
-                            environment_size
-                                .saturating_add(name.capacity())
-                                .saturating_add(value.capacity())
-                        },
-                    ))
-                    .saturating_add(probe.description.as_ref().map_or(0, String::capacity))
-            }));
-        let scripts = program
-            .scripts
-            .capacity()
-            .saturating_sub(program.scripts.len())
-            .saturating_mul(std::mem::size_of::<crate::rules::script::ScriptModule>())
-            .saturating_add(
-                program
-                    .scripts
-                    .iter()
-                    .map(crate::rules::script::ScriptModule::approximate_bytes)
-                    .sum::<usize>(),
-            );
-        total
-            .saturating_add(std::mem::size_of_val(loaded))
-            .saturating_add(std::mem::size_of::<crate::rules::ir::CommandProgram>())
-            .saturating_add(2 * std::mem::size_of::<usize>())
-            .saturating_add(metadata)
-            .saturating_add(rules)
-            .saturating_add(probes)
-            .saturating_add(scripts)
+        total.saturating_add(loaded.retained_bytes)
     })
 }
 
@@ -2775,7 +3630,7 @@ fn load_processes() -> (Vec<String>, Vec<String>) {
             .ok()
             .and_then(|file| {
                 let mut data = Vec::new();
-                file.take(4096).read_to_end(&mut data).ok()?;
+                file.take(256).read_to_end(&mut data).ok()?;
                 Some(String::from_utf8_lossy(&data).trim().to_owned())
             })
             .filter(|name| !name.chars().any(char::is_control))
@@ -3167,6 +4022,204 @@ mod tests {
     }
 
     #[test]
+    fn repeated_rule_reloads_coalesce_to_one_latest_discovery() {
+        let (request_tx, request_rx) = mpsc::sync_channel(4);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+
+        cache.configure_rules(vec![PathBuf::from("old-00")], Vec::new());
+        let first_generation = match request_rx.try_recv().unwrap() {
+            Request::DiscoverRules {
+                generation, paths, ..
+            } => {
+                assert_eq!(paths, [PathBuf::from("old-00")]);
+                generation
+            }
+            _ => panic!("expected first discovery"),
+        };
+        for index in 0..16 {
+            cache.configure_rules(vec![PathBuf::from(format!("new-{index:02}"))], Vec::new());
+        }
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(cache.rule_catalog_deferred);
+        assert_eq!(
+            cache.rule_catalog_reservation.unwrap().generation,
+            first_generation
+        );
+
+        response_tx
+            .send(Response::RuleCatalog {
+                summaries: Vec::new(),
+                approximate_bytes: 0,
+                generation: first_generation,
+            })
+            .unwrap();
+        cache.poll();
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::DiscoverRules {
+                paths,
+                generation,
+                ..
+            }) if paths == [PathBuf::from("new-15")] && generation == cache.rule_generation
+        ));
+        assert_eq!(
+            cache.rule_catalog_reservation.unwrap().generation,
+            cache.rule_generation
+        );
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+    }
+
+    #[test]
+    fn growing_coalesced_rule_configuration_rebases_its_reservation() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+
+        cache.configure_rules(vec![PathBuf::from("old")], Vec::new());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::DiscoverRules { .. })
+        ));
+        cache.configure_rules(vec![PathBuf::from("n".repeat(4096))], Vec::new());
+
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+        assert!(cache.rule_catalog_reservation.is_some() || cache.rule_catalog_deferred);
+        assert_eq!(
+            cache
+                .worker
+                .as_ref()
+                .unwrap()
+                .rule_generation
+                .load(Ordering::Acquire),
+            cache.rule_generation
+        );
+    }
+
+    #[test]
+    fn fixed_configuration_request_floor_is_terminal() {
+        let mut cache = CompletionCache::new(
+            MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES + MAX_RULE_ADMISSION_BYTES,
+            128,
+        );
+        cache.configure_rules(Vec::new(), Vec::new());
+        assert!(cache.rule_catalog_ready);
+        assert!(!cache.rule_catalog_deferred);
+        assert!(cache.rule_configuration.is_none());
+    }
+
+    #[test]
+    fn intrinsically_oversized_rule_configuration_is_terminal() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(128, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+
+        cache.rule_store_bytes = 32;
+        cache.used_bytes = cache.used_bytes.saturating_add(32);
+        cache.filesystem_generation = 7;
+        cache.configure_rules(vec![PathBuf::from("x".repeat(64))], Vec::new());
+
+        assert!(cache.rule_catalog_ready);
+        assert!(!cache.rule_catalog_deferred);
+        assert!(cache.rule_catalog_reservation.is_none());
+        assert_eq!(cache.rule_store_bytes, 0);
+        assert_eq!(
+            cache
+                .worker
+                .as_ref()
+                .unwrap()
+                .filesystem_generation
+                .load(Ordering::Acquire),
+            7
+        );
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+        assert!(!matches!(
+            request_rx.try_recv(),
+            Ok(Request::DiscoverRules { .. })
+        ));
+    }
+
+    #[test]
+    fn lowering_limit_rebases_a_store_that_cannot_be_rediscovered() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(2 * 1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        cache.configure_rules(vec![PathBuf::from("rules")], Vec::new());
+        let generation = match request_rx.try_recv().unwrap() {
+            Request::DiscoverRules { generation, .. } => generation,
+            _ => panic!("expected discovery"),
+        };
+        response_tx
+            .send(Response::RuleCatalog {
+                summaries: Vec::new(),
+                approximate_bytes: 900 * 1024,
+                generation,
+            })
+            .unwrap();
+        cache.poll();
+        assert_eq!(cache.rule_store_bytes, 900 * 1024);
+
+        let lowered_limit = cache.capacity_accounted_bytes();
+        cache.reconfigure(lowered_limit, 128);
+
+        assert_eq!(cache.rule_store_bytes, 0);
+        assert!(cache.capacity_accounted_bytes() <= cache.byte_limit);
+        assert!(cache.rule_catalog_reservation.is_some() || cache.rule_catalog_deferred);
+    }
+
+    #[test]
+    fn lowering_cache_limit_discards_an_oversized_retained_snapshot() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.users = vec!["x".repeat(128 * 1024)];
+        cache.snapshot_bytes = owned_strings_bytes(&cache.users);
+        cache.used_bytes = cache.snapshot_bytes;
+        let generation = cache.response_generation;
+
+        cache.reconfigure(1024, 128);
+
+        assert!(cache.users.is_empty());
+        assert_eq!(cache.snapshot_bytes, 0);
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+        assert_ne!(cache.response_generation, generation);
+    }
+
+    #[test]
     fn unchanged_rule_paths_are_rediscovered_on_explicit_configuration() {
         let mut cache = CompletionCache::new(1024 * 1024, 128);
         let paths = vec![PathBuf::from("/tmp/bashlume-rules")];
@@ -3204,6 +4257,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         let directory = PathBuf::from("/unchanged");
@@ -3239,6 +4293,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         let key = ScanKey {
@@ -3275,6 +4330,7 @@ mod tests {
         cache.poll();
         assert!(cache.pending.contains(&key));
         assert!(!cache.entries.contains_key(&key));
+        assert_eq!(cache.response_generation(), 0);
         response_tx
             .send(Response::Scan {
                 key: key.clone(),
@@ -3291,6 +4347,7 @@ mod tests {
         cache.poll();
         assert!(!cache.pending.contains(&key));
         assert_eq!(cache.entries[&key].entries[0].name, "new");
+        assert_eq!(cache.response_generation(), 1);
     }
 
     #[test]
@@ -3460,6 +4517,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         };
         let mut cache = CompletionCache::new(1024 * 1024, 128);
@@ -3497,6 +4555,188 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_rule_load_keeps_reservation_until_stale_terminal_ack() {
+        let (request_tx, request_rx) = mpsc::sync_channel(4);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+
+        assert!(cache.rule_programs("old").1);
+        let old_generation = match request_rx.try_recv().unwrap() {
+            Request::LoadRules { generation, .. } => generation,
+            _ => panic!("expected the old rule load"),
+        };
+        let reserved = cache.rule_load_reservation.unwrap().bytes;
+        cache.configure_rules(Vec::new(), Vec::new());
+        assert_eq!(cache.rule_load_reservation.unwrap().bytes, reserved);
+        assert!(cache.accounted_bytes() >= reserved);
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        response_tx
+            .send(Response::Rules {
+                command: "old".into(),
+                programs: Vec::new(),
+                errors: Vec::new(),
+                approximate_bytes: 0,
+                generation: old_generation,
+                complete: true,
+                rejected: false,
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.rule_load_reservation.is_none());
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::DiscoverRules { generation, .. }) if generation == cache.rule_generation
+        ));
+    }
+
+    #[test]
+    fn replay_reservation_preserves_rule_admission_headroom() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.set_replay_reservation(usize::MAX);
+        assert_eq!(cache.replay_reserved_bytes, cache.replay_byte_limit());
+        assert!(cache.capacity_accounted_bytes() <= cache.byte_limit);
+    }
+
+    #[test]
+    fn retained_catalog_preserves_one_maximum_rule_admission() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        cache.rule_store_bytes = cache
+            .byte_limit
+            .saturating_sub(MAX_RULE_CONFIGURATION_ACCOUNTED_BYTES)
+            .saturating_sub(MAX_RULE_ADMISSION_BYTES);
+        cache.used_bytes = cache.rule_store_bytes;
+        let command = "x".repeat(MAX_RULE_LOOKUP_BYTES);
+
+        assert!(cache.rule_programs(&command).1);
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::LoadRules { command: sent, .. }) if sent == command
+        ));
+        assert!(cache.capacity_accounted_bytes() <= cache.byte_limit);
+    }
+
+    #[test]
+    fn intrinsically_unaffordable_rule_admission_is_terminal() {
+        let mut cache = CompletionCache::new(1, 128);
+        let (programs, pending) = cache.rule_programs("command");
+        assert!(programs.is_none());
+        assert!(!pending);
+        assert!(cache.rule_rejected.contains(&rule_command_hash("command")));
+        assert!(cache.rule_pending.is_empty());
+    }
+
+    #[test]
+    fn transient_rule_admission_pressure_does_not_poison_command() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+        cache.replay_reserved_bytes = cache.byte_limit;
+
+        let (programs, pending) = cache.rule_programs("temporary");
+        assert!(programs.is_none());
+        assert!(pending);
+        assert!(!cache.rule_pending.contains("temporary"));
+        assert!(
+            !cache
+                .rule_rejected
+                .contains(&rule_command_hash("temporary"))
+        );
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        cache.replay_reserved_bytes = 0;
+        assert!(cache.rule_programs("temporary").1);
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Request::LoadRules { command, .. }) if command == "temporary"
+        ));
+    }
+
+    #[test]
+    fn queued_rule_loads_reserve_one_current_aggregate_budget() {
+        let (request_tx, request_rx) = mpsc::sync_channel(4);
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(true)),
+        });
+
+        assert!(cache.rule_programs("first").1);
+        let first_budget = match request_rx.try_recv().unwrap() {
+            Request::LoadRules { byte_limit, .. } => byte_limit,
+            _ => panic!("expected the first rule load"),
+        };
+        assert!(cache.rule_load_reservation.is_some());
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+
+        assert!(cache.rule_programs("second").1);
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!cache.rule_pending.contains("second"));
+
+        response_tx
+            .send(Response::Rules {
+                command: "first".into(),
+                programs: Vec::new(),
+                errors: Vec::new(),
+                approximate_bytes: 0,
+                generation: cache.rule_generation,
+                complete: true,
+                rejected: false,
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.rule_programs("second").1);
+        let second_budget = match request_rx.try_recv().unwrap() {
+            Request::LoadRules {
+                command,
+                byte_limit,
+                ..
+            } => {
+                assert_eq!(command, "second");
+                byte_limit
+            }
+            _ => panic!("expected the deferred rule load"),
+        };
+        assert!(second_budget < first_budget);
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
+    }
+
+    #[test]
     fn background_poll_retries_abandoned_deferred_rule_loads() {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         request_tx.try_send(Request::Stop).unwrap();
@@ -3508,6 +4748,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         assert!(cache.rule_programs("deferred").1);
@@ -3523,22 +4764,38 @@ mod tests {
     }
 
     #[test]
+    fn intrinsically_unaffordable_snapshot_is_terminally_unavailable() {
+        let mut cache = CompletionCache::new(16 * 1024 * 1024, 128);
+        cache.load_snapshots(None);
+        assert!(cache.snapshots_unavailable());
+        assert!(!cache.snapshots_pending());
+        assert!(cache.snapshot_reservation.is_none());
+        assert!(!cache.background_pending());
+    }
+
+    #[test]
     fn oversized_snapshot_home_is_not_retained_or_dispatched() {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (_response_tx, response_rx) = mpsc::channel();
-        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        let mut cache = CompletionCache::new(64 * 1024 * 1024, 128);
         cache.worker = Some(WorkerClient {
             requests: Some(request_tx),
             responses: response_rx,
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         cache.load_snapshots(Some(PathBuf::from(
             "x".repeat(MAX_PATH_COMPONENT_BYTES + 1),
         )));
         assert!(cache.snapshot_home.is_none());
+        assert_eq!(
+            cache.snapshot_reservation.map(|(_, bytes)| bytes),
+            Some(MAX_SNAPSHOT_LOAD_RESERVATION_BYTES)
+        );
+        assert!(cache.accounted_bytes() <= cache.byte_limit);
         assert!(matches!(
             request_rx.try_recv(),
             Ok(Request::LoadSnapshots { home: None, .. })
@@ -3549,13 +4806,14 @@ mod tests {
     fn latest_snapshot_home_is_retried_and_stale_response_is_ignored() {
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (response_tx, response_rx) = mpsc::channel();
-        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        let mut cache = CompletionCache::new(64 * 1024 * 1024, 128);
         cache.worker = Some(WorkerClient {
             requests: Some(request_tx),
             responses: response_rx,
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         cache.load_snapshots(Some(PathBuf::from("/old-home")));
@@ -3684,6 +4942,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(cache.filesystem_generation)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(true)),
         });
         cache.filesystem_pending.insert(key.clone());
@@ -3704,6 +4963,68 @@ mod tests {
     }
 
     #[test]
+    fn worker_rejected_terminal_rule_chunk_never_publishes_staged_programs() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.worker.take();
+        let (request_tx, _request_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::channel();
+        cache.worker = Some(WorkerClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
+            rule_chunk_ack: Arc::new(AtomicBool::new(false)),
+        });
+        cache.rule_pending.insert("huge".into());
+        response_tx
+            .send(Response::Rules {
+                command: "huge".into(),
+                programs: Vec::new(),
+                errors: Vec::new(),
+                approximate_bytes: 512,
+                generation: cache.rule_generation,
+                complete: false,
+                rejected: false,
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.pending_rule_chunks.contains_key("huge"));
+        assert!(!cache.rule_entries.contains_key("huge"));
+        cache.acknowledge_rule_chunk();
+        assert!(!cache.rule_chunk_ready_to_ack);
+
+        response_tx
+            .send(Response::Rules {
+                command: "huge".into(),
+                programs: Vec::new(),
+                errors: vec!["worker rule limit".into()],
+                approximate_bytes: 0,
+                generation: cache.rule_generation,
+                complete: true,
+                rejected: true,
+            })
+            .unwrap();
+        cache.poll();
+
+        assert!(cache.rule_chunk_ready_to_ack);
+        cache.acknowledge_rule_chunk();
+        assert!(
+            cache
+                .worker
+                .as_ref()
+                .unwrap()
+                .rule_chunk_ack
+                .load(Ordering::Acquire)
+        );
+        assert!(cache.pending_rule_chunks.is_empty());
+        assert!(!cache.rule_entries.contains_key("huge"));
+        assert!(cache.rule_rejected.contains(&rule_command_hash("huge")));
+        assert_eq!(cache.response_generation(), 0);
+    }
+
+    #[test]
     fn oversized_rule_load_is_terminal_instead_of_requeued() {
         let mut cache = CompletionCache::new(1, 128);
         cache.worker.take();
@@ -3715,6 +5036,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::new(AtomicU64::new(0)),
             rule_chunk_ack: Arc::new(AtomicBool::new(false)),
         });
         cache.rule_pending.insert("huge".into());
@@ -3735,10 +5057,12 @@ mod tests {
                 approximate_bytes: 1024,
                 generation: cache.rule_generation,
                 complete: false,
+                rejected: false,
             })
             .unwrap();
 
         cache.poll();
+        assert_eq!(cache.response_generation(), 0);
         assert!(cache.rule_chunk_ready_to_ack);
         cache.acknowledge_rule_chunk();
         assert!(!cache.rule_chunk_ready_to_ack);
@@ -3765,10 +5089,104 @@ mod tests {
                 approximate_bytes: 0,
                 generation: cache.rule_generation,
                 complete: true,
+                rejected: false,
             })
             .unwrap();
         cache.poll();
         assert!(!cache.rule_pending.contains("huge"));
+    }
+
+    #[test]
+    fn retained_rule_diagnostics_are_deduplicated_and_cache_accounted() {
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.record_rule_error("duplicate".into());
+        cache.record_rule_error("duplicate".into());
+        assert_eq!(cache.rule_errors, ["duplicate"]);
+        assert_eq!(cache.used_bytes(), owned_strings_bytes(&cache.rule_errors));
+
+        let mut tiny = CompletionCache::new(1, 128);
+        tiny.record_rule_error("cannot fit".into());
+        assert!(tiny.rule_errors.is_empty());
+        assert_eq!(tiny.used_bytes(), 0);
+    }
+
+    #[test]
+    fn probe_admission_reserves_the_bounded_parsed_representation() {
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "printf".into(),
+                arguments: vec!["value".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:parsed-admission".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1000,
+            output_limit: 8192,
+            cache_ttl_ms: 1000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        let cache_key = ProbeCacheKey::from(&request);
+        let parsed_slots = MAX_PARSED_PROBE_VALUES * std::mem::size_of::<String>();
+        assert!(
+            probe_admission_bytes(&request, &cache_key)
+                >= request.output_limit as usize * 7 + parsed_slots
+        );
+    }
+
+    #[test]
+    fn transient_probe_admission_pressure_does_not_poison_request() {
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let (_response_tx, response_rx) = mpsc::sync_channel(1);
+        let mut cache = CompletionCache::new(1024 * 1024, 128);
+        cache.probe_worker = Some(ProbeClient {
+            requests: Some(request_tx),
+            responses: response_rx,
+            handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            cleanup_reservation: Arc::new(AtomicUsize::new(0)),
+        });
+        let request = ProbeRequest {
+            key: ProbeKey {
+                executable: "printf".into(),
+                arguments: vec!["value".into()],
+                environment: Vec::new(),
+                working_directory: "/tmp".into(),
+                parser: crate::rules::ir::ProbeParser::Lines,
+                include_stderr: false,
+            },
+            probe_id: "script:test:transient-admission".into(),
+            candidate_kind: crate::rules::ir::RuleCandidateKind::Value,
+            append: crate::rules::ir::AppendPolicy::Space,
+            timeout_ms: 1000,
+            output_limit: 4096,
+            cache_ttl_ms: 1000,
+            description: None,
+            source: crate::rules::format::SourceKind::User,
+            dynamic_authorized: true,
+        };
+        let cache_key = ProbeCacheKey::from(&request);
+        cache.replay_reserved_bytes = cache.byte_limit;
+
+        let (values, pending) = cache.probe_values(&request);
+        assert!(values.is_none());
+        assert!(pending);
+        assert!(!cache.probe_rejected.contains(&probe_cache_hash(&cache_key)));
+        assert!(cache.probe_admissions.is_empty());
+        assert!(matches!(request_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        cache.replay_reserved_bytes = 0;
+        assert!(cache.probe_values(&request).1);
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(ProbeWorkerRequest::Run { generation: 0, .. })
+        ));
     }
 
     #[test]
@@ -3808,6 +5226,7 @@ mod tests {
         let (request_tx, _request_rx) = mpsc::sync_channel(1);
         let (_response_tx, response_rx) = mpsc::channel();
         let acknowledgement = Arc::new(AtomicBool::new(false));
+        let worker_generation = Arc::new(AtomicU64::new(0));
         let mut cache = CompletionCache::new(1024 * 1024, 128);
         cache.worker = Some(WorkerClient {
             requests: Some(request_tx),
@@ -3815,11 +5234,17 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             filesystem_generation: Arc::new(AtomicU64::new(0)),
+            rule_generation: Arc::clone(&worker_generation),
             rule_chunk_ack: Arc::clone(&acknowledgement),
         });
         cache.rule_chunk_ready_to_ack = true;
         cache.configure_rules(Vec::new(), Vec::new());
         assert!(acknowledgement.load(Ordering::Acquire));
+        assert_eq!(
+            worker_generation.load(Ordering::Acquire),
+            cache.rule_generation
+        );
+        assert_ne!(worker_generation.load(Ordering::Acquire), 0);
         assert!(!cache.rule_chunk_ready_to_ack);
     }
 
@@ -3835,6 +5260,7 @@ mod tests {
             handle: None,
             stop: Arc::new(AtomicBool::new(false)),
             generation: Arc::new(AtomicU64::new(cache.probe_generation)),
+            cleanup_reservation: Arc::new(AtomicUsize::new(PROBE_CLEANUP_FINISHED)),
         });
         let request = ProbeRequest {
             key: ProbeKey {
@@ -3870,6 +5296,7 @@ mod tests {
             .unwrap();
 
         cache.poll();
+        assert_eq!(cache.response_generation(), 0);
         assert!(!cache.probe_entries.contains_key(&cache_key));
         assert!(!cache.probe_fresh.contains(&cache_key));
         assert!(cache.probe_rejected.contains(&probe_cache_hash(&cache_key)));

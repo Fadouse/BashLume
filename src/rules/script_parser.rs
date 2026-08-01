@@ -24,6 +24,11 @@ const MAX_WORD_PARSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TOKENS: usize = 8_000_000;
 const MAX_PARSE_NESTING: usize = 256;
 const MAX_REDIRECTION_DESCRIPTOR: u16 = 9;
+const MAX_STATIC_REGISTRATION_WALK_WORK: usize = 16_384;
+const MAX_STATIC_REGISTRATIONS: usize = 4096;
+const MAX_STATIC_REGISTRATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FISH_FORWARDER_FUNCTIONS: usize = 65_536;
+const MAX_FISH_FORWARDER_EDGES: usize = 262_144;
 thread_local! {
     static WORD_PARSE_DEPTH: Cell<usize> = const { Cell::new(0) };
     static WORD_PARSE_WORK: Cell<usize> = const { Cell::new(0) };
@@ -586,13 +591,13 @@ pub fn parse_script(
     apply_here_documents(&mut statements, &here_documents);
     if dialect == ScriptDialect::Fish {
         let mut variables = HashMap::new();
-        let forwarders = fish_completion_forwarders(&statements);
+        let forwarders = fish_completion_forwarders(&statements)?;
         compile_fish_deferred_scripts(&mut statements, &mut variables, &forwarders)?;
     }
     let mut functions = Vec::new();
     collect_functions(&statements, &mut functions);
     let registrations =
-        extract_registrations(dialect, &source_path, source, &statements, &functions);
+        extract_registrations(dialect, &source_path, source, &statements, &functions)?;
     let module = ScriptModule {
         dialect,
         source_path,
@@ -3341,37 +3346,66 @@ fn fish_deferred_variable_source(
     variables.get(expression).cloned()
 }
 
-fn fish_completion_forwarders(statements: &[ScriptStatement]) -> HashSet<String> {
+fn fish_completion_forwarders(
+    statements: &[ScriptStatement],
+) -> Result<HashSet<String>, ScriptParseError> {
     let mut functions = Vec::new();
     collect_functions(statements, &mut functions);
-    let calls = functions
-        .iter()
-        .map(|function| {
-            let mut names = HashSet::new();
-            collect_fish_command_names(&function.body, &mut names);
-            (function.name.clone(), names)
-        })
-        .collect::<HashMap<_, _>>();
-    let mut forwarders = calls
-        .iter()
-        .filter(|(_, names)| names.contains("complete"))
-        .map(|(name, _)| name.clone())
-        .collect::<HashSet<_>>();
-    loop {
-        let additions = calls
-            .iter()
-            .filter(|(name, names)| {
-                !forwarders.contains(*name)
-                    && names.iter().any(|called| forwarders.contains(called))
-            })
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        if additions.is_empty() {
-            break;
-        }
-        forwarders.extend(additions);
+    if functions.len() > MAX_FISH_FORWARDER_FUNCTIONS {
+        return Err(ScriptParseError {
+            line: 1,
+            message: "Fish completion forwarder limit exceeded".into(),
+        });
     }
-    forwarders
+    let indices = functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| (function.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut reverse_edges = vec![Vec::<usize>::new(); functions.len()];
+    let mut forwarder = vec![false; functions.len()];
+    let mut queue = Vec::new();
+    let mut edge_count = 0_usize;
+    for (caller, function) in functions.iter().enumerate() {
+        if indices.get(function.name.as_str()) != Some(&caller) {
+            continue;
+        }
+        let mut names = HashSet::new();
+        collect_fish_command_names(&function.body, &mut names);
+        if names.contains("complete") {
+            forwarder[caller] = true;
+            queue.push(caller);
+        }
+        for called in names {
+            let Some(&target) = indices.get(called.as_str()) else {
+                continue;
+            };
+            edge_count = edge_count.saturating_add(1);
+            if edge_count > MAX_FISH_FORWARDER_EDGES {
+                return Err(ScriptParseError {
+                    line: 1,
+                    message: "Fish completion forwarder limit exceeded".into(),
+                });
+            }
+            reverse_edges[target].push(caller);
+        }
+    }
+    let mut cursor = 0_usize;
+    while let Some(&target) = queue.get(cursor) {
+        cursor += 1;
+        for &caller in &reverse_edges[target] {
+            if !forwarder[caller] {
+                forwarder[caller] = true;
+                queue.push(caller);
+            }
+        }
+    }
+    Ok(functions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| forwarder[*index])
+        .map(|(_, function)| function.name.clone())
+        .collect())
 }
 
 fn collect_fish_command_names(statements: &[ScriptStatement], names: &mut HashSet<String>) {
@@ -3889,11 +3923,18 @@ fn extract_registrations(
     source: &str,
     statements: &[ScriptStatement],
     functions: &[ScriptFunction],
-) -> Vec<ScriptRegistration> {
+) -> Result<Vec<ScriptRegistration>, ScriptParseError> {
     let mut registrations = Vec::new();
     match dialect {
         ScriptDialect::Fish | ScriptDialect::Bash => {
-            StaticRegistrationWalker::new(dialect, &mut registrations).walk(statements);
+            let mut walker = StaticRegistrationWalker::new(dialect, &mut registrations);
+            walker.walk(statements);
+            if walker.limit_exceeded {
+                return Err(ScriptParseError {
+                    line: 1,
+                    message: "static registration extraction limit exceeded".into(),
+                });
+            }
         }
         ScriptDialect::Zsh => {
             for line in source.lines().take(64) {
@@ -3908,43 +3949,66 @@ fn extract_registrations(
                             name: function.name.clone(),
                         }
                     });
-                    let names = names.split_whitespace().collect::<Vec<_>>();
-                    let mut index = 0;
+                    let mut names = names.split_whitespace();
                     let mut order = 0_u32;
-                    while index < names.len() {
-                        let name = names[index];
-                        let (registration, consumed) = match name {
-                            "-P" | "-p" if index + 1 < names.len() => {
-                                (Some((names[index + 1].to_owned(), None)), 2)
+                    let mut registration_bytes = 0_usize;
+                    while let Some(name) = names.next() {
+                        let registration = match name {
+                            "-P" | "-p" => names.next().map(|name| (name, None, false)),
+                            "-S" | "-s" => names.next().map(|name| (name, None, true)),
+                            "-N" | "-R" => {
+                                names.next();
+                                None
                             }
-                            "-S" | "-s" if index + 1 < names.len() => {
-                                (Some((format!("*{}", names[index + 1]), None)), 2)
+                            "-K" => {
+                                names.next();
+                                names.next();
+                                None
                             }
-                            "-N" | "-R" if index + 1 < names.len() => (None, 2),
-                            "-K" if index + 2 < names.len() => (None, 3),
-                            value if value.starts_with('-') => (None, 1),
+                            value if value.starts_with('-') => None,
                             value => {
-                                let (command, service) = value.split_once('=').map_or(
-                                    (value.to_owned(), None),
-                                    |(command, service)| {
-                                        (command.to_owned(), Some(service.to_owned()))
-                                    },
-                                );
-                                (Some((command, service)), 1)
+                                let (command, service) = value
+                                    .split_once('=')
+                                    .map_or((value, None), |(command, service)| {
+                                        (command, Some(service))
+                                    });
+                                Some((command, service, false))
                             }
                         };
-                        if let Some((command, service)) = registration {
-                            if !command.is_empty() {
-                                registrations.push(ScriptRegistration {
-                                    command,
-                                    entry: entry.clone(),
-                                    service,
-                                    source_order: order,
-                                });
-                                order = order.saturating_add(1);
-                            }
+                        let Some((command, service, prefix_glob)) = registration else {
+                            continue;
+                        };
+                        if command.is_empty() {
+                            continue;
                         }
-                        index += consumed;
+                        let command_bytes = command.len().saturating_add(usize::from(prefix_glob));
+                        let bytes = std::mem::size_of::<ScriptRegistration>()
+                            .saturating_add(command_bytes)
+                            .saturating_add(service.map_or(0, str::len))
+                            .saturating_add(match &entry {
+                                ScriptEntry::Function { name } => name.len(),
+                                ScriptEntry::Module | ScriptEntry::FishComplete { .. } => 0,
+                            });
+                        registration_bytes = registration_bytes.saturating_add(bytes);
+                        if registrations.len() >= MAX_STATIC_REGISTRATIONS
+                            || registration_bytes > MAX_STATIC_REGISTRATION_BYTES
+                        {
+                            return Err(ScriptParseError {
+                                line: 1,
+                                message: "static registration extraction limit exceeded".into(),
+                            });
+                        }
+                        registrations.push(ScriptRegistration {
+                            command: if prefix_glob {
+                                format!("*{command}")
+                            } else {
+                                command.to_owned()
+                            },
+                            entry: entry.clone(),
+                            service: service.map(str::to_owned),
+                            source_order: order,
+                        });
+                        order = order.saturating_add(1);
                     }
                     break;
                 }
@@ -3982,7 +4046,7 @@ fn extract_registrations(
     registrations.dedup_by(|left, right| {
         left.command == right.command && left.entry == right.entry && left.service == right.service
     });
-    registrations
+    Ok(registrations)
 }
 
 struct StaticRegistrationWalker<'a> {
@@ -3990,6 +4054,9 @@ struct StaticRegistrationWalker<'a> {
     environment: HashMap<String, Vec<String>>,
     registrations: &'a mut Vec<ScriptRegistration>,
     order: u32,
+    work: usize,
+    registration_bytes: usize,
+    limit_exceeded: bool,
 }
 
 impl<'a> StaticRegistrationWalker<'a> {
@@ -3999,16 +4066,45 @@ impl<'a> StaticRegistrationWalker<'a> {
             environment: HashMap::new(),
             registrations,
             order: 0,
+            work: 0,
+            registration_bytes: 0,
+            limit_exceeded: false,
         }
+    }
+
+    fn push_registration(&mut self, registration: ScriptRegistration) {
+        let bytes = std::mem::size_of::<ScriptRegistration>()
+            .saturating_add(registration.command.len())
+            .saturating_add(registration.service.as_ref().map_or(0, String::len))
+            .saturating_add(match &registration.entry {
+                ScriptEntry::Function { name } => name.len(),
+                ScriptEntry::Module | ScriptEntry::FishComplete { .. } => 0,
+            });
+        self.registration_bytes = self.registration_bytes.saturating_add(bytes);
+        if self.registrations.len() >= MAX_STATIC_REGISTRATIONS
+            || self.registration_bytes > MAX_STATIC_REGISTRATION_BYTES
+        {
+            self.limit_exceeded = true;
+            return;
+        }
+        self.registrations.push(registration);
     }
 
     fn walk(&mut self, statements: &[ScriptStatement]) {
         for statement in statements {
+            if self.limit_exceeded {
+                break;
+            }
             self.statement(statement);
         }
     }
 
     fn statement(&mut self, statement: &ScriptStatement) {
+        self.work = self.work.saturating_add(1);
+        if self.work > MAX_STATIC_REGISTRATION_WALK_WORK {
+            self.limit_exceeded = true;
+            return;
+        }
         match statement {
             ScriptStatement::Command { command } => self.command(command),
             ScriptStatement::Pipeline { commands, .. } => self.walk(commands),
@@ -4110,16 +4206,29 @@ impl<'a> StaticRegistrationWalker<'a> {
         }
         match self.dialect {
             ScriptDialect::Fish => {
-                let service = fish_complete_wrap(&arguments[1..]);
+                let services = fish_complete_wraps(&arguments[1..]);
                 for command_name in fish_complete_commands(&arguments[1..]) {
-                    self.registrations.push(ScriptRegistration {
-                        command: command_name,
-                        entry: ScriptEntry::FishComplete {
-                            statement_index: self.order,
-                        },
-                        service: service.clone(),
-                        source_order: self.order,
-                    });
+                    if services.is_empty() {
+                        self.push_registration(ScriptRegistration {
+                            command: command_name,
+                            entry: ScriptEntry::FishComplete {
+                                statement_index: self.order,
+                            },
+                            service: None,
+                            source_order: self.order,
+                        });
+                    } else {
+                        for service in &services {
+                            self.push_registration(ScriptRegistration {
+                                command: command_name.clone(),
+                                entry: ScriptEntry::FishComplete {
+                                    statement_index: self.order,
+                                },
+                                service: Some(service.clone()),
+                                source_order: self.order,
+                            });
+                        }
+                    }
                 }
             }
             ScriptDialect::Bash => self.bash_complete(&arguments[1..]),
@@ -4182,7 +4291,7 @@ impl<'a> StaticRegistrationWalker<'a> {
         let entry = function.map_or(ScriptEntry::Module, |name| ScriptEntry::Function { name });
         for command in commands {
             if !command.is_empty() && !command.contains('\0') {
-                self.registrations.push(ScriptRegistration {
+                self.push_registration(ScriptRegistration {
                     command,
                     entry: entry.clone(),
                     service: None,
@@ -4330,12 +4439,14 @@ fn expand_literal_braces(value: &str) -> Vec<String> {
         } else if first.chars().count() == 1 && last.chars().count() == 1 {
             let first = first.chars().next().unwrap() as u32;
             let last = last.chars().next().unwrap() as u32;
-            let range: Box<dyn Iterator<Item = u32>> = if first <= last {
-                Box::new(first..=last)
-            } else {
-                Box::new((last..=first).rev())
-            };
-            alternatives = range.filter_map(char::from_u32).map(String::from).collect();
+            if first.abs_diff(last) < 4096 {
+                let range: Box<dyn Iterator<Item = u32>> = if first <= last {
+                    Box::new(first..=last)
+                } else {
+                    Box::new((last..=first).rev())
+                };
+                alternatives = range.filter_map(char::from_u32).map(String::from).collect();
+            }
         }
     }
     if alternatives.is_empty() {
@@ -4400,18 +4511,27 @@ fn fish_complete_commands(arguments: &[String]) -> Vec<String> {
     commands
 }
 
-fn fish_complete_wrap(arguments: &[String]) -> Option<String> {
+fn fish_complete_wraps(arguments: &[String]) -> Vec<String> {
+    let mut services = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
         if matches!(argument.as_str(), "-w" | "--wraps") {
-            return arguments
+            if let Some(service) = arguments
                 .get(index + 1)
-                .filter(|value| !value.is_empty())
-                .cloned();
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+            {
+                services.push(service.clone());
+            }
+            index += 2;
+            continue;
         }
         if let Some(value) = argument.strip_prefix("--wraps=") {
-            return (!value.is_empty()).then(|| value.to_owned());
+            if !value.is_empty() && !value.contains('\0') {
+                services.push(value.to_owned());
+            }
+            index += 1;
+            continue;
         }
         if fish_complete_option_takes_value(argument)
             || matches!(argument.as_str(), "-c" | "--command" | "-p" | "--path")
@@ -4421,7 +4541,9 @@ fn fish_complete_wrap(arguments: &[String]) -> Option<String> {
             index += 1;
         }
     }
-    None
+    services.sort_unstable();
+    services.dedup();
+    services
 }
 
 fn fish_complete_option_takes_value(value: &str) -> bool {
@@ -4553,6 +4675,22 @@ complete -F _hello -o bashdefault demo
         )
         .unwrap_err();
         assert!(error.message.starts_with("unterminated here-document"));
+    }
+
+    #[test]
+    fn nested_static_registration_loops_are_work_bounded() {
+        let values = (0..256)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!(
+            "for outer in {values}\nfor inner in {values}\ncomplete -c demo -l option\nend\nend\n"
+        );
+        let error = parse_script(ScriptDialect::Fish, "loops.fish", &source).unwrap_err();
+        assert_eq!(
+            error.message,
+            "static registration extraction limit exceeded"
+        );
     }
 
     #[test]
@@ -5080,9 +5218,39 @@ complete -c demo -n __demo_condition -l help -d 'Show help'
     }
 
     #[test]
+    fn fish_forwarder_chains_use_bounded_linear_reachability() {
+        let mut source = String::new();
+        for index in 0..2048 {
+            source.push_str(&format!("function f{index}\n"));
+            if index + 1 == 2048 {
+                source.push_str("complete -c demo -l ready\n");
+            } else {
+                source.push_str(&format!("f{}\n", index + 1));
+            }
+            source.push_str("end\n");
+        }
+        source.push_str("f0\n");
+        let module = parse_script(ScriptDialect::Fish, "demo.fish", &source).unwrap();
+        assert_eq!(module.functions.len(), 2048);
+    }
+
+    #[test]
+    fn fish_character_brace_ranges_are_bounded_before_collection() {
+        let value = format!("{{a..{}}}", char::MAX);
+        assert_eq!(expand_literal_braces(&value), [value]);
+    }
+
+    #[test]
     fn reads_zsh_compdef_without_using_zsh_parser() {
         let source = "#compdef git-hub gh\n_arguments '*:file:_files'\n";
         let module = parse_script(ScriptDialect::Zsh, "_gh", source).unwrap();
         assert_eq!(module.registrations.len(), 2);
+    }
+
+    #[test]
+    fn zsh_compdef_registrations_are_bounded_before_cloning() {
+        let source = format!("#compdef {}\n", "x ".repeat(MAX_STATIC_REGISTRATIONS + 1));
+        let error = parse_script(ScriptDialect::Zsh, "_x", &source).unwrap_err();
+        assert!(error.message.contains("registration extraction limit"));
     }
 }

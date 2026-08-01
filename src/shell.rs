@@ -29,6 +29,7 @@ pub struct ShellSnapshot {
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
     pub path: String,
+    pub interactive_comments_disabled: bool,
     pub effective_user_id: u32,
     pub generation: u64,
 }
@@ -50,6 +51,12 @@ impl ShellSnapshot {
             .unwrap_or_else(|| PathBuf::from("."));
         self.home = unsafe { shell_variable("HOME") }.map(PathBuf::from);
         self.path = unsafe { shell_variable("PATH") }.unwrap_or_default();
+        self.interactive_comments_disabled =
+            unsafe { shell_variable("BASHOPTS") }.is_some_and(|options| {
+                !options
+                    .split(':')
+                    .any(|option| option == "interactive_comments")
+            });
         self.command_frequency = unsafe { command_frequency() };
         self.environment = environment_snapshot();
         self.effective_user_id = unsafe { libc::geteuid() };

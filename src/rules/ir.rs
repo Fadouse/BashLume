@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::HashSet;
 use std::fmt;
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-use super::script::ScriptModule;
+use super::script::{
+    MAX_SCRIPT_TAG_DEFERRED_FIELDS, MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES, ScriptModule,
+    ScriptStatement,
+};
 
 pub const COMMAND_BLOCK_MAGIC: &[u8; 4] = b"BLIR";
 pub const COMMAND_BLOCK_VERSION: u16 = 4;
@@ -15,8 +20,13 @@ pub const MAX_REGISTRATIONS: usize = 4096;
 pub const MAX_RULES: usize = 65_536;
 pub const MAX_PREDICATES_PER_RULE: usize = 4096;
 pub const MAX_PROBES: usize = 4096;
+const PROBE_ID_VALIDATION_SCRATCH_BYTES: usize = 64;
 pub const MAX_STRINGS_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+pub const MAX_SCRIPT_MODULES: usize = 4096;
+pub const MAX_SCRIPT_AGGREGATE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_COMMAND_DECODE_ALLOCATION_BYTES: usize =
+    MAX_COMMAND_BLOCK_BYTES + MAX_SCRIPT_AGGREGATE_BYTES;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -271,8 +281,514 @@ pub struct CommandProgram {
     pub scripts: Vec<ScriptModule>,
 }
 
+fn json_key_equals(mut raw: &[u8], expected: &[u8]) -> bool {
+    for expected_byte in expected {
+        let Some((&byte, rest)) = raw.split_first() else {
+            return false;
+        };
+        if byte == *expected_byte {
+            raw = rest;
+            continue;
+        }
+        if byte != b'\\' || rest.len() < 5 || rest[0] != b'u' {
+            return false;
+        }
+        let hex = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let Some(value) = hex(rest[1])
+            .zip(hex(rest[2]))
+            .zip(hex(rest[3]))
+            .zip(hex(rest[4]))
+            .map(|(((a, b), c), d)| {
+                (u16::from(a) << 12) | (u16::from(b) << 8) | (u16::from(c) << 4) | u16::from(d)
+            })
+        else {
+            return false;
+        };
+        if value != u16::from(*expected_byte) {
+            return false;
+        }
+        raw = &rest[5..];
+    }
+    raw.is_empty()
+}
+
+fn script_json_tag_value_is_known(tag_kind: &[u8], raw: &[u8]) -> bool {
+    let expected: &[&[u8]] = match tag_kind {
+        b"op" => &[
+            b"command",
+            b"and-or",
+            b"pipeline",
+            b"if",
+            b"while",
+            b"for",
+            b"case",
+            b"function",
+            b"group",
+            b"return",
+            b"break",
+            b"continue",
+            b"noop",
+            b"redirected",
+        ],
+        b"kind" => &[
+            b"function",
+            b"fish-complete",
+            b"module",
+            b"literal",
+            b"parameter",
+            b"command-substitution",
+            b"arithmetic",
+            b"brace-expansion",
+            b"array",
+            b"deferred-script",
+        ],
+        b"dialect" => &[b"bash", b"zsh", b"fish"],
+        _ => return false,
+    };
+    expected
+        .iter()
+        .any(|expected| json_key_equals(raw, expected))
+}
+
+struct ScriptJsonPreflight<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    used: usize,
+    scratch_by_container_depth: [usize; 130],
+    scratch_total: usize,
+    discriminator_error_peak: usize,
+    limit: usize,
+}
+
+impl ScriptJsonPreflight<'_> {
+    fn invalid<T>() -> Result<T, IrError> {
+        Err(IrError::Invalid("invalid script encoding"))
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), IrError> {
+        self.used = self.used.saturating_add(bytes);
+        self.check_limit()
+    }
+
+    fn record_scratch(&mut self, reparse_depth: usize, bytes: usize) -> Result<(), IrError> {
+        // Every object field is conservatively treated as a possible borrowed
+        // RawValue reparse. Deserializers on one nested field path coexist;
+        // sibling fields at the same level reuse one scratch capacity.
+        let Some(slot) = self.scratch_by_container_depth.get_mut(reparse_depth) else {
+            return Self::invalid();
+        };
+        if bytes > *slot {
+            self.scratch_total = self.scratch_total.saturating_add(bytes - *slot);
+            *slot = bytes;
+        }
+        self.check_limit()
+    }
+
+    fn record_discriminator_error(&mut self, raw_length: usize) -> Result<(), IrError> {
+        // Deserialization aborts at the first applicable unknown variant, so
+        // at most one formatted error string coexists with parser scratch.
+        self.discriminator_error_peak = self.discriminator_error_peak.max(
+            raw_length
+                .saturating_mul(2)
+                .saturating_add(2 * std::mem::size_of::<String>())
+                .saturating_add(256),
+        );
+        self.check_limit()
+    }
+
+    fn check_limit(&self) -> Result<(), IrError> {
+        if self
+            .used
+            .saturating_add(self.scratch_total)
+            .saturating_add(self.discriminator_error_peak)
+            > self.limit
+        {
+            return Err(IrError::Limit("aggregate shell script IR"));
+        }
+        Ok(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        self.skip_whitespace();
+        if self.bytes.get(self.cursor) == Some(&byte) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn literal(&mut self, value: &[u8]) -> Result<(), IrError> {
+        if self
+            .bytes
+            .get(self.cursor..self.cursor.saturating_add(value.len()))
+            != Some(value)
+        {
+            return Self::invalid();
+        }
+        self.cursor += value.len();
+        self.charge(16)
+    }
+
+    fn number(&mut self) -> Result<(), IrError> {
+        if self.bytes.get(self.cursor) == Some(&b'-') {
+            self.cursor += 1;
+        }
+        match self.bytes.get(self.cursor) {
+            Some(b'0') => self.cursor += 1,
+            Some(b'1'..=b'9') => {
+                self.cursor += 1;
+                while self.bytes.get(self.cursor).is_some_and(u8::is_ascii_digit) {
+                    self.cursor += 1;
+                }
+            }
+            _ => return Self::invalid(),
+        }
+        if self.bytes.get(self.cursor) == Some(&b'.') {
+            self.cursor += 1;
+            let start = self.cursor;
+            while self.bytes.get(self.cursor).is_some_and(u8::is_ascii_digit) {
+                self.cursor += 1;
+            }
+            if self.cursor == start {
+                return Self::invalid();
+            }
+        }
+        if self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+        {
+            self.cursor += 1;
+            if self
+                .bytes
+                .get(self.cursor)
+                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+            {
+                self.cursor += 1;
+            }
+            let start = self.cursor;
+            while self.bytes.get(self.cursor).is_some_and(u8::is_ascii_digit) {
+                self.cursor += 1;
+            }
+            if self.cursor == start {
+                return Self::invalid();
+            }
+        }
+        self.charge(16)
+    }
+
+    fn hex_quad(&mut self) -> Result<u16, IrError> {
+        let mut value = 0_u16;
+        for _ in 0..4 {
+            let Some(byte) = self.bytes.get(self.cursor).copied() else {
+                return Self::invalid();
+            };
+            let digit = match byte {
+                b'0'..=b'9' => u16::from(byte - b'0'),
+                b'a'..=b'f' => u16::from(byte - b'a' + 10),
+                b'A'..=b'F' => u16::from(byte - b'A' + 10),
+                _ => return Self::invalid(),
+            };
+            value = value * 16 + digit;
+            self.cursor += 1;
+        }
+        Ok(value)
+    }
+
+    fn string(
+        &mut self,
+        reparse_depth: usize,
+        charge: bool,
+        additional_slot_bytes: usize,
+    ) -> Result<(usize, usize), IrError> {
+        if self.bytes.get(self.cursor) != Some(&b'"') {
+            return Self::invalid();
+        }
+        self.cursor += 1;
+        let start = self.cursor;
+        let mut escaped = false;
+        loop {
+            let Some(byte) = self.bytes.get(self.cursor).copied() else {
+                return Self::invalid();
+            };
+            match byte {
+                b'"' => {
+                    let raw_length = self.cursor.saturating_sub(start);
+                    self.cursor += 1;
+                    if escaped {
+                        // serde_json decodes escaped keys and enum/string
+                        // values through an owned scratch buffer even when the
+                        // final field is ignored or rejected.
+                        self.record_scratch(
+                            reparse_depth,
+                            raw_length.saturating_mul(2).saturating_add(1),
+                        )?;
+                    }
+                    if charge {
+                        self.charge(
+                            raw_length
+                                .saturating_add(2 * std::mem::size_of::<String>())
+                                .saturating_add(additional_slot_bytes),
+                        )?;
+                    }
+                    return Ok((start, raw_length));
+                }
+                b'\\' => {
+                    escaped = true;
+                    self.cursor += 1;
+                    let Some(escape) = self.bytes.get(self.cursor).copied() else {
+                        return Self::invalid();
+                    };
+                    self.cursor += 1;
+                    match escape {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => {
+                            let code = self.hex_quad()?;
+                            if (0xd800..=0xdbff).contains(&code) {
+                                if self.bytes.get(self.cursor..self.cursor.saturating_add(2))
+                                    != Some(br"\u")
+                                {
+                                    return Self::invalid();
+                                }
+                                self.cursor += 2;
+                                if !(0xdc00..=0xdfff).contains(&self.hex_quad()?) {
+                                    return Self::invalid();
+                                }
+                            } else if (0xdc00..=0xdfff).contains(&code) {
+                                return Self::invalid();
+                            }
+                        }
+                        _ => return Self::invalid(),
+                    }
+                }
+                0x00..=0x1f => return Self::invalid(),
+                _ => self.cursor += 1,
+            }
+        }
+    }
+
+    fn value(
+        &mut self,
+        depth: usize,
+        reparse_depth: usize,
+        charge_string: bool,
+        additional_string_slot_bytes: usize,
+    ) -> Result<(), IrError> {
+        if depth > 128 {
+            return Self::invalid();
+        }
+        self.skip_whitespace();
+        match self.bytes.get(self.cursor).copied() {
+            Some(b'{') => self.object(depth + 1, reparse_depth),
+            Some(b'[') => self.array(depth + 1, reparse_depth, additional_string_slot_bytes),
+            Some(b'"') => self
+                .string(reparse_depth, charge_string, additional_string_slot_bytes)
+                .map(|_| ()),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'n') => self.literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Self::invalid(),
+        }
+    }
+
+    fn array(
+        &mut self,
+        depth: usize,
+        reparse_depth: usize,
+        additional_string_slot_bytes: usize,
+    ) -> Result<(), IrError> {
+        if !self.consume(b'[') {
+            return Self::invalid();
+        }
+        self.charge(2 * std::mem::size_of::<Vec<ScriptStatement>>())?;
+        if self.consume(b']') {
+            return Ok(());
+        }
+        loop {
+            self.value(depth, reparse_depth, true, additional_string_slot_bytes)?;
+            if self.consume(b']') {
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                return Self::invalid();
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize, reparse_depth: usize) -> Result<(), IrError> {
+        if !self.consume(b'{') {
+            return Self::invalid();
+        }
+        self.charge(2 * std::mem::size_of::<ScriptStatement>())?;
+        if self.consume(b'}') {
+            return Ok(());
+        }
+        let mut deferred_fields = 0_usize;
+        let mut deferred_name_bytes = 0_usize;
+        let mut discriminator_seen = false;
+        loop {
+            self.skip_whitespace();
+            let key_start = self.cursor.saturating_add(1);
+            self.string(reparse_depth, false, 0)?;
+            let key_end = self.cursor.saturating_sub(1);
+            let additional_string_slot_bytes = self
+                .bytes
+                .get(key_start..key_end)
+                .filter(|key| json_key_equals(key, b"zsh_function_names"))
+                .map_or(0, |_| std::mem::size_of::<&str>());
+            let key_length = key_end.saturating_sub(key_start);
+            if !discriminator_seen {
+                deferred_fields = deferred_fields.saturating_add(1);
+                deferred_name_bytes = deferred_name_bytes.saturating_add(key_length);
+            }
+            // Conservatively budget every object as a possible internally
+            // tagged enum. Statement and word-part visitors defer different
+            // discriminator names, and ScriptEntry has the same bounded
+            // tag-last representation; a decoy tag must not stop this
+            // accounting. This also covers Vec geometric growth and deferred
+            // scalar slots before typed deserialization.
+            const DEFERRED_FIELD_BYTES: usize = 10 * std::mem::size_of::<usize>();
+            self.charge(DEFERRED_FIELD_BYTES.saturating_add(key_end.saturating_sub(key_start)))?;
+            if !self.consume(b':') {
+                return Self::invalid();
+            }
+            self.skip_whitespace();
+            let key = &self.bytes[key_start..key_end];
+            let tag_kind = if json_key_equals(key, b"op") {
+                Some(b"op".as_slice())
+            } else if json_key_equals(key, b"kind") {
+                Some(b"kind".as_slice())
+            } else if json_key_equals(key, b"dialect") {
+                Some(b"dialect".as_slice())
+            } else {
+                None
+            };
+            let mut recognized_discriminator = false;
+            if let Some(tag_kind) = tag_kind.filter(|_| self.bytes.get(self.cursor) == Some(&b'"'))
+            {
+                let (value_start, value_length) = self.string(
+                    reparse_depth.saturating_add(1),
+                    false,
+                    additional_string_slot_bytes,
+                )?;
+                let value = &self.bytes[value_start..value_start.saturating_add(value_length)];
+                recognized_discriminator = script_json_tag_value_is_known(tag_kind, value);
+                if !recognized_discriminator {
+                    self.record_discriminator_error(value_length)?;
+                }
+            } else {
+                self.value(
+                    depth,
+                    reparse_depth.saturating_add(1),
+                    true,
+                    additional_string_slot_bytes,
+                )?;
+            }
+            if recognized_discriminator && !discriminator_seen {
+                deferred_fields = deferred_fields.saturating_sub(1);
+                deferred_name_bytes = deferred_name_bytes.saturating_sub(key_length);
+                discriminator_seen = true;
+            }
+            if deferred_fields > MAX_SCRIPT_TAG_DEFERRED_FIELDS
+                || deferred_name_bytes > MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES
+            {
+                return Err(IrError::Limit("aggregate shell script IR"));
+            }
+            if self.consume(b'}') {
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                return Self::invalid();
+            }
+        }
+    }
+
+    fn modules(&mut self) -> Result<(), IrError> {
+        if !self.consume(b'[') {
+            return Self::invalid();
+        }
+        if self.consume(b']') {
+            self.skip_whitespace();
+            return (self.cursor == self.bytes.len())
+                .then_some(())
+                .ok_or(IrError::Invalid("invalid script encoding"));
+        }
+        let mut modules = 0_usize;
+        loop {
+            self.value(1, 0, true, 0)?;
+            modules = modules.saturating_add(1);
+            if modules > MAX_SCRIPT_MODULES {
+                return Err(IrError::Limit("aggregate shell script IR"));
+            }
+            if self.consume(b']') {
+                self.skip_whitespace();
+                return (self.cursor == self.bytes.len())
+                    .then_some(())
+                    .ok_or(IrError::Invalid("invalid script encoding"));
+            }
+            if !self.consume(b',') {
+                return Self::invalid();
+            }
+        }
+    }
+}
+
+fn preflight_script_encoding_with_limit(
+    bytes: &[u8],
+    allocation_limit: usize,
+    charge_encoded_bytes: bool,
+) -> Result<usize, IrError> {
+    // Validate and budget the complete JSON without allocating. The compact
+    // encoding normally remains live while serde allocates the typed AST;
+    // callers that reserved the enclosing command buffer can omit that charge.
+    std::str::from_utf8(bytes).map_err(|_| IrError::Invalid("invalid script encoding"))?;
+    let limit = allocation_limit.min(MAX_SCRIPT_AGGREGATE_BYTES);
+    let used = (if charge_encoded_bytes { bytes.len() } else { 0 })
+        .saturating_add(2 * std::mem::size_of::<Vec<ScriptModule>>());
+    if used > limit {
+        return Err(IrError::Limit("aggregate shell script IR"));
+    }
+    let mut preflight = ScriptJsonPreflight {
+        bytes,
+        cursor: 0,
+        used,
+        scratch_by_container_depth: [0; 130],
+        scratch_total: 0,
+        discriminator_error_peak: 0,
+        limit,
+    };
+    preflight.modules()?;
+    Ok(preflight.used.saturating_add(preflight.scratch_total))
+}
+
+#[cfg(test)]
+fn preflight_script_encoding(bytes: &[u8]) -> Result<(), IrError> {
+    preflight_script_encoding_with_limit(bytes, MAX_SCRIPT_AGGREGATE_BYTES, true).map(|_| ())
+}
+
 impl CommandProgram {
     pub fn validate(&self) -> Result<(), IrError> {
+        self.validate_and_approximate_bytes().map(|_| ())
+    }
+
+    fn validate_and_approximate_bytes(&self) -> Result<usize, IrError> {
         if self.canonical_name.is_empty() {
             return Err(IrError::Invalid("canonical command name is empty"));
         }
@@ -285,10 +801,42 @@ impl CommandProgram {
         if self.probes.len() > MAX_PROBES {
             return Err(IrError::Limit("dynamic probes"));
         }
+        if self.scripts.len() > MAX_SCRIPT_MODULES {
+            return Err(IrError::Limit("script modules"));
+        }
+        let mut approximate_bytes = std::mem::size_of::<Self>()
+            .saturating_add(self.canonical_name.capacity())
+            .saturating_add(self.source_path.capacity())
+            .saturating_add(self.source_commit.capacity())
+            .saturating_add(self.license.capacity())
+            .saturating_add(
+                self.registrations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.static_rules
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<StaticRule>()),
+            )
+            .saturating_add(
+                self.probes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ProbeSpec>()),
+            );
+        let mut script_bytes = self
+            .scripts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ScriptModule>());
         for script in &self.scripts {
-            script
-                .validate()
+            let retained_bytes = script
+                .validate_and_approximate_bytes()
                 .map_err(|_| IrError::Invalid("invalid shell script IR"))?;
+            script_bytes = script_bytes
+                .saturating_add(retained_bytes.saturating_sub(std::mem::size_of::<ScriptModule>()));
+            if script_bytes > MAX_SCRIPT_AGGREGATE_BYTES {
+                return Err(IrError::Limit("aggregate shell script IR"));
+            }
         }
         let mut string_bytes = self
             .canonical_name
@@ -299,9 +847,23 @@ impl CommandProgram {
         for registration in &self.registrations {
             validate_string(registration)?;
             string_bytes = string_bytes.saturating_add(registration.len());
+            approximate_bytes = approximate_bytes.saturating_add(registration.capacity());
         }
         for rule in &self.static_rules {
             validate_predicates(&rule.when)?;
+            string_bytes = string_bytes.saturating_add(predicate_string_bytes(&rule.when));
+            approximate_bytes = approximate_bytes
+                .saturating_add(
+                    rule.when
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PredicateOp>()),
+                )
+                .saturating_add(predicate_allocation_bytes(&rule.when))
+                .saturating_add(
+                    rule.candidates
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<CandidateTemplate>()),
+                );
             if rule.candidates.len() > MAX_RULES {
                 return Err(IrError::Limit("candidates per static rule"));
             }
@@ -311,10 +873,42 @@ impl CommandProgram {
                     .saturating_add(candidate.value.len())
                     .saturating_add(candidate.display.len())
                     .saturating_add(candidate.description.as_ref().map_or(0, String::len));
+                approximate_bytes = approximate_bytes
+                    .saturating_add(candidate.value.capacity())
+                    .saturating_add(candidate.display.capacity())
+                    .saturating_add(candidate.description.as_ref().map_or(0, String::capacity));
             }
         }
+        let mut probe_ids = HashSet::with_capacity(self.probes.len());
         for probe in &self.probes {
+            if !probe_ids.insert(probe.id.as_str()) {
+                return Err(IrError::Invalid("duplicate probe id"));
+            }
             validate_predicates(&probe.when)?;
+            string_bytes = string_bytes.saturating_add(predicate_string_bytes(&probe.when));
+            approximate_bytes = approximate_bytes
+                .saturating_add(probe.id.capacity())
+                .saturating_add(probe.executable.capacity())
+                .saturating_add(
+                    probe
+                        .when
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PredicateOp>()),
+                )
+                .saturating_add(predicate_allocation_bytes(&probe.when))
+                .saturating_add(
+                    probe
+                        .arguments
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    probe
+                        .environment
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(String, String)>()),
+                )
+                .saturating_add(probe.description.as_ref().map_or(0, String::capacity));
             validate_string(&probe.id)?;
             validate_executable(&probe.executable)?;
             if probe.arguments.len() > 1024 || probe.environment.len() > 256 {
@@ -322,10 +916,14 @@ impl CommandProgram {
             }
             for argument in &probe.arguments {
                 validate_string(argument)?;
+                approximate_bytes = approximate_bytes.saturating_add(argument.capacity());
             }
             for (name, value) in &probe.environment {
                 validate_string(name)?;
                 validate_string(value)?;
+                approximate_bytes = approximate_bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(value.capacity());
                 if name.is_empty()
                     || !name
                         .bytes()
@@ -372,7 +970,7 @@ impl CommandProgram {
         validate_string(&self.source_path)?;
         validate_string(&self.source_commit)?;
         validate_string(&self.license)?;
-        Ok(())
+        Ok(approximate_bytes.saturating_add(script_bytes))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, IrError> {
@@ -430,9 +1028,21 @@ impl CommandProgram {
             encoder.optional_string(probe.description.as_deref())?;
         }
         if block_version >= 3 {
-            let scripts = serde_json::to_vec(&self.scripts)
-                .map_err(|_| IrError::Invalid("script serialization failed"))?;
-            encoder.blob(&scripts)?;
+            // Stream into an allocation-capped buffer. Validation bounds the
+            // in-memory Script IR, while this bound also covers JSON escaping
+            // expansion before the command-block size check.
+            let script_limit = MAX_COMMAND_BLOCK_BYTES
+                .saturating_sub(encoder.bytes.len())
+                .saturating_sub(std::mem::size_of::<u32>());
+            let mut scripts = BoundedJsonBuffer::new(script_limit);
+            if serde_json::to_writer(&mut scripts, &self.scripts).is_err() {
+                return Err(if scripts.exceeded {
+                    IrError::Limit("encoded command block")
+                } else {
+                    IrError::Invalid("script serialization failed")
+                });
+            }
+            encoder.blob(&scripts.bytes)?;
         }
         if encoder.bytes.len() > MAX_COMMAND_BLOCK_BYTES {
             return Err(IrError::Limit("encoded command block"));
@@ -441,10 +1051,25 @@ impl CommandProgram {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, IrError> {
-        if bytes.len() > MAX_COMMAND_BLOCK_BYTES {
+        Self::decode_with_allocation_limit(bytes, MAX_COMMAND_DECODE_ALLOCATION_BYTES)
+    }
+
+    pub(crate) fn decode_with_allocation_limit(
+        bytes: &[u8],
+        allocation_limit: usize,
+    ) -> Result<Self, IrError> {
+        Self::decode_with_allocation_limit_and_size(bytes, allocation_limit)
+            .map(|(program, _)| program)
+    }
+
+    pub(crate) fn decode_with_allocation_limit_and_size(
+        bytes: &[u8],
+        allocation_limit: usize,
+    ) -> Result<(Self, usize), IrError> {
+        if bytes.len() > MAX_COMMAND_BLOCK_BYTES || bytes.len() > allocation_limit {
             return Err(IrError::Limit("encoded command block"));
         }
-        let mut decoder = Decoder::new(bytes);
+        let mut decoder = Decoder::new(bytes, allocation_limit);
         if decoder.take(4)? != COMMAND_BLOCK_MAGIC {
             return Err(IrError::Invalid("invalid command block magic"));
         }
@@ -461,6 +1086,7 @@ impl CommandProgram {
         let source_commit = decoder.string()?;
         let license = decoder.string()?;
         let rule_count = decoder.count(MAX_RULES)?;
+        decoder.charge_array::<StaticRule>(rule_count)?;
         let mut static_rules = Vec::with_capacity(rule_count);
         for _ in 0..rule_count {
             let when = decode_predicates(&mut decoder)?;
@@ -470,6 +1096,7 @@ impl CommandProgram {
                 PathCompletion::Inherit
             };
             let candidate_count = decoder.count(MAX_RULES)?;
+            decoder.charge_array::<CandidateTemplate>(candidate_count)?;
             let mut candidates = Vec::with_capacity(candidate_count);
             for _ in 0..candidate_count {
                 candidates.push(decode_candidate(&mut decoder)?);
@@ -481,6 +1108,8 @@ impl CommandProgram {
             });
         }
         let probe_count = decoder.count(MAX_PROBES)?;
+        decoder.charge_array::<ProbeSpec>(probe_count)?;
+        decoder.charge(probe_count.saturating_mul(PROBE_ID_VALIDATION_SCRATCH_BYTES))?;
         let mut probes = Vec::with_capacity(probe_count);
         for _ in 0..probe_count {
             let id = decoder.string()?;
@@ -488,6 +1117,7 @@ impl CommandProgram {
             let executable = decoder.string()?;
             let arguments = decoder.strings(1024)?;
             let environment_count = decoder.count(256)?;
+            decoder.charge_array::<(String, String)>(environment_count)?;
             let mut environment = Vec::with_capacity(environment_count);
             for _ in 0..environment_count {
                 environment.push((decoder.string()?, decoder.string()?));
@@ -519,13 +1149,12 @@ impl CommandProgram {
         }
         let scripts = if block_version >= 3 {
             let bytes = decoder.blob(MAX_COMMAND_BLOCK_BYTES)?;
+            let script_allocation_limit = decoder.remaining_allocation();
+            let script_allocation =
+                preflight_script_encoding_with_limit(bytes, script_allocation_limit, false)?;
+            decoder.charge(script_allocation)?;
             let scripts: Vec<ScriptModule> = serde_json::from_slice(bytes)
                 .map_err(|_| IrError::Invalid("invalid script encoding"))?;
-            for script in &scripts {
-                script
-                    .validate()
-                    .map_err(|_| IrError::Invalid("invalid shell script IR"))?;
-            }
             if block_version < 4 && scripts.iter().any(ScriptModule::requires_block_v4) {
                 return Err(IrError::Invalid(
                     "script feature requires command block version 4",
@@ -538,6 +1167,8 @@ impl CommandProgram {
         if !decoder.remaining().is_empty() {
             return Err(IrError::Invalid("trailing command block bytes"));
         }
+        // `Decoder` has already enforced the transient input-plus-AST peak.
+        // Return only allocations retained after the input buffer is released.
         let program = Self {
             canonical_name,
             registrations,
@@ -548,8 +1179,8 @@ impl CommandProgram {
             probes,
             scripts,
         };
-        program.validate()?;
-        Ok(program)
+        let actual_allocation_bytes = program.validate_and_approximate_bytes()?;
+        Ok((program, actual_allocation_bytes))
     }
 }
 
@@ -599,6 +1230,67 @@ fn validate_string(value: &str) -> Result<(), IrError> {
         return Err(IrError::Invalid("string contains NUL"));
     }
     Ok(())
+}
+
+fn predicate_string_bytes(program: &[PredicateOp]) -> usize {
+    program.iter().fold(0_usize, |total, predicate| {
+        let bytes = match predicate {
+            PredicateOp::CurrentWordEquals(value)
+            | PredicateOp::CurrentWordStartsWith(value)
+            | PredicateOp::PreviousWordEquals(value)
+            | PredicateOp::AnyWordEquals(value)
+            | PredicateOp::WordNotPresent(value)
+            | PredicateOp::EnvironmentSet(value) => value.len(),
+            PredicateOp::CommandPathEquals(values) => values
+                .iter()
+                .map(String::len)
+                .fold(0_usize, usize::saturating_add),
+            PredicateOp::EnvironmentEquals { name, value } => {
+                name.len().saturating_add(value.len())
+            }
+            PredicateOp::True
+            | PredicateOp::False
+            | PredicateOp::Not
+            | PredicateOp::And
+            | PredicateOp::Or
+            | PredicateOp::WordIndexEquals(_)
+            | PredicateOp::WordIndexAtLeast(_) => 0,
+        };
+        total.saturating_add(bytes)
+    })
+}
+
+fn predicate_allocation_bytes(program: &[PredicateOp]) -> usize {
+    program.iter().fold(0_usize, |total, predicate| {
+        let bytes = match predicate {
+            PredicateOp::CurrentWordEquals(value)
+            | PredicateOp::CurrentWordStartsWith(value)
+            | PredicateOp::PreviousWordEquals(value)
+            | PredicateOp::AnyWordEquals(value)
+            | PredicateOp::WordNotPresent(value)
+            | PredicateOp::EnvironmentSet(value) => value.capacity(),
+            PredicateOp::CommandPathEquals(values) => values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>())
+                .saturating_add(
+                    values
+                        .iter()
+                        .map(String::capacity)
+                        .fold(0_usize, usize::saturating_add),
+                ),
+            PredicateOp::EnvironmentEquals { name, value } => {
+                name.capacity().saturating_add(value.capacity())
+            }
+            PredicateOp::True
+            | PredicateOp::False
+            | PredicateOp::Not
+            | PredicateOp::And
+            | PredicateOp::Or
+            | PredicateOp::WordIndexEquals(_)
+            | PredicateOp::WordIndexAtLeast(_) => 0,
+        };
+        total.saturating_add(bytes)
+    })
 }
 
 fn validate_predicates(program: &[PredicateOp]) -> Result<(), IrError> {
@@ -723,6 +1415,7 @@ fn encode_predicates(encoder: &mut Encoder, predicates: &[PredicateOp]) -> Resul
 
 fn decode_predicates(decoder: &mut Decoder<'_>) -> Result<Vec<PredicateOp>, IrError> {
     let count = decoder.count(MAX_PREDICATES_PER_RULE)?;
+    decoder.charge_array::<PredicateOp>(count)?;
     let mut predicates = Vec::with_capacity(count);
     for _ in 0..count {
         predicates.push(match decoder.u8()? {
@@ -781,6 +1474,37 @@ fn decode_candidate(decoder: &mut Decoder<'_>) -> Result<CandidateTemplate, IrEr
     }
     validate_candidate(&candidate)?;
     Ok(candidate)
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(4096)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON buffer exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct Encoder {
@@ -848,15 +1572,35 @@ struct Decoder<'a> {
     bytes: &'a [u8],
     position: usize,
     string_bytes: usize,
+    allocation_bytes: usize,
+    allocation_limit: usize,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    fn new(bytes: &'a [u8], allocation_limit: usize) -> Self {
         Self {
             bytes,
             position: 0,
             string_bytes: 0,
+            allocation_bytes: bytes.len(),
+            allocation_limit,
         }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), IrError> {
+        self.allocation_bytes = self.allocation_bytes.saturating_add(bytes);
+        if self.allocation_bytes > self.allocation_limit {
+            return Err(IrError::Limit("decoded command allocation"));
+        }
+        Ok(())
+    }
+
+    fn charge_array<T>(&mut self, count: usize) -> Result<(), IrError> {
+        self.charge(count.saturating_mul(std::mem::size_of::<T>()))
+    }
+
+    fn remaining_allocation(&self) -> usize {
+        self.allocation_limit.saturating_sub(self.allocation_bytes)
     }
 
     fn remaining(&self) -> &'a [u8] {
@@ -908,6 +1652,7 @@ impl<'a> Decoder<'a> {
     fn string(&mut self) -> Result<String, IrError> {
         let length = self.count(MAX_STRING_BYTES)?;
         self.string_bytes = self.string_bytes.saturating_add(length);
+        self.charge(length)?;
         if self.string_bytes > MAX_STRINGS_BYTES {
             return Err(IrError::Limit("decoded string table"));
         }
@@ -928,6 +1673,7 @@ impl<'a> Decoder<'a> {
 
     fn strings(&mut self, maximum: usize) -> Result<Vec<String>, IrError> {
         let count = self.count(maximum)?;
+        self.charge_array::<String>(count)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.string()?);
@@ -1070,6 +1816,290 @@ mod tests {
                 "script feature requires command block version 4"
             ))
         ));
+    }
+
+    #[test]
+    fn predicate_strings_share_the_encoded_string_budget() {
+        let mut program = fixture();
+        let value = "x".repeat(MAX_STRING_BYTES);
+        program.static_rules = (0..9)
+            .map(|_| StaticRule {
+                when: vec![PredicateOp::CurrentWordEquals(value.clone())],
+                path_completion: PathCompletion::Inherit,
+                candidates: Vec::new(),
+            })
+            .collect();
+        assert!(matches!(
+            program.validate(),
+            Err(IrError::Limit("command string table"))
+        ));
+        assert!(matches!(
+            program.encode(),
+            Err(IrError::Limit("command string table"))
+        ));
+    }
+
+    #[test]
+    fn duplicate_probe_ids_are_rejected_before_encoding() {
+        let mut program = fixture();
+        program.probes.push(program.probes[0].clone());
+        assert!(matches!(
+            program.validate(),
+            Err(IrError::Invalid("duplicate probe id"))
+        ));
+    }
+
+    #[test]
+    fn aggregate_script_module_count_is_validated_before_encoding() {
+        let module = crate::rules::script_parser::parse_script(
+            crate::rules::script::ScriptDialect::Fish,
+            "demo.fish",
+            ":\n",
+        )
+        .unwrap();
+        let mut program = fixture();
+        program.scripts = vec![module; MAX_SCRIPT_MODULES + 1];
+        assert!(matches!(
+            program.encode(),
+            Err(IrError::Limit("script modules"))
+        ));
+    }
+
+    #[test]
+    fn script_json_serialization_is_capped_by_the_command_block_limit() {
+        let mut program = fixture();
+        program.scripts = (0..17)
+            .map(|_| {
+                let mut module = crate::rules::script_parser::parse_script(
+                    crate::rules::script::ScriptDialect::Fish,
+                    "demo.fish",
+                    ":\n",
+                )
+                .unwrap();
+                module.source_path = "x".repeat(MAX_STRING_BYTES);
+                module
+            })
+            .collect();
+        assert!(matches!(
+            program.encode(),
+            Err(IrError::Limit("encoded command block"))
+        ));
+    }
+
+    #[test]
+    fn valid_script_json_above_eight_mib_round_trips() {
+        let mut program = fixture();
+        program.scripts = (0..14)
+            .map(|index| {
+                let mut module = crate::rules::script_parser::parse_script(
+                    crate::rules::script::ScriptDialect::Fish,
+                    "demo.fish",
+                    ":\n",
+                )
+                .unwrap();
+                module.source_path = format!("{index}{}", "x".repeat(950_000));
+                module
+            })
+            .collect();
+        let encoded = program.encode().unwrap();
+        assert!(encoded.len() > 12 * 1024 * 1024);
+        let decoded = CommandProgram::decode(&encoded).unwrap();
+        assert_eq!(decoded.scripts.len(), program.scripts.len());
+        assert_eq!(
+            decoded
+                .scripts
+                .iter()
+                .map(|module| module.source_path.as_str())
+                .collect::<Vec<_>>(),
+            program
+                .scripts
+                .iter()
+                .map(|module| module.source_path.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tag_late_raw_fields_are_charged_before_typed_deserialization() {
+        let mut json = String::from("[{");
+        for index in 0..20_000 {
+            if index != 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""unknown-{index}":null"#));
+        }
+        json.push_str(r#", "op":"noop"}]"#);
+        assert!(matches!(
+            preflight_script_encoding_with_limit(json.as_bytes(), 1536 * 1024, false),
+            Err(IrError::Limit("aggregate shell script IR"))
+        ));
+    }
+
+    #[test]
+    fn decoy_enum_tags_cannot_bypass_deferred_field_accounting() {
+        for (decoy, real) in [("kind", "op"), ("op", "kind")] {
+            let mut json = format!(r#"[{{"{decoy}":null"#);
+            for index in 0..20_000 {
+                json.push_str(&format!(r#", "unknown-{index}":null"#));
+            }
+            json.push_str(&format!(r#", "{real}":"noop"}}]"#));
+            assert!(matches!(
+                preflight_script_encoding_with_limit(json.as_bytes(), 1536 * 1024, false),
+                Err(IrError::Limit("aggregate shell script IR"))
+            ));
+        }
+    }
+
+    #[test]
+    fn known_discriminators_and_sequential_scratch_are_not_cumulative() {
+        let module_prefix = r#"[{"dialect":"fish","source_path":"x","statements":["#;
+        let module_suffix = r#"],"functions":[],"registrations":[],"probe_capabilities":[]}]"#;
+        let mut plain = String::from(module_prefix);
+        for index in 0..250_000 {
+            if index != 0 {
+                plain.push(',');
+            }
+            plain.push_str(r#"{"op":"noop"}"#);
+        }
+        plain.push_str(module_suffix);
+        preflight_script_encoding_with_limit(plain.as_bytes(), MAX_SCRIPT_AGGREGATE_BYTES, false)
+            .unwrap();
+
+        let mut escaped = String::from(module_prefix);
+        for index in 0..215_000 {
+            if index != 0 {
+                escaped.push(',');
+            }
+            escaped.push_str(r#"{"op":"n\u006fop"}"#);
+        }
+        escaped.push_str(module_suffix);
+        preflight_script_encoding_with_limit(escaped.as_bytes(), MAX_SCRIPT_AGGREGATE_BYTES, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn deferred_field_boundary_excludes_the_discriminator() {
+        let mut json = String::from("[{");
+        for _ in 0..MAX_SCRIPT_TAG_DEFERRED_FIELDS {
+            json.push_str(r#""x":null,"#);
+        }
+        json.push_str(r#""op":"noop"}]"#);
+        preflight_script_encoding_with_limit(json.as_bytes(), MAX_SCRIPT_AGGREGATE_BYTES, false)
+            .unwrap();
+
+        let mut post_tag = String::from(r#"[{"op":"noop","#);
+        for index in 0..=MAX_SCRIPT_TAG_DEFERRED_FIELDS {
+            if index != 0 {
+                post_tag.push(',');
+            }
+            post_tag.push_str(r#""x":null"#);
+        }
+        post_tag.push_str("}]");
+        preflight_script_encoding_with_limit(
+            post_tag.as_bytes(),
+            MAX_SCRIPT_AGGREGATE_BYTES,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unknown_discriminator_error_text_is_preflighted() {
+        let json = format!(r#"[{{"body":null,"op":"{}"}}]"#, "x".repeat(1024 * 1024));
+        assert!(matches!(
+            preflight_script_encoding_with_limit(json.as_bytes(), 512 * 1024, false),
+            Err(IrError::Limit("aggregate shell script IR"))
+        ));
+    }
+
+    #[test]
+    fn escaped_key_scratch_is_included_in_preflight_peak() {
+        let escaped_key = r"\u0061".repeat(200_000);
+        let json = format!(r#"[{{"{escaped_key}":null}}]"#);
+        assert!(matches!(
+            preflight_script_encoding_with_limit(json.as_bytes(), 2 * 1024 * 1024, false),
+            Err(IrError::Limit("aggregate shell script IR"))
+        ));
+    }
+
+    #[test]
+    fn nested_tag_late_reparse_scratch_is_cumulative() {
+        let escaped_name = r"\u0061".repeat(10_000);
+        let mut statement = String::from(r#"{"op":"noop"}"#);
+        for _ in 0..16 {
+            statement = format!(
+                r#"{{"function":{{"name":"{escaped_name}","arguments":[],"body":[{statement}]}},"op":"function"}}"#
+            );
+        }
+        let json = format!("[{statement}]");
+        assert!(matches!(
+            preflight_script_encoding_with_limit(json.as_bytes(), 2 * 1024 * 1024, false),
+            Err(IrError::Limit("aggregate shell script IR"))
+        ));
+    }
+
+    #[test]
+    fn zsh_name_uniqueness_sort_scratch_is_preflighted() {
+        let mut json = String::from(
+            r#"[{"dialect":"zsh","source_path":"x","statements":[],"functions":[],"registrations":[],"probe_capabilities":[],"zsh_function_names":["#,
+        );
+        json.push('"');
+        for index in 0..32_769 {
+            if index != 0 {
+                json.push_str(r#"",""#);
+            }
+            json.push_str(&format!("name-{index}"));
+        }
+        json.push_str(r#""]}]"#);
+        let result = preflight_script_encoding_with_limit(json.as_bytes(), 2 * 1024 * 1024, false);
+        assert!(
+            matches!(result, Err(IrError::Limit("aggregate shell script IR"))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn compact_script_json_is_allocation_budgeted_before_deserialization() {
+        let mut json =
+            String::from(r#"[{"dialect":"fish","source_path":"hostile.fish","statements":["#);
+        for index in 0..500_000 {
+            if index != 0 {
+                json.push(',');
+            }
+            json.push_str(r#"{"op":"noop"}"#);
+        }
+        json.push_str("],\"functions\":[],\"registrations\":[],\"probe_capabilities\":[]}]");
+        assert!(json.len() < MAX_COMMAND_BLOCK_BYTES);
+        assert!(matches!(
+            preflight_script_encoding(json.as_bytes()),
+            Err(IrError::Limit("aggregate shell script IR"))
+        ));
+    }
+
+    #[test]
+    fn escaped_script_string_is_charged_without_false_rejection() {
+        let escaped = r"\u0061".repeat(2_000_000);
+        let json = format!(
+            r#"[{{"dialect":"fish","source_path":"{escaped}","statements":[],"functions":[],"registrations":[],"probe_capabilities":[]}}]"#
+        );
+        assert!(json.len() < MAX_COMMAND_BLOCK_BYTES);
+        preflight_script_encoding(json.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn script_json_preflight_rejects_malformed_structure_without_allocation() {
+        for json in [
+            br#"[{"source_path":"\uD800"}]"#.as_slice(),
+            br#"[{"source_path":"\uDC00"}]"#.as_slice(),
+            br#"[{"source_path":"unterminated}]"#.as_slice(),
+            br#"[{"value":1e}]"#.as_slice(),
+            br#"[{"values":[true,]}]"#.as_slice(),
+        ] {
+            assert!(matches!(
+                preflight_script_encoding(json),
+                Err(IrError::Invalid("invalid script encoding"))
+            ));
+        }
     }
 
     #[test]

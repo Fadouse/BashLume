@@ -19,6 +19,7 @@ pub struct CompletionContext {
     pub query: String,
     pub quote: QuoteMode,
     pub command_position: bool,
+    pub in_comment: bool,
     /// Dequoted words in the current simple command, including an empty
     /// current word after trailing whitespace.
     pub words: Vec<String>,
@@ -32,6 +33,14 @@ pub struct CompletionContext {
 
 impl CompletionContext {
     pub fn analyze(line: &str, point: usize) -> Self {
+        Self::analyze_with_interactive_comments(line, point, true)
+    }
+
+    pub fn analyze_with_interactive_comments(
+        line: &str,
+        point: usize,
+        interactive_comments: bool,
+    ) -> Self {
         let point = floor_char_boundary(line, point.min(line.len()));
         if line.len() > MAX_COMPLETION_CONTEXT_BYTES {
             return Self {
@@ -42,19 +51,25 @@ impl CompletionContext {
                 query: String::new(),
                 quote: QuoteMode::Unquoted,
                 command_position: false,
+                in_comment: false,
                 words: Vec::new(),
                 word_index: 0,
                 command_name: None,
                 command_path: Vec::new(),
             };
         }
-        let tokens = lex_shell(line, point);
-        let (replace_start, quote) = current_word_start_and_quote(line, point);
+        let (tokens, in_comment) = lex_shell(line, point, interactive_comments);
+        let (replace_start, quote) =
+            current_word_start_and_quote(line, point, interactive_comments);
         let replace_end = current_word_end(line, point, quote);
         let raw_word = line[replace_start..point].to_owned();
         let query = dequote_prefix(&raw_word);
-        let command_position = command_position_before(&tokens, replace_start);
-        let (words, word_index) = completion_words(&tokens, replace_start, &query);
+        let command_position = !in_comment && command_position_before(&tokens, replace_start);
+        let (words, word_index) = if in_comment {
+            (Vec::new(), 0)
+        } else {
+            completion_words(&tokens, replace_start, &query)
+        };
         let command_index = words.iter().position(|word| !is_assignment(word));
         let command_name = command_index.and_then(|index| words.get(index)).cloned();
         let command_path = command_index.map_or_else(Vec::new, |index| {
@@ -73,6 +88,7 @@ impl CompletionContext {
             query,
             quote,
             command_position,
+            in_comment,
             words,
             word_index,
             command_name,
@@ -119,7 +135,7 @@ pub fn existing_directory_target(line: &str) -> Option<String> {
     if line.len() > MAX_COMPLETION_CONTEXT_BYTES {
         return None;
     }
-    let tokens = lex_shell(line, line.len());
+    let (tokens, _) = lex_shell(line, line.len(), true);
     let words = tokens
         .iter()
         .take_while(|token| !matches!(token.kind, TokenKind::Operator(_)))
@@ -175,6 +191,7 @@ enum TokenKind {
     Word(String),
     Operator(String),
     Redirect,
+    Comment,
 }
 
 #[derive(Clone, Debug)]
@@ -209,7 +226,7 @@ fn completion_words(
     for token in &tokens[segment_start..] {
         match &token.kind {
             TokenKind::Redirect => redirect_target = true,
-            TokenKind::Operator(_) => {}
+            TokenKind::Operator(_) | TokenKind::Comment => {}
             TokenKind::Word(word) => {
                 if redirect_target {
                     redirect_target = false;
@@ -242,6 +259,7 @@ fn command_position_before(tokens: &[Token], current_start: usize) -> bool {
     for token in tokens.iter().filter(|token| token.start < current_start) {
         match &token.kind {
             TokenKind::Redirect => expect_redirect_target = true,
+            TokenKind::Comment => {}
             TokenKind::Operator(operator) => {
                 expect_redirect_target = false;
                 if matches!(operator.as_str(), ";" | "&" | "&&" | "|" | "||" | "(" | "{") {
@@ -353,13 +371,15 @@ fn is_assignment(word: &str) -> bool {
         && characters.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn lex_shell(line: &str, point: usize) -> Vec<Token> {
+fn lex_shell(line: &str, point: usize, interactive_comments: bool) -> (Vec<Token>, bool) {
     let bytes = line.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
     let mut word_start = None;
     let mut quote = QuoteMode::Unquoted;
     let mut escaped = false;
+    let mut parameter_depth = 0_usize;
+    let mut in_comment = false;
 
     let flush_word = |end: usize, tokens: &mut Vec<Token>, word_start: &mut Option<usize>| {
         if let Some(start) = word_start.take() {
@@ -408,6 +428,28 @@ fn lex_shell(line: &str, point: usize) -> Vec<Token> {
         }
 
         match byte {
+            b'{' if index > 0 && bytes[index - 1] == b'$' => {
+                word_start.get_or_insert(index.saturating_sub(1));
+                parameter_depth = parameter_depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' if parameter_depth > 0 => {
+                parameter_depth -= 1;
+                index += 1;
+            }
+            b'#' if interactive_comments && word_start.is_none() => {
+                tokens.push(Token {
+                    start: index,
+                    kind: TokenKind::Comment,
+                });
+                while index < point && bytes[index] != b'\n' {
+                    index += utf8_char_len(bytes[index]).min(point - index);
+                }
+                if index == point {
+                    in_comment = true;
+                    break;
+                }
+            }
             b'\\' => {
                 word_start.get_or_insert(index);
                 escaped = true;
@@ -427,8 +469,16 @@ fn lex_shell(line: &str, point: usize) -> Vec<Token> {
                 quote = QuoteMode::Double;
                 index += 1;
             }
-            b' ' | b'\t' | b'\r' | b'\n' => {
+            b' ' | b'\t' | b'\r' => {
                 flush_word(index, &mut tokens, &mut word_start);
+                index += 1;
+            }
+            b'\n' => {
+                flush_word(index, &mut tokens, &mut word_start);
+                tokens.push(Token {
+                    start: index,
+                    kind: TokenKind::Operator(";".into()),
+                });
                 index += 1;
             }
             b';' | b'&' | b'|' | b'(' | b')' | b'{' | b'}' => {
@@ -469,20 +519,27 @@ fn lex_shell(line: &str, point: usize) -> Vec<Token> {
     }
 
     flush_word(point, &mut tokens, &mut word_start);
-    tokens
+    (tokens, in_comment)
 }
 
-fn current_word_start_and_quote(line: &str, point: usize) -> (usize, QuoteMode) {
+fn current_word_start_and_quote(
+    line: &str,
+    point: usize,
+    interactive_comments: bool,
+) -> (usize, QuoteMode) {
     let bytes = line.as_bytes();
     let mut index = 0;
     let mut start = 0;
     let mut quote = QuoteMode::Unquoted;
     let mut escaped = false;
+    let mut at_word_start = true;
+    let mut parameter_depth = 0_usize;
 
     while index < point {
         let byte = bytes[index];
         if escaped {
             escaped = false;
+            at_word_start = false;
             index += 1;
             continue;
         }
@@ -491,6 +548,7 @@ fn current_word_start_and_quote(line: &str, point: usize) -> (usize, QuoteMode) 
                 if byte == b'\'' {
                     quote = QuoteMode::Unquoted;
                 }
+                at_word_start = false;
             }
             QuoteMode::Double => {
                 if byte == b'"' {
@@ -498,6 +556,7 @@ fn current_word_start_and_quote(line: &str, point: usize) -> (usize, QuoteMode) 
                 } else if byte == b'\\' {
                     escaped = true;
                 }
+                at_word_start = false;
             }
             QuoteMode::AnsiC => {
                 if byte == b'\'' {
@@ -505,21 +564,50 @@ fn current_word_start_and_quote(line: &str, point: usize) -> (usize, QuoteMode) 
                 } else if byte == b'\\' {
                     escaped = true;
                 }
+                at_word_start = false;
             }
             QuoteMode::Unquoted => match byte {
-                b'\\' => escaped = true,
+                b'{' if index > 0 && bytes[index - 1] == b'$' => {
+                    parameter_depth = parameter_depth.saturating_add(1);
+                    at_word_start = false;
+                }
+                b'}' if parameter_depth > 0 => {
+                    parameter_depth -= 1;
+                    at_word_start = false;
+                }
+                b'#' if interactive_comments && at_word_start => {
+                    while index < point && bytes[index] != b'\n' {
+                        index += utf8_char_len(bytes[index]).min(point - index);
+                    }
+                    if index < point {
+                        start = index + 1;
+                        at_word_start = true;
+                        quote = QuoteMode::Unquoted;
+                        index += 1;
+                    }
+                    continue;
+                }
+                b'\\' => {
+                    escaped = true;
+                    at_word_start = false;
+                }
                 b'\'' => {
                     quote = if index > start && bytes[index - 1] == b'$' {
                         QuoteMode::AnsiC
                     } else {
                         QuoteMode::Single
                     };
+                    at_word_start = false;
                 }
-                b'"' => quote = QuoteMode::Double,
+                b'"' => {
+                    quote = QuoteMode::Double;
+                    at_word_start = false;
+                }
                 b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => {
-                    start = index + 1
+                    start = index + 1;
+                    at_word_start = true;
                 }
-                _ => {}
+                _ => at_word_start = false,
             },
         }
         index += 1;
@@ -722,6 +810,50 @@ mod tests {
         assert!(context.words.is_empty());
         assert!(context.command_name.is_none());
         assert_eq!(context.replace_start, line.len());
+    }
+
+    #[test]
+    fn comments_do_not_create_completion_commands() {
+        for line in ["# comment", "echo value # comment", "echo;# comment"] {
+            let context = CompletionContext::analyze(line, line.len());
+            assert!(context.command_name.is_none(), "line={line:?}");
+            assert!(context.words.is_empty(), "line={line:?}");
+            assert!(!context.command_position, "line={line:?}");
+            assert!(context.in_comment, "line={line:?}");
+        }
+        for line in [
+            "echo value#suffix",
+            "echo '# quoted'",
+            r"echo \# escaped",
+            "${#name}",
+        ] {
+            let context = CompletionContext::analyze(line, line.len());
+            assert!(context.command_name.is_some(), "line={line:?}");
+            assert!(!context.in_comment, "line={line:?}");
+        }
+        let multiline = "echo value # comment\ngit ch";
+        let context = CompletionContext::analyze(multiline, multiline.len());
+        assert_eq!(context.command_name.as_deref(), Some("git"));
+        assert_eq!(context.query, "ch");
+        assert!(!context.in_comment);
+
+        let after_quoted_comment = "echo value # don't\ngi";
+        let context = CompletionContext::analyze(after_quoted_comment, after_quoted_comment.len());
+        assert_eq!(context.command_name.as_deref(), Some("gi"));
+        assert_eq!(context.query, "gi");
+        assert_eq!(context.replace_start, after_quoted_comment.len() - 2);
+        assert!(context.command_position);
+        assert!(!context.in_comment);
+    }
+
+    #[test]
+    fn disabled_interactive_comments_treat_hash_words_as_input() {
+        let line = "echo #Cargo";
+        let context = CompletionContext::analyze_with_interactive_comments(line, line.len(), false);
+        assert!(!context.in_comment);
+        assert_eq!(context.command_name.as_deref(), Some("echo"));
+        assert_eq!(context.query, "#Cargo");
+        assert_eq!(context.words, ["echo", "#Cargo"]);
     }
 
     #[test]

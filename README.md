@@ -153,7 +153,7 @@ enable -d bashlume    # fully unload and restore callbacks/bindings
 Variables do not need to be exported. Set them **before** sourcing the loader, or run `bashlume reload` after changing them.
 
 ```bash
-BASHLUME_CACHE_MIB=16
+BASHLUME_CACHE_MIB=64
 BASHLUME_MAX_CANDIDATES=4096
 BASHLUME_MENU_ROWS=10
 
@@ -218,7 +218,7 @@ Development checks enforce:
 - incremental syntax-highlighting p99 below 0.5 ms for an approximately 1 KiB line
 - generic ranking thread-CPU p99 below 0.5 ms across 5,000 command names
 - additional private memory below 3.75 MiB (3,840 KiB) in the standard smoke workload
-- cache hard limit of 16 MiB by default
+- aggregate cache and mapped-rule hard limit of 64 MiB by default
 - top 4,096 candidates retained per scan by default
 
 Run all development checks with:

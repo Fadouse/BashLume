@@ -10,6 +10,10 @@ use super::format::{SourceKind, TrustStatus};
 use super::ir::{
     CandidateTemplate, CommandProgram, PathCompletion, PredicateOp, ProbeParser, RuleCandidateKind,
 };
+use super::probe::{
+    MAX_PROBE_ARGUMENT_BYTES, MAX_PROBE_ARGUMENTS, MAX_PROBE_ENVIRONMENT,
+    MAX_PROBE_ENVIRONMENT_BYTES, MAX_PROBE_PATH_BYTES,
+};
 use super::script::ScriptDialect;
 
 pub const MAX_EVALUATED_RULES: usize = 65_536;
@@ -99,6 +103,84 @@ pub struct ProbeResult {
     pub values: Vec<String>,
     #[serde(default)]
     pub truncated: bool,
+}
+
+fn charge_replay_values(
+    values: &[String],
+    total_values: &mut usize,
+    total_bytes: &mut usize,
+) -> Result<(), VmError> {
+    if values.len() > super::script_vm::MAX_VALUES {
+        return Err(VmError::Limit("external replay values"));
+    }
+    *total_values = total_values.saturating_add(values.len());
+    let value_bytes = values
+        .iter()
+        .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+        .ok_or(VmError::Limit("external replay values"))?;
+    *total_bytes = total_bytes.saturating_add(value_bytes);
+    if *total_values > super::script_vm::MAX_VALUES
+        || *total_bytes > super::script_vm::MAX_TOTAL_CANDIDATE_BYTES
+    {
+        return Err(VmError::Limit("external replay values"));
+    }
+    Ok(())
+}
+
+fn validate_replay_inputs<'a>(
+    probe_result_count: usize,
+    probe_results: impl Iterator<Item = (&'a ProbeKey, &'a [String])>,
+    completion_results: &HashMap<String, Vec<String>>,
+) -> Result<(), VmError> {
+    // Replay maps can retain resolved requests from earlier dependency rounds.
+    // Bound that accumulated state absolutely without requiring every stale
+    // entry to belong to the current round's much smaller publication caps.
+    if probe_result_count > MAX_PROBE_REQUESTS || completion_results.len() > MAX_PROBE_REQUESTS {
+        return Err(VmError::Limit("external replay results"));
+    }
+    let mut total_values = 0_usize;
+    let mut total_bytes = 0_usize;
+    for (key, values) in probe_results {
+        if key.arguments.len() > MAX_PROBE_ARGUMENTS
+            || key.environment.len() > MAX_PROBE_ENVIRONMENT
+            || key.executable.len() > MAX_PROBE_PATH_BYTES
+            || key.working_directory.len() > MAX_PROBE_PATH_BYTES
+        {
+            return Err(VmError::Limit("external replay results"));
+        }
+        let argument_bytes = key
+            .arguments
+            .iter()
+            .try_fold(0_usize, |bytes, value| bytes.checked_add(value.len()))
+            .ok_or(VmError::Limit("external replay results"))?;
+        let environment_bytes = key
+            .environment
+            .iter()
+            .try_fold(0_usize, |bytes, (name, value)| {
+                bytes.checked_add(name.len())?.checked_add(value.len())
+            })
+            .ok_or(VmError::Limit("external replay results"))?;
+        if argument_bytes > MAX_PROBE_ARGUMENT_BYTES
+            || environment_bytes > MAX_PROBE_ENVIRONMENT_BYTES
+        {
+            return Err(VmError::Limit("external replay results"));
+        }
+        total_bytes = total_bytes
+            .checked_add(key.executable.len())
+            .and_then(|bytes| bytes.checked_add(key.working_directory.len()))
+            .and_then(|bytes| bytes.checked_add(argument_bytes))
+            .and_then(|bytes| bytes.checked_add(environment_bytes))
+            .ok_or(VmError::Limit("external replay results"))?;
+        charge_replay_values(values, &mut total_values, &mut total_bytes)?;
+    }
+    for (key, values) in completion_results {
+        if key.len() > super::script_vm::MAX_VALUE_BYTES {
+            return Err(VmError::Limit("external replay results"));
+        }
+        total_bytes = total_bytes.saturating_add(key.len());
+        charge_replay_values(values, &mut total_values, &mut total_bytes)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -237,6 +319,13 @@ pub fn evaluate_with_results(
     probe_results: &HashMap<ProbeKey, Vec<String>>,
     completion_results: &HashMap<String, Vec<String>>,
 ) -> Result<EvaluationResult, VmError> {
+    validate_replay_inputs(
+        probe_results.len(),
+        probe_results
+            .iter()
+            .map(|(key, values)| (key, values.as_slice())),
+        completion_results,
+    )?;
     let outcomes = probe_results
         .iter()
         .map(|(key, values)| {
@@ -273,6 +362,13 @@ pub fn evaluate_with_outcomes(
     probe_results: &HashMap<ProbeKey, ProbeResult>,
     completion_results: &HashMap<String, Vec<String>>,
 ) -> Result<EvaluationResult, VmError> {
+    validate_replay_inputs(
+        probe_results.len(),
+        probe_results
+            .iter()
+            .map(|(key, result)| (key, result.values.as_slice())),
+        completion_results,
+    )?;
     program.validate().map_err(VmError::InvalidProgram)?;
     evaluate_validated_with_outcomes(
         program,
@@ -352,9 +448,81 @@ pub(crate) fn evaluate_runtime_programs_with_outcomes(
     allow_provisional_yield: bool,
     runtime_optimizations: bool,
 ) -> Result<EvaluationResult, VmError> {
+    evaluate_runtime_programs_with_options(
+        programs,
+        context,
+        source,
+        mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+        allow_provisional_yield,
+        runtime_optimizations,
+        runtime_optimizations,
+        runtime_optimizations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_runtime_program_dependencies_with_outcomes(
+    programs: &[(&CommandProgram, TrustStatus)],
+    context: &EvaluationContext<'_>,
+    source: SourceKind,
+    mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+) -> Result<EvaluationResult, VmError> {
+    evaluate_runtime_programs_with_options(
+        programs,
+        context,
+        source,
+        mode,
+        candidate_limit,
+        probe_results,
+        completion_results,
+        false,
+        true,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_runtime_programs_with_options(
+    programs: &[(&CommandProgram, TrustStatus)],
+    context: &EvaluationContext<'_>,
+    source: SourceKind,
+    mode: EvaluationMode,
+    candidate_limit: usize,
+    probe_results: &HashMap<ProbeKey, ProbeResult>,
+    completion_results: &HashMap<String, Vec<String>>,
+    allow_provisional_yield: bool,
+    runtime_optimizations: bool,
+    stop_after_dependency: bool,
+    skip_nonmatching_candidate_work: bool,
+) -> Result<EvaluationResult, VmError> {
+    // Static predicates and probes consume the same externally supplied
+    // context as Script IR. Validate it before either path can clone strings
+    // (notably the working directory into every ProbeKey), including for
+    // programs that contain no script modules.
+    super::script_vm::validate_evaluation_context(context)?;
     let candidate_limit = candidate_limit.clamp(1, MAX_EMITTED_CANDIDATES);
+    let fish_script_effects = source == SourceKind::Fish
+        && programs
+            .iter()
+            .any(|(program, _)| !program.scripts.is_empty());
+    // Fish script erases can remove static registration contributions later in
+    // the same evaluation. Keep them under the absolute VM cap until all Fish
+    // effects have run, then apply the caller's presentation limit.
+    let static_candidate_limit = if fish_script_effects {
+        MAX_EMITTED_CANDIDATES
+    } else {
+        candidate_limit
+    };
     let mut result = EvaluationResult::default();
     let mut evaluated_rules = 0_usize;
+    let mut candidate_bytes = 0_usize;
 
     for &(program, trust) in programs {
         for rule in &program.static_rules {
@@ -365,9 +533,16 @@ pub(crate) fn evaluate_runtime_programs_with_outcomes(
             if evaluate_predicates(&rule.when, context)? {
                 result.path_completion = result.path_completion.merge(rule.path_completion);
                 for candidate in &rule.candidates {
-                    if result.candidates.len() >= candidate_limit {
+                    if result.candidates.len() >= static_candidate_limit {
                         result.truncated = true;
                         break;
+                    }
+                    candidate_bytes = candidate_bytes
+                        .saturating_add(candidate.value.len())
+                        .saturating_add(candidate.display.len())
+                        .saturating_add(candidate.description.as_ref().map_or(0, String::len));
+                    if candidate_bytes > super::script_vm::MAX_TOTAL_CANDIDATE_BYTES {
+                        return Err(VmError::Limit("candidate bytes"));
                     }
                     let emitted = EmittedCandidate {
                         candidate: candidate.clone(),
@@ -392,21 +567,43 @@ pub(crate) fn evaluate_runtime_programs_with_outcomes(
             if result.probes.len() >= MAX_PROBE_REQUESTS {
                 return Err(VmError::Limit("probe requests"));
             }
-            let arguments = probe
-                .arguments
-                .iter()
-                .map(|argument| expand_template(argument, context))
-                .collect::<Result<Vec<_>, _>>()?;
+            if probe.arguments.len() > MAX_PROBE_ARGUMENTS
+                || probe.environment.len() > MAX_PROBE_ENVIRONMENT
+            {
+                return Err(VmError::Limit("probe arguments or environment"));
+            }
+            let mut argument_bytes = 0_usize;
+            let mut arguments = Vec::with_capacity(probe.arguments.len());
+            for argument in &probe.arguments {
+                let argument = expand_template(argument, context)?;
+                argument_bytes = argument_bytes.saturating_add(argument.len());
+                if argument_bytes > MAX_PROBE_ARGUMENT_BYTES {
+                    return Err(VmError::Limit("probe argument bytes"));
+                }
+                arguments.push(argument);
+            }
+            let mut environment_bytes = 0_usize;
             let mut environment = Vec::with_capacity(probe.environment.len());
             for (name, value) in &probe.environment {
-                environment.push((name.clone(), expand_template(value, context)?));
+                let value = expand_template(value, context)?;
+                environment_bytes = environment_bytes
+                    .saturating_add(name.len())
+                    .saturating_add(value.len());
+                if environment_bytes > MAX_PROBE_ENVIRONMENT_BYTES {
+                    return Err(VmError::Limit("probe environment bytes"));
+                }
+                environment.push((name.clone(), value));
+            }
+            let working_directory = context.working_directory.to_string_lossy().into_owned();
+            if working_directory.len() > MAX_PROBE_PATH_BYTES {
+                return Err(VmError::Limit("probe working directory"));
             }
             result.probes.push(ProbeRequest {
                 key: ProbeKey {
                     executable: probe.executable.clone(),
                     arguments,
                     environment,
-                    working_directory: context.working_directory.to_string_lossy().into_owned(),
+                    working_directory,
                     parser: probe.parser,
                     include_stderr: false,
                 },
@@ -448,6 +645,8 @@ pub(crate) fn evaluate_runtime_programs_with_outcomes(
             &mut result,
             script_allow_provisional_yield,
             runtime_optimizations,
+            stop_after_dependency,
+            skip_nonmatching_candidate_work,
         )?;
     }
     Ok(result)
@@ -674,6 +873,94 @@ mod tests {
     }
 
     #[test]
+    fn static_only_program_groups_share_the_candidate_byte_budget() {
+        let program = |name: &str, value: char| CommandProgram {
+            canonical_name: name.into(),
+            registrations: vec!["demo".into()],
+            source_path: name.into(),
+            source_commit: "abc".into(),
+            license: "GPL-2.0-or-later".into(),
+            static_rules: vec![StaticRule {
+                when: vec![PredicateOp::True],
+                path_completion: PathCompletion::Inherit,
+                candidates: (0..6)
+                    .map(|_| CandidateTemplate {
+                        value: value.to_string().repeat(600_000),
+                        display: value.to_string().repeat(600_000),
+                        description: None,
+                        kind: RuleCandidateKind::Value,
+                        append: AppendPolicy::Space,
+                        preserve_order: false,
+                    })
+                    .collect(),
+            }],
+            probes: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let first = program("first", 'a');
+        let second = program("second", 'b');
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate_runtime_programs_with_outcomes(
+                &[
+                    (&first, TrustStatus::Unsigned),
+                    (&second, TrustStatus::Unsigned)
+                ],
+                &context(&words, &environment),
+                SourceKind::Fish,
+                EvaluationMode::Passive,
+                128,
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
+                true,
+            ),
+            Err(VmError::Limit("candidate bytes"))
+        ));
+    }
+
+    #[test]
+    fn expanded_probe_arguments_are_aggregate_bounded_before_request_publication() {
+        let program = CommandProgram {
+            canonical_name: "demo".into(),
+            registrations: vec!["demo".into()],
+            source_path: "demo".into(),
+            source_commit: "abc".into(),
+            license: "GPL-2.0-or-later".into(),
+            static_rules: Vec::new(),
+            probes: vec![crate::rules::ir::ProbeSpec {
+                id: "expanded".into(),
+                when: vec![PredicateOp::True],
+                executable: "printf".into(),
+                arguments: vec!["{current}".into(); MAX_PROBE_ARGUMENTS],
+                environment: Vec::new(),
+                parser: ProbeParser::Lines,
+                candidate_kind: RuleCandidateKind::Value,
+                append: AppendPolicy::Space,
+                timeout_ms: 1000,
+                output_limit: 1024,
+                cache_ttl_ms: 1000,
+                description: None,
+            }],
+            scripts: Vec::new(),
+        };
+        let words = vec!["demo".into(), "x".repeat(2048)];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::User,
+                TrustStatus::Verified { key_id: [1; 32] },
+                EvaluationMode::ExplicitTab,
+                128,
+            ),
+            Err(VmError::Limit("probe argument bytes"))
+        ));
+    }
+
+    #[test]
     fn passive_evaluation_never_returns_process_requests() {
         let program = CommandProgram {
             canonical_name: "git".into(),
@@ -709,6 +996,36 @@ mod tests {
         .unwrap();
         assert_eq!(result.candidates.len(), 1);
         assert!(result.probes.is_empty());
+    }
+
+    #[test]
+    fn scriptless_programs_validate_external_context_before_evaluation() {
+        let program = CommandProgram {
+            canonical_name: "demo".into(),
+            registrations: vec!["demo".into()],
+            source_path: "demo".into(),
+            source_commit: "abc".into(),
+            license: "GPL-2.0-or-later".into(),
+            static_rules: Vec::new(),
+            probes: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let oversized_working_directory = "x".repeat(64 * 1024 + 1);
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.working_directory = Path::new(&oversized_working_directory);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &evaluation_context,
+                SourceKind::User,
+                TrustStatus::Unsigned,
+                EvaluationMode::ExplicitTab,
+                128,
+            ),
+            Err(VmError::Limit("evaluation context"))
+        ));
     }
 
     #[test]
@@ -2559,6 +2876,56 @@ complete -c demo -a '(generated)'
             128,
         );
         assert!(matches!(result, Err(VmError::Limit("evaluation context"))));
+
+        let variable_values = (0..=4096)
+            .map(|index| (format!("value_{index}"), vec![String::new()]))
+            .collect::<HashMap<_, _>>();
+        let bounded_words = vec!["large".into(), String::new()];
+        let mut ctx = context(&bounded_words, &environment);
+        ctx.shell_variable_values = Some(&variable_values);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &ctx,
+                SourceKind::Bash,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("evaluation context"))
+        ));
+
+        let oversized_working_directory = "x".repeat(64 * 1024 + 1);
+        let mut ctx = context(&bounded_words, &environment);
+        ctx.working_directory = Path::new(&oversized_working_directory);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &ctx,
+                SourceKind::Bash,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("evaluation context"))
+        ));
+
+        // Numbered positional variables are derived by Machine::new. Reject
+        // their cardinality before cloning the words into those variables.
+        let mut positional_words = vec![String::new(); 5000];
+        positional_words[0] = "large".into();
+        let ctx = context(&positional_words, &environment);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &ctx,
+                SourceKind::Bash,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("evaluation context"))
+        ));
     }
 
     #[test]
@@ -3141,6 +3508,43 @@ complete -c demo -a '(generated)'
     }
 
     #[test]
+    fn fish_quick_pass_does_not_reset_incomplete_optimization_between_modules() {
+        let mut program = script_program(
+            ScriptDialect::Fish,
+            "first.fish",
+            "demo",
+            "set -g gate yes\ncomplete -c demo -l other -a '(set -g gate no; echo unrelated)'\ncomplete -c demo -n 'test $gate = yes' -l version\n",
+        );
+        program.scripts.push(
+            parse_script(
+                ScriptDialect::Fish,
+                "second.fish",
+                "complete -c demo -n 'test -e /virtual/state' -l version-two\n",
+            )
+            .unwrap(),
+        );
+        let words = vec!["demo".into(), "--ver".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(result.optimization_incomplete);
+        assert_eq!(result.filesystem_requests.len(), 1);
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+    }
+
+    #[test]
     fn fish_quick_pass_yields_only_after_prior_dependencies_are_replayed() {
         let program = script_program(
             ScriptDialect::Fish,
@@ -3234,6 +3638,66 @@ complete -c demo -a '(generated)'
     }
 
     #[test]
+    fn fish_quick_pass_recognizes_builtin_dispatched_erase() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l removed\ntest -e /virtual/state\nbuiltin -- complete -ec demo -l removed\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!result.provisional_yielded);
+        assert!(result.provisional_candidates.is_empty());
+    }
+
+    #[test]
+    fn fish_quick_pass_recognizes_wrapped_and_dynamic_erase_dispatch() {
+        for erase in [
+            "not complete -ec demo -l removed",
+            "and complete -ec demo -l removed",
+            "or complete -ec demo -l removed",
+            "set erase complete; $erase -ec demo -l removed",
+        ] {
+            let source = format!("complete -c demo -l removed\ntest -e /virtual/state\n{erase}\n");
+            let program = script_program(ScriptDialect::Fish, "demo.fish", "demo", &source);
+            let words = vec!["demo".into(), "--".into()];
+            let environment = HashMap::new();
+            let result = evaluate_runtime_with_outcomes(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Fish,
+                TrustStatus::Verified { key_id: [1; 32] },
+                EvaluationMode::ExplicitTab,
+                128,
+                &HashMap::new(),
+                &HashMap::new(),
+                true,
+                true,
+            )
+            .unwrap();
+            assert!(!result.provisional_yielded, "erase dispatch: {erase}");
+            assert!(
+                result.provisional_candidates.is_empty(),
+                "erase dispatch: {erase}"
+            );
+        }
+    }
+
+    #[test]
     fn fish_erase_removes_argument_candidates_and_path_policy() {
         let program = script_program(
             ScriptDialect::Fish,
@@ -3254,6 +3718,400 @@ complete -c demo -a '(generated)'
         .unwrap();
         assert!(result.candidates.is_empty());
         assert_eq!(result.path_completion, PathCompletion::Inherit);
+    }
+
+    #[test]
+    fn fish_selective_erase_preserves_other_selectors_in_same_registration() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l old -l keep\ncomplete -e -c demo -l old\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--keep"]
+        );
+    }
+
+    #[test]
+    fn fish_selective_erase_removes_erased_selector_arguments_and_path_policy() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l old -l keep -r -f -a value\ncomplete -e -c demo -l old\n",
+        );
+        let environment = HashMap::new();
+        let erased_words = vec!["demo".into(), "--old".into(), String::new()];
+        let erased = evaluate(
+            &program,
+            &context(&erased_words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(erased.candidates.is_empty());
+        assert_eq!(erased.path_completion, PathCompletion::Inherit);
+
+        let retained_words = vec!["demo".into(), "--keep".into(), String::new()];
+        let retained = evaluate(
+            &program,
+            &context(&retained_words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        assert_eq!(retained.path_completion, PathCompletion::Suppress);
+    }
+
+    #[test]
+    fn evaluation_context_rejects_flattened_variable_slots_before_machine_clone() {
+        let program = script_program(ScriptDialect::Fish, "bounded.fish", "bounded", ":\n");
+        let words = vec!["bounded".into(), String::new()];
+        let environment = HashMap::new();
+        let values_per_variable = crate::rules::script_vm::MAX_VALUES / 2 + 1;
+        let shell_values = HashMap::from([
+            ("first".into(), vec![String::new(); values_per_variable]),
+            ("second".into(), vec![String::new(); values_per_variable]),
+        ]);
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.shell_variable_values = Some(&shell_values);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &evaluation_context,
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("evaluation context"))
+        ));
+    }
+
+    #[test]
+    fn fish_runtime_registration_effects_share_the_machine_memory_budget() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "for option in $options\ncomplete -c demo -l $option\nend\n",
+        );
+        let words = vec!["demo".into(), "value".into()];
+        let environment = HashMap::new();
+        let shell_values = HashMap::from([(
+            "options".into(),
+            (0..9000).map(|index| format!("option{index}")).collect(),
+        )]);
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.shell_variable_values = Some(&shell_values);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &evaluation_context,
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("Fish registration state"))
+        ));
+    }
+
+    #[test]
+    fn fish_presentation_limit_is_applied_after_registration_erase() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "limit-erase.fish",
+            "demo",
+            "complete -c demo -l old\ncomplete -c demo -l new\ncomplete -e -c demo -l old\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--new"]
+        );
+    }
+
+    #[test]
+    fn fish_static_candidates_are_not_truncated_before_script_erases() {
+        let mut program = script_program(
+            ScriptDialect::Fish,
+            "static-erase.fish",
+            "demo",
+            "complete -e -c demo -l old\n",
+        );
+        program.static_rules = vec![StaticRule {
+            when: vec![PredicateOp::True],
+            path_completion: PathCompletion::Inherit,
+            candidates: vec![
+                CandidateTemplate {
+                    value: "--old".into(),
+                    display: "--old".into(),
+                    description: None,
+                    kind: RuleCandidateKind::Option,
+                    append: AppendPolicy::Space,
+                    preserve_order: true,
+                },
+                CandidateTemplate {
+                    value: "--new".into(),
+                    display: "--new".into(),
+                    description: None,
+                    kind: RuleCandidateKind::Option,
+                    append: AppendPolicy::Space,
+                    preserve_order: true,
+                },
+            ],
+        }];
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--new"]
+        );
+    }
+
+    #[test]
+    fn fish_builtin_complete_erase_cannot_leak_a_provisional_candidate() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "builtin-erase.fish",
+            "demo",
+            "complete -c demo -l old\nbuiltin complete -e -c demo -l old\ncomplete -c demo -l new\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::ExplicitTab,
+            128,
+        )
+        .unwrap();
+        assert!(
+            result
+                .provisional_candidates
+                .iter()
+                .all(|candidate| candidate.candidate.value != "--old")
+        );
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--new"]
+        );
+    }
+
+    #[test]
+    fn fish_selective_erase_charges_command_selector_cartesian_work() {
+        let mut source = String::new();
+        for index in 0..1000 {
+            source.push_str(&format!("complete -c demo -w target{index}\n"));
+        }
+        source.push_str("complete -c '*' ");
+        for index in 0..300 {
+            source.push_str(&format!("-l option{index} "));
+        }
+        source.push('\n');
+        source.push_str("complete -e -c '*' ");
+        for index in 0..300 {
+            source.push_str(&format!("-l option{index} "));
+        }
+        source.push('\n');
+        let program = script_program(ScriptDialect::Fish, "demo.fish", "demo", &source);
+        let words = vec!["demo".into(), "value".into()];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("Fish erase work"))
+        ));
+    }
+
+    #[test]
+    fn fish_repeated_erase_scans_have_an_absolute_work_budget() {
+        let mut source = String::new();
+        for index in 0..1000 {
+            source.push_str(&format!("complete -c demo -l option{index}\n"));
+        }
+        for _ in 0..100 {
+            source.push_str("complete -e -c demo -l absent\n");
+        }
+        let program = script_program(ScriptDialect::Fish, "demo.fish", "demo", &source);
+        let words = vec!["demo".into(), "value".into()];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("Fish erase work"))
+        ));
+    }
+
+    #[test]
+    fn fish_erase_preserves_non_registration_path_effects() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -C ''\ncomplete -c demo -F\ncomplete -ec demo\n",
+        );
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let completion_results = HashMap::from([(
+            String::new(),
+            vec![nested_completion_path_marker(PathCompletion::Directories).unwrap()],
+        )]);
+        let result = evaluate_with_results(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+            &HashMap::new(),
+            &completion_results,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.path_completion, PathCompletion::Directories);
+    }
+
+    #[test]
+    fn fish_erase_recharges_retained_static_display_bytes() {
+        let mut program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l removed\ncomplete -ec demo -l removed\ncomplete -c demo -a \"$LARGE\"\n",
+        );
+        program.static_rules.push(StaticRule {
+            when: vec![PredicateOp::True],
+            path_completion: PathCompletion::Inherit,
+            candidates: (0..8)
+                .map(|index| CandidateTemplate {
+                    value: format!("s{index}"),
+                    display: "d".repeat(1_041_000),
+                    description: None,
+                    kind: RuleCandidateKind::Value,
+                    append: AppendPolicy::Space,
+                    preserve_order: false,
+                })
+                .collect(),
+        });
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::from([("LARGE".into(), "x".repeat(40_000))]);
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("candidate bytes"))
+        ));
+    }
+
+    #[test]
+    fn fish_presentation_limit_is_applied_after_registration_erasure() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete -c demo -l old\ncomplete -c demo -l new\ncomplete -ec demo -l old\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--new"]
+        );
+        assert!(!result.truncated);
     }
 
     #[test]
@@ -3307,6 +4165,43 @@ complete -c demo -a '(generated)'
         )
         .unwrap();
         assert!(result.candidates.is_empty());
+    }
+
+    #[test]
+    fn fish_attached_long_complete_values_are_normalized_before_selective_erase() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "complete --command=demo --long-option=old\ncomplete --command=demo --long-option=keep\ncomplete --erase --command=demo --long-option=old\ncomplete --command=demo --condition=true --arguments=value --description=attached\n",
+        );
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(!values.contains(&"--old"));
+        assert!(values.contains(&"--keep"));
+        assert!(values.contains(&"value"));
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .find(|candidate| candidate.candidate.value == "value")
+                .and_then(|candidate| candidate.candidate.description.as_deref()),
+            Some("attached")
+        );
     }
 
     #[test]
@@ -3400,6 +4295,123 @@ complete -c demo -a '(generated)'
     }
 
     #[test]
+    fn fish_erase_is_scoped_to_the_selected_wrapper_command() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "wrapper.fish",
+            "wrapper",
+            "function target\nend\ncomplete -c wrapper -w target\ncomplete -c wrapper -l own\ncomplete -c target -l inherited\ncomplete -ec target\n",
+        );
+        let words = vec!["wrapper".into(), "--".into()];
+        let environment = HashMap::new();
+        let available = HashSet::from(["wrapper".to_owned()]);
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.available_commands = Some(&available);
+        let result = evaluate(
+            &program,
+            &evaluation_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"--own"));
+        assert!(!values.contains(&"--inherited"));
+    }
+
+    #[test]
+    fn fish_wrap_erase_recomputes_transitive_reachability() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "wrapper.fish",
+            "wrapper",
+            "complete -c wrapper -w middle\ncomplete -c middle -w leaf\ncomplete -c wrapper -l own\ncomplete -c leaf -l inherited\ncomplete -e -c wrapper -w middle\n",
+        );
+        let words = vec!["wrapper".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"--own"));
+        assert!(!values.contains(&"--inherited"));
+    }
+
+    #[test]
+    fn fish_unexecuted_wrap_metadata_does_not_create_reachability() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "wrapper.fish",
+            "wrapper",
+            "if false\n    complete -c wrapper -w target\nend\ncomplete -c wrapper -l own\ncomplete -c target -l ghost\n",
+        );
+        let words = vec!["wrapper".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"--own"));
+        assert!(!values.contains(&"--ghost"));
+    }
+
+    #[test]
+    fn fish_large_literal_wrapper_closure_remains_bounded() {
+        let mut source = String::new();
+        for index in 0..512 {
+            source.push_str(&format!(
+                "complete -c wrapper{index} -w wrapper{}\n",
+                index + 1
+            ));
+        }
+        source.push_str("complete -c wrapper512 -l terminal\n");
+        let program = script_program(ScriptDialect::Fish, "wrapper.fish", "wrapper0", &source);
+        let words = vec!["wrapper0".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate.value == "--terminal")
+        );
+    }
+
+    #[test]
     fn fish_erase_and_wrappers_compose_across_command_programs() {
         let first = script_program(
             ScriptDialect::Fish,
@@ -3479,6 +4491,39 @@ complete -c demo -n flip -a second
             &HashMap::new(),
             false,
             true,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn unoptimized_fish_replay_does_not_memoize_across_state_changes() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "demo",
+            "set -g gate yes\ncomplete -c demo -n 'test $gate = yes' -a first\nset -g gate no\ncomplete -c demo -n 'test $gate = yes' -a second\n",
+        );
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let result = evaluate_runtime_with_outcomes(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Verified { key_id: [1; 32] },
+            EvaluationMode::ExplicitTab,
+            128,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -4553,6 +5598,29 @@ _arguments '-f[functions]:*:function:compadd -k func_arr'
     }
 
     #[test]
+    fn script_controlled_array_index_is_rejected_before_resize() {
+        let program = script_program(
+            ScriptDialect::Bash,
+            "demo.bash",
+            "demo",
+            "printf -v 'items[999999999]' value\n",
+        );
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Bash,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("shell variable values"))
+        ));
+    }
+
+    #[test]
     fn zsh_associative_unset_and_print_preserve_native_scan_order() {
         let program = script_program(
             ScriptDialect::Zsh,
@@ -5177,7 +6245,14 @@ complete -c demo -n needs_first_argument -a first
             128,
         )
         .unwrap();
-        assert!(unavailable_result.candidates.is_empty());
+        assert_eq!(
+            unavailable_result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--wrapped"]
+        );
 
         let available = HashSet::from(["target".into(), "helper".into()]);
         let mut available_context = context(&words, &environment);
@@ -5199,6 +6274,265 @@ complete -c demo -n needs_first_argument -a first
                 .collect::<Vec<_>>(),
             ["--local", "--wrapped"]
         );
+    }
+
+    #[test]
+    fn fish_multiple_unavailable_wrapper_services_are_all_reachable() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "alias.fish",
+            "alias",
+            "set target missing-two\ncomplete -c alias -w missing-one -w $target\ncomplete -c missing-two -l inherited\n",
+        );
+        let words = vec!["alias".into(), "--".into()];
+        let environment = HashMap::new();
+        let unavailable = HashSet::new();
+        let mut unavailable_context = context(&words, &environment);
+        unavailable_context.available_commands = Some(&unavailable);
+        let result = evaluate(
+            &program,
+            &unavailable_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--inherited"]
+        );
+    }
+
+    #[test]
+    fn fish_runtime_resolved_unavailable_wrapper_service_expands_the_closure() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "alias.fish",
+            "alias",
+            "complete -c alias -w (printf missing)\ncomplete -c missing -l inherited\n",
+        );
+        let words = vec!["alias".into(), "--".into()];
+        let environment = HashMap::new();
+        let unavailable = HashSet::new();
+        let mut unavailable_context = context(&words, &environment);
+        unavailable_context.available_commands = Some(&unavailable);
+        let result = evaluate(
+            &program,
+            &unavailable_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["--inherited"]
+        );
+    }
+
+    #[test]
+    fn fish_runtime_wrapper_revisits_an_earlier_registration_in_the_same_module() {
+        let program = script_program(
+            ScriptDialect::Fish,
+            "alias.fish",
+            "alias",
+            "set target missing\ncomplete -c missing -l inherited\ncomplete -c alias -w $target\n",
+        );
+        let words = vec!["alias".into(), "--".into()];
+        let environment = HashMap::new();
+        let unavailable = HashSet::new();
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.available_commands = Some(&unavailable);
+        let result = evaluate(
+            &program,
+            &evaluation_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].candidate.value, "--inherited");
+    }
+
+    #[test]
+    fn fish_runtime_wrapper_revisits_an_earlier_target_module() {
+        let target = parse_script(
+            ScriptDialect::Fish,
+            "target.fish",
+            "complete -c missing -l inherited\n",
+        )
+        .unwrap();
+        let wrapper = parse_script(
+            ScriptDialect::Fish,
+            "alias.fish",
+            "complete -c alias -w (printf missing)\n",
+        )
+        .unwrap();
+        let program = CommandProgram {
+            canonical_name: "alias".into(),
+            registrations: vec!["alias".into()],
+            source_path: "combined.fish".into(),
+            source_commit: "0123456789abcdef".into(),
+            license: "GPL-2.0-only".into(),
+            static_rules: Vec::new(),
+            probes: Vec::new(),
+            scripts: vec![target, wrapper],
+        };
+        let words = vec!["alias".into(), "--".into()];
+        let environment = HashMap::new();
+        let unavailable = HashSet::new();
+        let mut evaluation_context = context(&words, &environment);
+        evaluation_context.available_commands = Some(&unavailable);
+        let result = evaluate(
+            &program,
+            &evaluation_context,
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(result.candidates[0].candidate.value, "--inherited");
+    }
+
+    #[test]
+    fn fish_complete_argument_expansion_is_aggregate_bounded() {
+        let source = format!("complete -c demo {}\n", "{1..4096} ".repeat(32));
+        let program = script_program(ScriptDialect::Fish, "demo.fish", "demo", &source);
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        assert!(matches!(
+            evaluate(
+                &program,
+                &context(&words, &environment),
+                SourceKind::Fish,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+            ),
+            Err(VmError::Limit("shell command output"))
+        ));
+
+        let source = format!("complete -c demo {}{{1..4096}}\n", "x".repeat(16 * 1024));
+        let program = script_program(ScriptDialect::Fish, "demo.fish", "demo", &source);
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        );
+        assert!(matches!(result, Err(VmError::Limit(_))), "{result:?}");
+    }
+
+    #[test]
+    fn fish_selective_erase_removes_a_static_option_candidate() {
+        let module = parse_script(
+            ScriptDialect::Fish,
+            "demo.fish",
+            "complete -e -c demo -l old\n",
+        )
+        .unwrap();
+        let program = CommandProgram {
+            canonical_name: "demo".into(),
+            registrations: vec!["demo".into()],
+            source_path: "demo.fish".into(),
+            source_commit: "0123456789abcdef".into(),
+            license: "GPL-2.0-only".into(),
+            static_rules: vec![StaticRule {
+                when: vec![PredicateOp::True],
+                path_completion: PathCompletion::Files,
+                candidates: vec![
+                    CandidateTemplate {
+                        value: "--old".into(),
+                        display: "--old".into(),
+                        description: None,
+                        kind: RuleCandidateKind::Option,
+                        append: AppendPolicy::Space,
+                        preserve_order: false,
+                    },
+                    CandidateTemplate {
+                        value: "keep".into(),
+                        display: "keep".into(),
+                        description: None,
+                        kind: RuleCandidateKind::Value,
+                        append: AppendPolicy::Space,
+                        preserve_order: false,
+                    },
+                ],
+            }],
+            probes: Vec::new(),
+            scripts: vec![module],
+        };
+        let words = vec!["demo".into(), "--".into()];
+        let environment = HashMap::new();
+        let result = evaluate(
+            &program,
+            &context(&words, &environment),
+            SourceKind::Fish,
+            TrustStatus::Unsigned,
+            EvaluationMode::Passive,
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+        assert_eq!(result.path_completion, PathCompletion::Files);
+    }
+
+    #[test]
+    fn oversized_external_probe_results_are_rejected_before_cloning() {
+        let program = CommandProgram {
+            canonical_name: "demo".into(),
+            registrations: vec!["demo".into()],
+            source_path: "demo".into(),
+            source_commit: "0123456789abcdef".into(),
+            license: "GPL-2.0-only".into(),
+            static_rules: Vec::new(),
+            probes: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let words = vec!["demo".into(), String::new()];
+        let environment = HashMap::new();
+        let key = ProbeKey {
+            executable: "printf".into(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            working_directory: "/tmp".into(),
+            parser: ProbeParser::Lines,
+            include_stderr: false,
+        };
+        let results = HashMap::from([(key, vec!["x".repeat(8 * 1024 * 1024 + 1)])]);
+        assert!(matches!(
+            evaluate_with_probe_results(
+                &program,
+                &context(&words, &environment),
+                SourceKind::User,
+                TrustStatus::Unsigned,
+                EvaluationMode::Passive,
+                128,
+                &results,
+            ),
+            Err(VmError::Limit("external replay values"))
+        ));
     }
 
     #[test]

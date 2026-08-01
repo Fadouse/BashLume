@@ -75,7 +75,7 @@ impl Default for Config {
             highlight: HighlightMode::Errors,
             diagnostics: DiagnosticsMode::Marker,
             diagnostic_delay_ms: 300,
-            cache_limit_bytes: 16 * 1024 * 1024,
+            cache_limit_bytes: 64 * 1024 * 1024,
             max_candidates: 4096,
             menu_rows: 10,
             menu_descriptions: MenuDescriptionMode::Selected,
@@ -139,7 +139,7 @@ impl Config {
                 .unwrap_or(config.diagnostic_delay_ms);
         }
         if let Some(value) = unsafe { shell_var("BASHLUME_CACHE_MIB") } {
-            let mib = parse_bounded(&value, 1, 1024).unwrap_or(16);
+            let mib = parse_bounded(&value, 1, 1024).unwrap_or(64);
             config.cache_limit_bytes = mib.saturating_mul(1024 * 1024);
         }
         if let Some(value) = unsafe { shell_var("BASHLUME_MAX_CANDIDATES") } {

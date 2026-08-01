@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 
-use super::format::{PackFile, SourceKind, TrustStatus, TrustedKeys};
+use super::format::{MAX_MATCHING_COMMAND_BLOCKS, PackFile, SourceKind, TrustStatus, TrustedKeys};
 use super::ir::CommandProgram;
 use super::script::{
     ScriptDialect, ScriptModule, ScriptStatement, ScriptWord, ScriptWordPart, registration_matches,
@@ -39,6 +39,21 @@ pub struct PackSummary {
     pub error: Option<String>,
 }
 
+pub(crate) fn pack_summaries_bytes(summaries: &[PackSummary]) -> usize {
+    summaries
+        .len()
+        .saturating_mul(std::mem::size_of::<PackSummary>())
+        .saturating_add(summaries.iter().fold(0_usize, |total, summary| {
+            total
+                .saturating_add(summary.path.as_os_str().as_bytes().len())
+                .saturating_add(summary.pack_id.capacity())
+                .saturating_add(summary.pack_version.capacity())
+                .saturating_add(summary.source_commit.capacity())
+                .saturating_add(summary.license_expression.capacity())
+                .saturating_add(summary.error.as_ref().map_or(0, String::capacity))
+        }))
+}
+
 #[derive(Clone, Debug)]
 pub struct LoadedProgram {
     pub pack_id: [u8; 32],
@@ -47,6 +62,7 @@ pub struct LoadedProgram {
     pub source: SourceKind,
     pub trust: TrustStatus,
     pub required_commands: Vec<String>,
+    pub(crate) retained_bytes: usize,
     pub program: Arc<CommandProgram>,
 }
 
@@ -54,6 +70,22 @@ pub struct LoadedProgram {
 pub struct RuleStore {
     packs: Vec<PackFile>,
     summaries: Vec<PackSummary>,
+}
+
+fn push_bounded_summary(
+    store: &mut RuleStore,
+    retained_bytes: &mut usize,
+    byte_limit: usize,
+    summary: PackSummary,
+) -> bool {
+    // One copy remains in the worker store and one is sent to the main cache.
+    let bytes = pack_summaries_bytes(std::slice::from_ref(&summary)).saturating_mul(2);
+    if retained_bytes.saturating_add(bytes) > byte_limit {
+        return false;
+    }
+    *retained_bytes = retained_bytes.saturating_add(bytes);
+    store.summaries.push(summary);
+    true
 }
 
 fn bounded_discovery_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -76,6 +108,23 @@ fn bounded_discovery_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 
 impl RuleStore {
     pub fn discover(paths: &[PathBuf], trusted_key_paths: &[PathBuf]) -> Self {
+        Self::discover_bounded(paths, trusted_key_paths, usize::MAX)
+    }
+
+    pub(crate) fn discover_bounded(
+        paths: &[PathBuf],
+        trusted_key_paths: &[PathBuf],
+        byte_limit: usize,
+    ) -> Self {
+        Self::discover_bounded_while(paths, trusted_key_paths, byte_limit, || true)
+    }
+
+    pub(crate) fn discover_bounded_while(
+        paths: &[PathBuf],
+        trusted_key_paths: &[PathBuf],
+        byte_limit: usize,
+        mut should_continue: impl FnMut() -> bool,
+    ) -> Self {
         let trusted_key_paths = bounded_discovery_paths(trusted_key_paths);
         let paths = bounded_discovery_paths(paths);
         let (trusted_keys, key_errors) = load_trusted_keys(&trusted_key_paths);
@@ -85,35 +134,18 @@ impl RuleStore {
         files.truncate(MAX_DISCOVERED_PACKS);
 
         let mut store = Self::default();
+        let mut retained_bytes = 0_usize;
         for error in key_errors {
-            store.summaries.push(PackSummary {
-                path: PathBuf::new(),
-                pack_id: "trusted-key".into(),
-                pack_version: String::new(),
-                source: SourceKind::User,
-                source_commit: String::new(),
-                license_expression: String::new(),
-                trust: TrustStatus::Unsigned,
-                format: [0, 0],
-                command_count: 0,
-                stale_count: 0,
-                compatible: false,
-                error: Some(error),
-            });
-        }
-        for path in files {
-            match PackFile::open(&path, &trusted_keys) {
-                Ok(pack) => {
-                    let compatible = version_at_least(ENGINE_VERSION, pack.minimum_engine())
-                        && pack.required_opcodes() & !SUPPORTED_REQUIRED_OPCODES == 0;
-                    store.summaries.push(summary(&pack, compatible, None));
-                    if compatible {
-                        store.packs.push(pack);
-                    }
-                }
-                Err(error) => store.summaries.push(PackSummary {
-                    path,
-                    pack_id: String::new(),
+            if !should_continue() {
+                return Self::default();
+            }
+            let _ = push_bounded_summary(
+                &mut store,
+                &mut retained_bytes,
+                byte_limit,
+                PackSummary {
+                    path: PathBuf::new(),
+                    pack_id: "trusted-key".into(),
                     pack_version: String::new(),
                     source: SourceKind::User,
                     source_commit: String::new(),
@@ -123,8 +155,79 @@ impl RuleStore {
                     command_count: 0,
                     stale_count: 0,
                     compatible: false,
-                    error: Some(error.to_string()),
-                }),
+                    error: Some(error),
+                },
+            );
+        }
+        for path in files {
+            if !should_continue() {
+                return Self::default();
+            }
+            // `open_bounded` preflights the mapping plus parsed metadata
+            // against this complete remaining store budget before allocating.
+            let mapping_limit = byte_limit.saturating_sub(retained_bytes);
+            match PackFile::open_bounded(
+                &path,
+                &trusted_keys,
+                u64::try_from(mapping_limit).unwrap_or(u64::MAX),
+            ) {
+                Ok(pack) => {
+                    let compatible = version_at_least(ENGINE_VERSION, pack.minimum_engine())
+                        && pack.required_opcodes() & !SUPPORTED_REQUIRED_OPCODES == 0;
+                    let pack_bytes = pack.approximate_bytes();
+                    // Compute from borrowed metadata before cloning a summary.
+                    // If the aggregate cannot retain both copies, unmap the
+                    // pack before allocating even the bounded rejection row.
+                    let summary_bytes = summary_bytes(&pack, 0).saturating_mul(2);
+                    let retained = compatible
+                        && retained_bytes
+                            .saturating_add(pack_bytes)
+                            .saturating_add(summary_bytes)
+                            <= byte_limit;
+                    if retained {
+                        let accepted_summary = summary(&pack, true, None);
+                        retained_bytes = retained_bytes
+                            .saturating_add(pack_bytes)
+                            .saturating_add(summary_bytes);
+                        store.summaries.push(accepted_summary);
+                        store.packs.push(pack);
+                    } else {
+                        let path = pack.path().to_owned();
+                        drop(pack);
+                        let error = if compatible {
+                            "rule pack exceeds the configured store limit"
+                        } else {
+                            "rule pack is incompatible with this engine"
+                        };
+                        let _ = push_bounded_summary(
+                            &mut store,
+                            &mut retained_bytes,
+                            byte_limit,
+                            rejected_summary(path, error),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = push_bounded_summary(
+                        &mut store,
+                        &mut retained_bytes,
+                        byte_limit,
+                        PackSummary {
+                            path,
+                            pack_id: String::new(),
+                            pack_version: String::new(),
+                            source: SourceKind::User,
+                            source_commit: String::new(),
+                            license_expression: String::new(),
+                            trust: TrustStatus::Unsigned,
+                            format: [0, 0],
+                            command_count: 0,
+                            stale_count: 0,
+                            compatible: false,
+                            error: Some(error.to_string()),
+                        },
+                    );
+                }
             }
         }
         store.packs.sort_by(|left, right| {
@@ -141,10 +244,20 @@ impl RuleStore {
         &self.summaries
     }
 
+    pub(crate) fn approximate_bytes(&self) -> usize {
+        self.packs
+            .iter()
+            .map(PackFile::approximate_bytes)
+            .sum::<usize>()
+            .saturating_add(pack_summaries_bytes(&self.summaries))
+    }
+
     pub(crate) fn load_command_incremental(
         &self,
         command: &str,
-        mut emit: impl FnMut(Vec<LoadedProgram>, Vec<String>, bool) -> bool,
+        decoded_byte_limit: usize,
+        mut should_continue: impl FnMut() -> bool,
+        mut emit: impl FnMut(Vec<LoadedProgram>, Vec<String>, bool, bool) -> Option<usize>,
     ) {
         let mut matching = self
             .packs
@@ -161,27 +274,80 @@ impl RuleStore {
             SourceKind::Fish => 2,
             SourceKind::Bash => 3,
         });
-        if matching.is_empty() {
-            let _ = emit(Vec::new(), Vec::new(), true);
-            return;
-        }
-        let last = matching.len() - 1;
-        for (index, pack) in matching.into_iter().enumerate() {
-            let (programs, errors) = load_pack_command(pack, command);
-            if !emit(programs, errors, index == last) {
+        let mut pending = None;
+        let mut matched_blocks = 0_usize;
+        let mut remaining_bytes = decoded_byte_limit;
+        for pack in matching {
+            if !should_continue() {
                 return;
             }
+            // Retain IDs for at most one pack at a time; never materialize the
+            // cross-pack Cartesian match list.
+            let block_ids = match pack.matching_block_ids(command) {
+                Ok(block_ids) => block_ids,
+                Err(error) => {
+                    let _ = emit(
+                        Vec::new(),
+                        vec![format!("{}: {error}", pack.path().display())],
+                        true,
+                        true,
+                    );
+                    return;
+                }
+            };
+            for block_id in block_ids {
+                matched_blocks = matched_blocks.saturating_add(1);
+                if matched_blocks > MAX_MATCHING_COMMAND_BLOCKS {
+                    let _ = emit(
+                        Vec::new(),
+                        vec![format!(
+                            "{command}: matching rule blocks exceed the bounded limit"
+                        )],
+                        true,
+                        true,
+                    );
+                    return;
+                }
+                if let Some((previous_pack, previous_block)) = pending.replace((pack, block_id)) {
+                    if !should_continue() {
+                        return;
+                    }
+                    let (programs, errors, limit_exceeded) =
+                        load_pack_block(previous_pack, previous_block, command, remaining_bytes);
+                    let Some(next_limit) = emit(programs, errors, false, limit_exceeded) else {
+                        return;
+                    };
+                    remaining_bytes = next_limit;
+                }
+            }
         }
+        let Some((pack, block_id)) = pending else {
+            if should_continue() {
+                let _ = emit(Vec::new(), Vec::new(), true, false);
+            }
+            return;
+        };
+        if !should_continue() {
+            return;
+        }
+        let (programs, errors, limit_exceeded) =
+            load_pack_block(pack, block_id, command, remaining_bytes);
+        let _ = emit(programs, errors, true, limit_exceeded);
     }
 
     pub fn load_command(&self, command: &str) -> (Vec<LoadedProgram>, Vec<String>) {
         let mut programs = Vec::new();
         let mut errors = Vec::new();
-        self.load_command_incremental(command, |loaded, load_errors, _| {
-            programs.extend(loaded);
-            errors.extend(load_errors);
-            true
-        });
+        self.load_command_incremental(
+            command,
+            super::ir::MAX_COMMAND_DECODE_ALLOCATION_BYTES,
+            || true,
+            |loaded, load_errors, _, _| {
+                programs.extend(loaded);
+                errors.extend(load_errors);
+                Some(super::ir::MAX_COMMAND_DECODE_ALLOCATION_BYTES)
+            },
+        );
         sort_loaded_programs(&mut programs);
         (programs, errors)
     }
@@ -197,78 +363,199 @@ pub(crate) fn sort_loaded_programs(programs: &mut [LoadedProgram]) {
     });
 }
 
-fn load_pack_command(pack: &PackFile, command: &str) -> (Vec<LoadedProgram>, Vec<String>) {
+fn load_pack_block(
+    pack: &PackFile,
+    block_id: u32,
+    command: &str,
+    decoded_byte_limit: usize,
+) -> (Vec<LoadedProgram>, Vec<String>, bool) {
     let dialect = match pack.source_kind() {
         SourceKind::Bash => ScriptDialect::Bash,
         SourceKind::Zsh => ScriptDialect::Zsh,
         SourceKind::Fish => ScriptDialect::Fish,
         SourceKind::User => ScriptDialect::Bash,
     };
-    let mut programs = Vec::new();
-    let mut errors = Vec::new();
-    match pack.load_matching_commands(command) {
-        Ok(matches) => {
-            for program in matches {
-                if !program
-                    .registrations
-                    .iter()
-                    .any(|name| registration_matches(dialect, name, command))
-                {
-                    errors.push(format!(
-                        "{}: command block does not register {command}",
-                        pack.path().display()
-                    ));
-                    continue;
-                }
-                let required_commands = required_commands(&program);
-                programs.push(LoadedProgram {
-                    pack_id: pack.pack_id(),
-                    pack_name: pack.manifest().pack_id.clone(),
-                    pack_version: pack.manifest().pack_version.clone(),
-                    source: pack.source_kind(),
-                    trust: pack.trust(),
-                    required_commands,
-                    program: Arc::new(program),
-                });
+    let (program, decoded_allocation) =
+        match pack.load_block_bounded_accounted(block_id, decoded_byte_limit) {
+            Ok(program) => program,
+            Err(error) => {
+                let limit_exceeded = matches!(error, super::format::PackError::Limit(_));
+                return (
+                    Vec::new(),
+                    vec![format!("{}: {error}", pack.path().display())],
+                    limit_exceeded,
+                );
             }
-        }
-        Err(error) => errors.push(format!("{}: {error}", pack.path().display())),
+        };
+    if !program
+        .registrations
+        .iter()
+        .any(|name| registration_matches(dialect, name, command))
+    {
+        return (
+            Vec::new(),
+            vec![format!(
+                "{}: command block does not register {command}",
+                pack.path().display()
+            )],
+            false,
+        );
     }
-    (programs, errors)
+    let metadata_bytes = std::mem::size_of::<LoadedProgram>()
+        .saturating_add(std::mem::size_of::<Arc<CommandProgram>>())
+        .saturating_add(pack.manifest().pack_id.len())
+        .saturating_add(pack.manifest().pack_version.len());
+    let required_budget = decoded_byte_limit
+        .saturating_sub(decoded_allocation)
+        .saturating_sub(metadata_bytes);
+    let required_commands = match required_commands_bounded(&program, required_budget) {
+        Ok(commands) => commands,
+        Err(()) => {
+            return (
+                Vec::new(),
+                vec![format!(
+                    "{}: required command metadata exceeds the configured limit",
+                    pack.path().display()
+                )],
+                true,
+            );
+        }
+    };
+    let required_command_bytes = required_commands
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(
+            required_commands
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>(),
+        );
+    let retained_bytes = decoded_allocation
+        .saturating_add(metadata_bytes)
+        .saturating_add(required_command_bytes);
+    (
+        vec![LoadedProgram {
+            pack_id: pack.pack_id(),
+            pack_name: pack.manifest().pack_id.clone(),
+            pack_version: pack.manifest().pack_version.clone(),
+            source: pack.source_kind(),
+            trust: pack.trust(),
+            required_commands,
+            retained_bytes,
+            program: Arc::new(program),
+        }],
+        Vec::new(),
+        false,
+    )
 }
 
-fn required_commands(program: &CommandProgram) -> Vec<String> {
-    let mut commands = BTreeSet::new();
+const MAX_REQUIRED_COMMANDS: usize = 65_536;
+const REQUIRED_COMMAND_NODE_BYTES: usize =
+    4 * std::mem::size_of::<usize>() + std::mem::size_of::<&str>();
+
+struct RequiredCommandSet<'a> {
+    values: BTreeSet<&'a str>,
+    used: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl<'a> RequiredCommandSet<'a> {
+    fn new(limit: usize) -> Self {
+        Self {
+            values: BTreeSet::new(),
+            used: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+
+    fn insert(&mut self, value: &'a str) {
+        if self.exceeded || self.values.contains(value) {
+            return;
+        }
+        let bytes = REQUIRED_COMMAND_NODE_BYTES;
+        if self.values.len() >= MAX_REQUIRED_COMMANDS
+            || self.used.saturating_add(bytes) > self.limit
+        {
+            self.exceeded = true;
+            return;
+        }
+        self.used = self.used.saturating_add(bytes);
+        self.values.insert(value);
+    }
+}
+
+fn required_commands_bounded(
+    program: &CommandProgram,
+    byte_limit: usize,
+) -> Result<Vec<String>, ()> {
+    let mut commands = RequiredCommandSet::new(byte_limit);
     for module in &program.scripts {
-        let mut module_commands = BTreeSet::new();
+        let remaining = byte_limit.saturating_sub(commands.used);
+        let mut module_commands = RequiredCommandSet::new(remaining);
         if module.dialect == ScriptDialect::Fish {
-            module_commands.extend(
-                module
-                    .registrations
-                    .iter()
-                    .filter_map(|registration| registration.service.clone()),
-            );
+            for service in module
+                .registrations
+                .iter()
+                .filter_map(|registration| registration.service.as_deref())
+            {
+                module_commands.insert(service);
+            }
         }
         collect_required_commands(module, &mut module_commands);
         for function in &module.functions {
-            module_commands.remove(&function.name);
+            module_commands.values.remove(function.name.as_str());
         }
         if module.dialect == ScriptDialect::Fish {
-            module_commands.retain(|name| !super::script_vm::fish_builtin_available(name));
+            module_commands
+                .values
+                .retain(|name| !super::script_vm::fish_builtin_available(name));
         }
-        commands.extend(module_commands);
+        if module_commands.exceeded
+            || commands.used.saturating_add(module_commands.used) > byte_limit
+        {
+            return Err(());
+        }
+        // Both trees coexist during this merge. Reserve the transient module
+        // nodes while deciding whether another global node may be allocated.
+        commands.limit = byte_limit.saturating_sub(module_commands.used);
+        for command in module_commands.values {
+            commands.insert(command);
+        }
+        commands.limit = byte_limit;
+        if commands.exceeded {
+            return Err(());
+        }
     }
-    commands.into_iter().collect()
+    let output_bytes = commands
+        .values
+        .len()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(
+            commands
+                .values
+                .iter()
+                .map(|value| value.len())
+                .sum::<usize>(),
+        );
+    if commands.used.saturating_add(output_bytes) > byte_limit {
+        return Err(());
+    }
+    Ok(commands.values.into_iter().map(str::to_owned).collect())
 }
 
-fn collect_required_commands(module: &ScriptModule, commands: &mut BTreeSet<String>) {
+fn collect_required_commands<'a>(module: &'a ScriptModule, commands: &mut RequiredCommandSet<'a>) {
     collect_statement_requirements(&module.statements, commands);
     for function in &module.functions {
         collect_statement_requirements(&function.body, commands);
     }
 }
 
-fn collect_statement_requirements(statements: &[ScriptStatement], commands: &mut BTreeSet<String>) {
+fn collect_statement_requirements<'a>(
+    statements: &'a [ScriptStatement],
+    commands: &mut RequiredCommandSet<'a>,
+) {
     for statement in statements {
         match statement {
             ScriptStatement::Command { command } => {
@@ -279,7 +566,7 @@ fn collect_statement_requirements(statements: &[ScriptStatement], commands: &mut
                 if let Some(name) =
                     name.filter(|name| super::script_vm::emulated_external_command(name))
                 {
-                    commands.insert(name.to_owned());
+                    commands.insert(name);
                 }
                 if matches!(name, Some("command" | "type" | "whence" | "which")) {
                     for target in command
@@ -289,7 +576,7 @@ fn collect_statement_requirements(statements: &[ScriptStatement], commands: &mut
                         .filter_map(ScriptWord::as_unquoted_plain_literal)
                         .filter(|argument| !argument.starts_with('-'))
                     {
-                        commands.insert(target.to_owned());
+                        commands.insert(target);
                     }
                 }
                 for word in &command.words {
@@ -357,7 +644,7 @@ fn collect_statement_requirements(statements: &[ScriptStatement], commands: &mut
     }
 }
 
-fn collect_word_requirements(word: &ScriptWord, commands: &mut BTreeSet<String>) {
+fn collect_word_requirements<'a>(word: &'a ScriptWord, commands: &mut RequiredCommandSet<'a>) {
     for part in &word.parts {
         match part {
             ScriptWordPart::CommandSubstitution { statements, .. } => {
@@ -383,6 +670,33 @@ fn collect_word_requirements(word: &ScriptWord, commands: &mut BTreeSet<String>)
             }
             _ => {}
         }
+    }
+}
+
+fn summary_bytes(pack: &PackFile, error_bytes: usize) -> usize {
+    std::mem::size_of::<PackSummary>()
+        .saturating_add(pack.path().as_os_str().as_bytes().len())
+        .saturating_add(pack.manifest().pack_id.len())
+        .saturating_add(pack.manifest().pack_version.len())
+        .saturating_add(pack.manifest().source_commit.len())
+        .saturating_add(pack.manifest().license_expression.len())
+        .saturating_add(error_bytes)
+}
+
+fn rejected_summary(path: PathBuf, error: &str) -> PackSummary {
+    PackSummary {
+        path,
+        pack_id: String::new(),
+        pack_version: String::new(),
+        source: SourceKind::User,
+        source_commit: String::new(),
+        license_expression: String::new(),
+        trust: TrustStatus::Unsigned,
+        format: [0, 0],
+        command_count: 0,
+        stale_count: 0,
+        compatible: false,
+        error: Some(error.to_owned()),
     }
 }
 
@@ -559,6 +873,7 @@ mod tests {
                 source,
                 trust: TrustStatus::Unsigned,
                 required_commands: Vec::new(),
+                retained_bytes: 0,
                 program: Arc::new(CommandProgram {
                     canonical_name: "demo".into(),
                     registrations: vec!["demo".into()],

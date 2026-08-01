@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -12,7 +12,9 @@ use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::ir::{CommandProgram, IrError, MAX_COMMAND_BLOCK_BYTES};
+use super::ir::{
+    CommandProgram, IrError, MAX_COMMAND_BLOCK_BYTES, MAX_COMMAND_DECODE_ALLOCATION_BYTES,
+};
 use super::script::{ScriptDialect, registration_matches};
 
 pub const PACK_MAGIC: &[u8; 4] = b"BLPK";
@@ -29,6 +31,7 @@ pub const MAX_COMMAND_NAMES: usize = 262_144;
 pub const MAX_BLOCKS: usize = 65_536;
 pub const MAX_COMMAND_NAME_BYTES: usize = 4096;
 pub const MAX_COMPRESSED_BLOCK_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_MATCHING_COMMAND_BLOCKS: usize = 4096;
 
 const FLAG_SIGNED: u8 = 0x01;
 const ROOT_HASH_RANGE: std::ops::Range<usize> = 128..160;
@@ -144,10 +147,40 @@ struct BlockEntry {
     hash: [u8; 32],
 }
 
-fn immutable_pack_mapping(path: &Path) -> Result<Mmap, PackError> {
+fn json_string_allocation_upper_bound(bytes: &[u8]) -> usize {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_bytes = 0_usize;
+    let mut strings = 0_usize;
+    for &byte in bytes {
+        if !in_string {
+            if byte == b'"' {
+                in_string = true;
+                strings = strings.saturating_add(1);
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            string_bytes = string_bytes.saturating_add(1);
+        } else if byte == b'\\' {
+            escaped = true;
+            string_bytes = string_bytes.saturating_add(1);
+        } else if byte == b'"' {
+            in_string = false;
+        } else {
+            string_bytes = string_bytes.saturating_add(1);
+        }
+    }
+    string_bytes.saturating_add(strings.saturating_mul(2 * std::mem::size_of::<String>()))
+}
+
+fn immutable_pack_mapping(path: &Path, byte_limit: u64) -> Result<Mmap, PackError> {
     let source = File::open(path)?;
     let metadata = source.metadata()?;
-    if !metadata.is_file() || metadata.len() < HEADER_SIZE as u64 || metadata.len() > MAX_PACK_BYTES
+    if !metadata.is_file()
+        || metadata.len() < HEADER_SIZE as u64
+        || metadata.len() > MAX_PACK_BYTES.min(byte_limit)
     {
         return Err(PackError::Limit("pack file size"));
     }
@@ -162,7 +195,7 @@ fn immutable_pack_mapping(path: &Path) -> Result<Mmap, PackError> {
     }
     let mut immutable = unsafe { File::from_raw_fd(descriptor) };
     let copied = std::io::copy(
-        &mut source.take(MAX_PACK_BYTES.saturating_add(1)),
+        &mut source.take(MAX_PACK_BYTES.min(byte_limit).saturating_add(1)),
         &mut immutable,
     )?;
     if copied != metadata.len() {
@@ -194,11 +227,19 @@ pub struct PackFile {
 
 impl PackFile {
     pub fn open(path: impl AsRef<Path>, trusted_keys: &TrustedKeys) -> Result<Self, PackError> {
+        Self::open_bounded(path, trusted_keys, MAX_PACK_BYTES)
+    }
+
+    pub(crate) fn open_bounded(
+        path: impl AsRef<Path>,
+        trusted_keys: &TrustedKeys,
+        byte_limit: u64,
+    ) -> Result<Self, PackError> {
         let path = path.as_ref().to_owned();
         // Copy into a sealed anonymous file before mapping. This keeps lazy,
         // file-backed block access while making concurrent replacement or
         // truncation of a mutable installation path unable to SIGBUS Bash.
-        let mapping = immutable_pack_mapping(&path)?;
+        let mapping = immutable_pack_mapping(&path, byte_limit)?;
         let header = mapping.get(..HEADER_SIZE).ok_or(PackError::Truncated)?;
         if header.get(..4) != Some(PACK_MAGIC.as_slice()) {
             return Err(PackError::Invalid("invalid pack magic"));
@@ -264,6 +305,21 @@ impl PackFile {
         if index.len() > MAX_INDEX_BYTES || manifest_bytes.len() > MAX_MANIFEST_BYTES {
             return Err(PackError::Limit("pack metadata section"));
         }
+        // Bound the sealed mapping and every metadata allocation before serde
+        // or index parsing allocates retained objects. Index bytes cover all
+        // copied command names; two manifest copies conservatively cover JSON
+        // strings plus vector/string headers.
+        let retained_preflight = mapping
+            .len()
+            .saturating_add(command_count.saturating_mul(std::mem::size_of::<NameEntry>()))
+            .saturating_add(block_count.saturating_mul(std::mem::size_of::<BlockEntry>()))
+            .saturating_add(index.len())
+            .saturating_add(json_string_allocation_upper_bound(manifest_bytes))
+            .saturating_add(path.as_os_str().as_encoded_bytes().len())
+            .saturating_add(std::mem::size_of::<Self>());
+        if retained_preflight > usize::try_from(byte_limit).unwrap_or(usize::MAX) {
+            return Err(PackError::Limit("pack retained allocation"));
+        }
         let expected_root: [u8; 32] = header[ROOT_HASH_RANGE]
             .try_into()
             .map_err(|_| PackError::Truncated)?;
@@ -320,6 +376,58 @@ impl PackFile {
         &self.path
     }
 
+    pub(crate) fn approximate_bytes(&self) -> usize {
+        self.mapping
+            .len()
+            .saturating_add(self.path.as_os_str().as_encoded_bytes().len())
+            .saturating_add(
+                [
+                    &self.manifest.pack_id,
+                    &self.manifest.pack_version,
+                    &self.manifest.source_repository,
+                    &self.manifest.source_commit,
+                    &self.manifest.license_expression,
+                    &self.manifest.channel,
+                    &self.manifest.compiler_version,
+                    &self.manifest.generated_at,
+                ]
+                .into_iter()
+                .map(|value| value.capacity())
+                .sum::<usize>(),
+            )
+            .saturating_add(
+                [
+                    &self.manifest.stale_commands,
+                    &self.manifest.probe_capabilities,
+                ]
+                .into_iter()
+                .map(|values| {
+                    values
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>())
+                        .saturating_add(values.iter().map(String::capacity).sum::<usize>())
+                })
+                .sum::<usize>(),
+            )
+            .saturating_add(
+                self.names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NameEntry>()),
+            )
+            .saturating_add(
+                self.names
+                    .iter()
+                    .map(|entry| entry.name.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.blocks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BlockEntry>()),
+            )
+            .saturating_add(std::mem::size_of::<Self>())
+    }
+
     pub fn manifest(&self) -> &PackManifest {
         &self.manifest
     }
@@ -369,7 +477,15 @@ impl PackFile {
     }
 
     pub fn contains_command(&self, command: &str) -> bool {
-        !self.matching_block_ids(command).is_empty()
+        let dialect = match self.source_kind() {
+            SourceKind::Bash => ScriptDialect::Bash,
+            SourceKind::Zsh => ScriptDialect::Zsh,
+            SourceKind::Fish => ScriptDialect::Fish,
+            SourceKind::User => ScriptDialect::Bash,
+        };
+        self.names
+            .iter()
+            .any(|entry| registration_matches(dialect, &entry.name, command))
     }
 
     pub fn command_names(&self) -> impl Iterator<Item = &str> {
@@ -384,13 +500,30 @@ impl PackFile {
     }
 
     pub fn load_matching_commands(&self, command: &str) -> Result<Vec<CommandProgram>, PackError> {
-        self.matching_block_ids(command)
+        self.matching_block_ids(command)?
             .into_iter()
             .map(|block_id| self.load_block(block_id))
             .collect()
     }
 
     fn load_block(&self, block_id: u32) -> Result<CommandProgram, PackError> {
+        self.load_block_bounded(block_id, MAX_COMMAND_DECODE_ALLOCATION_BYTES)
+    }
+
+    pub(crate) fn load_block_bounded(
+        &self,
+        block_id: u32,
+        decoded_byte_limit: usize,
+    ) -> Result<CommandProgram, PackError> {
+        self.load_block_bounded_accounted(block_id, decoded_byte_limit)
+            .map(|(program, _)| program)
+    }
+
+    pub(crate) fn load_block_bounded_accounted(
+        &self,
+        block_id: u32,
+        decoded_byte_limit: usize,
+    ) -> Result<(CommandProgram, usize), PackError> {
         let block = self
             .blocks
             .get(block_id as usize)
@@ -404,14 +537,19 @@ impl PackFile {
         if hash != block.hash {
             return Err(PackError::Integrity("command block hash"));
         }
+        if block.uncompressed_length as usize > decoded_byte_limit.min(MAX_COMMAND_BLOCK_BYTES) {
+            return Err(PackError::Limit("decompressed command block"));
+        }
         let decoded = zstd::bulk::decompress(compressed, block.uncompressed_length as usize)
             .map_err(PackError::Decompression)?;
         if decoded.len() != block.uncompressed_length as usize
-            || decoded.len() > MAX_COMMAND_BLOCK_BYTES
+            || decoded.len() > decoded_byte_limit.min(MAX_COMMAND_BLOCK_BYTES)
         {
             return Err(PackError::Limit("decompressed command block"));
         }
-        let program = CommandProgram::decode(&decoded).map_err(PackError::Ir)?;
+        let (program, allocation_bytes) =
+            CommandProgram::decode_with_allocation_limit_and_size(&decoded, decoded_byte_limit)
+                .map_err(PackError::Ir)?;
         if program.probes.iter().any(|probe| {
             !self
                 .manifest
@@ -431,25 +569,29 @@ impl PackFile {
                 "command block requests an undeclared probe capability",
             ));
         }
-        Ok(program)
+        Ok((program, allocation_bytes))
     }
 
-    fn matching_block_ids(&self, command: &str) -> Vec<u32> {
+    pub(crate) fn matching_block_ids(&self, command: &str) -> Result<Vec<u32>, PackError> {
         let dialect = match self.source_kind() {
             SourceKind::Bash => ScriptDialect::Bash,
             SourceKind::Zsh => ScriptDialect::Zsh,
             SourceKind::Fish => ScriptDialect::Fish,
             SourceKind::User => ScriptDialect::Bash,
         };
-        let mut blocks = self
+        let mut blocks = BTreeSet::new();
+        for block_id in self
             .names
             .iter()
             .filter(|entry| registration_matches(dialect, &entry.name, command))
             .map(|entry| entry.block_id)
-            .collect::<Vec<_>>();
-        blocks.sort_unstable();
-        blocks.dedup();
-        blocks
+        {
+            if !blocks.contains(&block_id) && blocks.len() >= MAX_MATCHING_COMMAND_BLOCKS {
+                return Err(PackError::Limit("matching command blocks"));
+            }
+            blocks.insert(block_id);
+        }
+        Ok(blocks.into_iter().collect())
     }
 
     fn find_block(&self, command: &str) -> Option<u32> {
@@ -1024,6 +1166,20 @@ mod tests {
             pack.load_command("git").unwrap().unwrap().canonical_name,
             "git"
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manifest_string_slots_are_preflighted_before_typed_deserialization() {
+        let mut hostile = spec();
+        hostile.manifest.stale_commands = vec![String::new(); 100_000];
+        let bytes = PackBuilder::new(hostile).build(None).unwrap();
+        assert!(bytes.len() < 1024 * 1024);
+        let path = temporary_pack(&bytes);
+        assert!(matches!(
+            PackFile::open_bounded(&path, &TrustedKeys::default(), 1024 * 1024),
+            Err(PackError::Limit("pack retained allocation"))
+        ));
         fs::remove_file(path).unwrap();
     }
 

@@ -72,7 +72,6 @@ unsafe extern "C" {
     pub static mut rl_executing_keyseq: *mut c_char;
 
     pub fn rl_redisplay();
-    pub fn rl_forced_update_display() -> c_int;
     pub fn rl_insert_text(text: *const c_char) -> c_int;
     pub fn rl_delete_text(start: c_int, end: c_int) -> c_int;
     pub fn rl_begin_undo_group() -> c_int;

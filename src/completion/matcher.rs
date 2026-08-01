@@ -250,6 +250,7 @@ impl Candidate {
     }
 }
 
+#[derive(Clone)]
 struct CandidateEntry(Candidate);
 
 impl Borrow<str> for CandidateEntry {
@@ -272,6 +273,7 @@ impl Hash for CandidateEntry {
     }
 }
 
+#[derive(Clone)]
 pub struct CandidateSink {
     limit: usize,
     best_tier: u8,
@@ -289,8 +291,12 @@ impl CandidateSink {
         }
     }
 
-    pub fn remaining_capacity_hint(&self) -> usize {
-        self.limit.saturating_sub(self.candidates.len()).max(1)
+    pub fn candidate_limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn has_strong_matches(&self) -> bool {
+        !self.candidates.is_empty() && self.best_tier == MatchClass::Prefix.candidate_set_tier()
     }
 
     pub fn push(&mut self, mut candidate: Candidate) {

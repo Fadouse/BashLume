@@ -9,12 +9,17 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use crate::completion::matcher::match_score;
 
 use super::format::{SourceKind, TrustStatus};
 use super::ir::{AppendPolicy, CandidateTemplate, PathCompletion, ProbeParser, RuleCandidateKind};
+use super::probe::{
+    MAX_PROBE_ARGUMENT_BYTES, MAX_PROBE_ARGUMENTS, MAX_PROBE_ENVIRONMENT,
+    MAX_PROBE_ENVIRONMENT_BYTES,
+};
 use super::script::{
     ScriptAssignment, ScriptBooleanOperator, ScriptCommand, ScriptDialect, ScriptEntry,
     ScriptFunction, ScriptModule, ScriptRedirection, ScriptStatement, ScriptWord, ScriptWordPart,
@@ -30,21 +35,49 @@ use super::vm::{
 const MAX_STEPS: usize = 250_000;
 const MAX_CALL_DEPTH: usize = 256;
 const MAX_LOOP_ITERATIONS: usize = 32_768;
-const MAX_VALUES: usize = 65_536;
-const MAX_VALUE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_VALUES: usize = 65_536;
+pub(crate) const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_CONTEXT_ENVIRONMENT: usize = 4096;
+const MAX_CONTEXT_WORKING_DIRECTORY_BYTES: usize = 64 * 1024;
 const MAX_ARITHMETIC_DEPTH: usize = 256;
 const MAX_ARITHMETIC_TOKENS: usize = 65_536;
 const MAX_PATTERN_RECURSION: usize = 128;
 const MAX_MACHINE_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MACHINE_VARIABLES: usize = 4096;
 const MAX_EMITTED_CANDIDATE_BYTES: usize = 64 * 1024;
-const MAX_TOTAL_CANDIDATE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_CANDIDATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_WORK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ZSH_TAG_STATE_ITEMS: usize = 256;
 const MAX_ZSH_TAG_STATE_BYTES: usize = 16 * 1024;
 const MAX_FISH_MEMOIZED_CONDITIONS: usize = 1024;
 const MAX_FISH_MEMOIZED_CONDITION_BYTES: usize = 64 * 1024;
+const MAX_FISH_CONDITION_ALIASES: usize = 8192;
+const MAX_FISH_CONDITION_ALIAS_COMPARISONS: usize = 65_536;
+const MAX_FISH_EFFECTIVE_COMMANDS: usize = 4096;
+const MAX_FISH_WRAPPER_EDGES: usize = 8192;
+const MAX_FISH_WRAPPER_PATTERN_COMPARISONS: usize = 65_536;
+const MAX_FISH_ERASE_WORK: usize = 262_144;
+const MAX_FISH_ERASE_SELECTOR_RECORDS: usize = 8192;
+const MAX_FISH_REGISTRATION_EFFECTS: usize = 8192;
+
+fn lossy_utf8_len(mut bytes: &[u8]) -> usize {
+    let mut length = 0_usize;
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(value) => return length.saturating_add(value.len()),
+            Err(error) => {
+                length = length
+                    .saturating_add(error.valid_up_to())
+                    .saturating_add(char::REPLACEMENT_CHARACTER.len_utf8());
+                let consumed = error
+                    .valid_up_to()
+                    .saturating_add(error.error_len().unwrap_or(bytes.len()));
+                bytes = bytes.get(consumed..).unwrap_or_default();
+            }
+        }
+    }
+    length
+}
 
 fn bounded_string_snapshot<'a>(values: impl IntoIterator<Item = &'a String>) -> bool {
     let mut count = 0_usize;
@@ -59,10 +92,13 @@ fn bounded_string_snapshot<'a>(values: impl IntoIterator<Item = &'a String>) -> 
     true
 }
 
-fn validate_evaluation_context(context: &EvaluationContext<'_>) -> Result<(), VmError> {
+pub(crate) fn validate_evaluation_context(context: &EvaluationContext<'_>) -> Result<(), VmError> {
+    let working_directory = context.working_directory.as_os_str().as_bytes();
     let strings_are_bounded = context.current_word.len() <= MAX_VALUE_BYTES
         && bounded_string_snapshot(context.words)
         && bounded_string_snapshot(context.command_path)
+        && working_directory.len() <= MAX_CONTEXT_WORKING_DIRECTORY_BYTES
+        && lossy_utf8_len(working_directory) <= MAX_CONTEXT_WORKING_DIRECTORY_BYTES
         && context.environment.len() <= MAX_CONTEXT_ENVIRONMENT
         && bounded_string_snapshot(
             context
@@ -75,7 +111,9 @@ fn validate_evaluation_context(context: &EvaluationContext<'_>) -> Result<(), Vm
             .is_none_or(bounded_string_snapshot)
         && context.shell_commands.is_none_or(bounded_string_snapshot)
         && context.shell_functions.is_none_or(bounded_string_snapshot)
-        && context.shell_variables.is_none_or(bounded_string_snapshot)
+        && context.shell_variables.is_none_or(|variables| {
+            variables.len() <= MAX_MACHINE_VARIABLES && bounded_string_snapshot(variables)
+        })
         && context.users.is_none_or(bounded_string_snapshot)
         && context.groups.is_none_or(bounded_string_snapshot)
         && context.hosts.is_none_or(bounded_string_snapshot)
@@ -88,20 +126,286 @@ fn validate_evaluation_context(context: &EvaluationContext<'_>) -> Result<(), Vm
         && context.passwd_records.is_none_or(bounded_string_snapshot)
         && context.group_records.is_none_or(bounded_string_snapshot);
     let variable_values_are_bounded = context.shell_variable_values.is_none_or(|variables| {
-        variables.len() <= MAX_VALUES
+        variables.len() <= MAX_MACHINE_VARIABLES
             && bounded_string_snapshot(variables.keys())
-            && variables.values().all(bounded_string_snapshot)
-            && variables
-                .values()
-                .flatten()
-                .map(String::len)
-                .fold(0_usize, usize::saturating_add)
-                <= MAX_VALUE_BYTES
+            // Bound flattened cardinality as well as payload. Empty array
+            // elements still consume a `String` slot when Machine state is
+            // cloned, so per-variable payload checks are not sufficient.
+            && bounded_string_snapshot(variables.values().flatten())
     });
     if !strings_are_bounded || !variable_values_are_bounded {
         return Err(VmError::Limit("evaluation context"));
     }
     Ok(())
+}
+
+fn set_preflight_variable(
+    variables: &mut HashMap<String, (usize, usize)>,
+    total_bytes: &mut usize,
+    total_values: &mut usize,
+    name: &str,
+    value_bytes: usize,
+    value_count: usize,
+) -> bool {
+    if let Some((previous_bytes, previous_count)) = variables.get_mut(name) {
+        *total_bytes = total_bytes
+            .saturating_sub(*previous_bytes)
+            .saturating_add(value_bytes);
+        *total_values = total_values
+            .saturating_sub(*previous_count)
+            .saturating_add(value_count);
+        *previous_bytes = value_bytes;
+        *previous_count = value_count;
+    } else {
+        *total_bytes = total_bytes
+            .saturating_add(name.len())
+            .saturating_add(value_bytes);
+        *total_values = total_values.saturating_add(value_count);
+        variables.insert(name.to_owned(), (value_bytes, value_count));
+    }
+    variables.len() <= MAX_MACHINE_VARIABLES
+        && *total_bytes <= MAX_MACHINE_VALUE_BYTES
+        && *total_values <= MAX_VALUES
+}
+
+fn validate_machine_evaluation_context(
+    context: &EvaluationContext<'_>,
+    dialect: ScriptDialect,
+) -> Result<(), VmError> {
+    // Mirror Machine::new and initialize_context_variables without cloning any
+    // values. This closes the pre-construction bound over generated numbered
+    // positional variables and dialect-specific arrays as well as external
+    // maps. The map stops growing as soon as the absolute machine limit is hit.
+    let mut variables = HashMap::<String, (usize, usize)>::with_capacity(
+        context.environment.len().min(MAX_MACHINE_VARIABLES + 1),
+    );
+    let mut total_bytes = 0_usize;
+    let mut total_values = 0_usize;
+    let mut set = |name: &str, value_bytes: usize, value_count: usize| {
+        set_preflight_variable(
+            &mut variables,
+            &mut total_bytes,
+            &mut total_values,
+            name,
+            value_bytes,
+            value_count,
+        )
+    };
+
+    // Insert name-only variables first; environment and captured values then
+    // overwrite them exactly as Machine::new's later `entry().or_default()`
+    // would leave existing values intact.
+    if let Some(shell_variables) = context.shell_variables {
+        for name in shell_variables {
+            if !set(name, 0, 0) {
+                return Err(VmError::Limit("evaluation context"));
+            }
+        }
+    }
+    for (name, value) in context.environment {
+        if !set(name, value.len(), 1) {
+            return Err(VmError::Limit("evaluation context"));
+        }
+    }
+    if let Some(shell_variable_values) = context.shell_variable_values {
+        for (name, values) in shell_variable_values {
+            let value_bytes = values
+                .iter()
+                .map(String::len)
+                .fold(0_usize, usize::saturating_add);
+            if !set(name, value_bytes, values.len()) {
+                return Err(VmError::Limit("evaluation context"));
+            }
+        }
+    }
+    let user_id_bytes = context.effective_user_id.to_string().len();
+    if !set("EUID", user_id_bytes, 1) || !set("UID", user_id_bytes, 1) {
+        return Err(VmError::Limit("evaluation context"));
+    }
+
+    let word_bytes = context
+        .words
+        .iter()
+        .map(String::len)
+        .fold(0_usize, usize::saturating_add);
+    let first_word_bytes = context.words.first().map_or(0, String::len);
+    let argument_bytes = word_bytes.saturating_sub(first_word_bytes);
+    if !set("0", first_word_bytes, 1)
+        || !set("@", word_bytes, context.words.len())
+        || !set("*", word_bytes, context.words.len())
+        || !set(
+            "argv",
+            argument_bytes,
+            context.words.len().saturating_sub(1),
+        )
+    {
+        return Err(VmError::Limit("evaluation context"));
+    }
+    for (index, value) in context.words.iter().enumerate().skip(1) {
+        if !set(&index.to_string(), value.len(), 1) {
+            return Err(VmError::Limit("evaluation context"));
+        }
+    }
+
+    let valid = match dialect {
+        ScriptDialect::Bash => {
+            let line_bytes = word_bytes.saturating_add(context.words.len().saturating_sub(1));
+            set("COMP_WORDS", word_bytes, context.words.len())
+                && set("COMP_CWORD", context.word_index.to_string().len(), 1)
+                && set("COMP_POINT", line_bytes.to_string().len(), 1)
+                && set("COMP_LINE", line_bytes, 1)
+                && set("COMPREPLY", 0, 0)
+                && set("BASH_VERSINFO", 2, 2)
+                && set("COMP_WORDBREAKS", " \\t\\n\"'><=;|&(:".len(), 1)
+                && set("__bashlume_shopt", 7, 1)
+        }
+        ScriptDialect::Zsh => {
+            set("@", 0, 0)
+                && set("*", 0, 0)
+                && set("argv", 0, 0)
+                && set("OSTYPE", 9, 1)
+                && set("HOSTTYPE", 0, 1)
+                && set("MACHTYPE", std::env::consts::ARCH.len(), 1)
+                && set("VENDOR", 2, 1)
+                && set("ZSH_VERSION", 5, 1)
+                && set("words", word_bytes, context.words.len())
+                && set(
+                    "CURRENT",
+                    context.word_index.saturating_add(1).to_string().len(),
+                    1,
+                )
+                && set("PREFIX", context.current_word.len(), 1)
+                && set("IPREFIX", 0, 1)
+                && set("SUFFIX", 0, 1)
+                && set("service", first_word_bytes, 1)
+                && set("state", 0, 0)
+                && set("ret", 1, 1)
+                && set("line", word_bytes, context.words.len())
+                && set("opt_args", 0, 0)
+        }
+        ScriptDialect::Fish => true,
+    };
+    if !valid {
+        return Err(VmError::Limit("evaluation context"));
+    }
+    Ok(())
+}
+
+fn registration_command_is_literal(dialect: ScriptDialect, command: &str) -> bool {
+    dialect == ScriptDialect::Bash
+        || !command.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'*' | b'?' | b'[' | b']' | b'(' | b')' | b'|' | b'+' | b'@' | b'!' | b'#' | b'\\'
+            )
+        })
+}
+
+fn collect_effective_commands(
+    modules: &[(&ScriptModule, TrustStatus)],
+    command: &str,
+) -> Result<Vec<String>, VmError> {
+    let mut exact = HashMap::<(ScriptDialect, &str), Vec<&str>>::new();
+    let mut patterns = Vec::<(ScriptDialect, &str, &str)>::new();
+    let mut edge_count = 0_usize;
+    for (module, _) in modules {
+        for registration in &module.registrations {
+            let Some(service) = registration.service.as_deref() else {
+                continue;
+            };
+            // Fish wraps completion service names, not executable commands;
+            // a virtual or currently unavailable target still contributes its
+            // registered completions to the wrapper closure.
+            edge_count = edge_count.saturating_add(1);
+            if edge_count > MAX_FISH_WRAPPER_EDGES {
+                return Err(VmError::Limit("Fish wrapper closure"));
+            }
+            if registration_command_is_literal(module.dialect, &registration.command) {
+                exact
+                    .entry((module.dialect, registration.command.as_str()))
+                    .or_default()
+                    .push(service);
+            } else {
+                patterns.push((module.dialect, registration.command.as_str(), service));
+            }
+        }
+    }
+
+    let mut effective = Vec::with_capacity(edge_count.min(MAX_FISH_EFFECTIVE_COMMANDS));
+    let mut indices = HashMap::<String, usize>::with_capacity(effective.capacity());
+    effective.push(command.to_owned());
+    indices.insert(command.to_owned(), 0);
+    let mut cursor = 0_usize;
+    let mut pattern_comparisons = 0_usize;
+    while cursor < effective.len() {
+        let current = effective[cursor].clone();
+        for dialect in [ScriptDialect::Bash, ScriptDialect::Fish, ScriptDialect::Zsh] {
+            if let Some(services) = exact.get(&(dialect, current.as_str())) {
+                for service in services {
+                    if indices.contains_key(*service) {
+                        continue;
+                    }
+                    if effective.len() >= MAX_FISH_EFFECTIVE_COMMANDS {
+                        return Err(VmError::Limit("Fish wrapper closure"));
+                    }
+                    let index = effective.len();
+                    effective.push((*service).to_owned());
+                    indices.insert((*service).to_owned(), index);
+                }
+            }
+        }
+        for &(dialect, pattern, service) in &patterns {
+            pattern_comparisons = pattern_comparisons.saturating_add(1);
+            if pattern_comparisons > MAX_FISH_WRAPPER_PATTERN_COMPARISONS {
+                return Err(VmError::Limit("Fish wrapper closure"));
+            }
+            if !registration_matches(dialect, pattern, &current) || indices.contains_key(service) {
+                continue;
+            }
+            if effective.len() >= MAX_FISH_EFFECTIVE_COMMANDS {
+                return Err(VmError::Limit("Fish wrapper closure"));
+            }
+            let index = effective.len();
+            effective.push(service.to_owned());
+            indices.insert(service.to_owned(), index);
+        }
+        cursor += 1;
+    }
+    Ok(effective)
+}
+
+fn fish_reachable_commands(
+    command_count: usize,
+    wrapper_edges: &HashSet<(usize, usize)>,
+) -> Result<Vec<bool>, VmError> {
+    if command_count == 0
+        || command_count > MAX_FISH_EFFECTIVE_COMMANDS
+        || wrapper_edges.len() > MAX_FISH_WRAPPER_EDGES
+    {
+        return Err(VmError::Limit("Fish wrapper closure"));
+    }
+    let mut adjacency = vec![Vec::<usize>::new(); command_count];
+    for &(source, target) in wrapper_edges {
+        if source >= command_count || target >= command_count {
+            return Err(VmError::Limit("Fish wrapper closure"));
+        }
+        adjacency[source].push(target);
+    }
+    let mut reachable = vec![false; command_count];
+    let mut queue = Vec::with_capacity(command_count);
+    reachable[0] = true;
+    queue.push(0);
+    let mut cursor = 0_usize;
+    while let Some(&source) = queue.get(cursor) {
+        cursor += 1;
+        for &target in &adjacency[source] {
+            if !reachable[target] {
+                reachable[target] = true;
+                queue.push(target);
+            }
+        }
+    }
+    Ok(reachable)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -117,12 +421,19 @@ pub(crate) fn evaluate_module_groups(
     result: &mut EvaluationResult,
     allow_provisional_yield: bool,
     runtime_optimizations: bool,
+    stop_after_dependency: bool,
+    skip_nonmatching_candidate_work: bool,
 ) -> Result<(), VmError> {
-    validate_evaluation_context(context)?;
     let modules = module_groups
         .iter()
         .flat_map(|(modules, trust)| modules.iter().map(move |module| (module, *trust)))
         .collect::<Vec<_>>();
+    let mut validated_dialects = HashSet::with_capacity(3);
+    for (module, _) in &modules {
+        if validated_dialects.insert(module.dialect) {
+            validate_machine_evaluation_context(context, module.dialect)?;
+        }
+    }
     let candidate_limit = candidate_limit.clamp(1, MAX_EMITTED_CANDIDATES);
     let mut candidate_bytes = result.candidates.iter().fold(0_usize, |total, emitted| {
         total
@@ -150,7 +461,6 @@ pub(crate) fn evaluate_module_groups(
     } else {
         Vec::new()
     };
-    let fish_has_static_candidates = !fish_static_candidates.is_empty();
     let mut output_work_bytes = 0_usize;
     let mut candidate_indices = result
         .candidates
@@ -158,92 +468,154 @@ pub(crate) fn evaluate_module_groups(
         .enumerate()
         .map(|(index, candidate)| (candidate.candidate.value.clone(), index))
         .collect::<HashMap<_, _>>();
-    let fish_module_functions = modules
-        .iter()
-        .filter(|(module, _)| module.dialect == ScriptDialect::Fish)
-        .flat_map(|(module, _)| {
-            module
-                .functions
-                .iter()
-                .map(|function| function.name.as_str())
-        })
-        .collect::<HashSet<_>>();
-    let mut effective_commands = vec![command.to_owned()];
-    loop {
-        let mut changed = false;
-        for (module, _) in &modules {
-            for registration in &module.registrations {
-                if effective_commands.iter().any(|effective| {
-                    registration_matches(module.dialect, &registration.command, effective)
-                }) {
-                    if let Some(service) = &registration.service {
-                        let available = module.dialect != ScriptDialect::Fish
-                            || fish_builtin_available(service)
-                            || fish_module_functions.contains(service.as_str())
-                            || context.command_available(service).unwrap_or(true);
-                        if available && !effective_commands.contains(service) {
-                            effective_commands.push(service.clone());
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let mut effective_commands = collect_effective_commands(&modules, command)?;
     let fish_initial_candidate_bytes = if declarative_fish { 0 } else { candidate_bytes };
-    let mut fish_candidates = fish_static_candidates
-        .into_iter()
-        .enumerate()
-        .map(|(index, emitted)| CandidateRecord {
+    // Presentation order and erase provenance are distinct. Static candidates
+    // share presentation group zero, but each selector gets its own effect so
+    // erasing one option cannot erase unrelated arguments or static path policy.
+    const STATIC_FISH_EFFECT_BASE: u64 = 1_u64 << 63;
+    let static_path_effect = fish_static_path.is_some_and(|path| path != PathCompletion::Inherit);
+    let static_effect_count = fish_static_candidates
+        .len()
+        .saturating_add(usize::from(static_path_effect));
+    let static_selector_bytes = fish_static_candidates
+        .iter()
+        .fold(0_usize, |total, emitted| {
+            if emitted.candidate.kind == RuleCandidateKind::Option
+                && emitted.candidate.value.starts_with('-')
+            {
+                total
+                    .saturating_add(4 * std::mem::size_of::<Arc<str>>())
+                    .saturating_add(emitted.candidate.value.len())
+            } else {
+                total
+            }
+        });
+    // Include both Vec backing stores and conservative hash-table buckets,
+    // and reject before allocating either collection.
+    let static_work_bytes = fish_static_candidates
+        .len()
+        .saturating_mul(std::mem::size_of::<CandidateRecord>())
+        .saturating_add(
+            static_effect_count.saturating_mul(
+                std::mem::size_of::<FishRegistrationEffect>()
+                    .saturating_add(16 * std::mem::size_of::<usize>()),
+            ),
+        )
+        .saturating_add(static_selector_bytes);
+    if output_work_bytes.saturating_add(static_work_bytes) > MAX_COMMAND_OUTPUT_WORK_BYTES {
+        return Err(VmError::Limit("Fish registration state"));
+    }
+    output_work_bytes = output_work_bytes.saturating_add(static_work_bytes);
+    let mut fish_candidates = Vec::with_capacity(fish_static_candidates.len());
+    let mut fish_effects = Vec::with_capacity(static_effect_count);
+    for (index, emitted) in fish_static_candidates.into_iter().enumerate() {
+        let fish_selector = (emitted.candidate.kind == RuleCandidateKind::Option
+            && emitted.candidate.value.starts_with('-'))
+        .then(|| Arc::<str>::from(emitted.candidate.value.as_str()));
+        let effect_group = STATIC_FISH_EFFECT_BASE.saturating_add(index as u64);
+        let mut selectors = HashSet::new();
+        if let Some(selector) = &fish_selector {
+            selectors.insert(Arc::clone(selector));
+        }
+        fish_effects.push(FishRegistrationEffect {
+            group: effect_group,
+            commands: HashSet::from([0_usize]),
+            selectors,
+            erased_selectors: HashMap::new(),
+            path: FishPathEffect::None,
+            path_selector: None,
+        });
+        fish_candidates.push(CandidateRecord {
             emitted,
             fish_group: 0,
+            fish_effect_group: effect_group,
             fish_item: index as u64,
+            fish_selector,
             provisional: true,
-        })
-        .collect::<Vec<_>>();
-    let mut fish_effects = if fish_has_static_candidates
-        || fish_static_path.is_some_and(|path| path != PathCompletion::Inherit)
-    {
-        vec![FishRegistrationEffect {
-            group: 0,
+        });
+    }
+    if let Some(path) = fish_static_path.filter(|path| *path != PathCompletion::Inherit) {
+        fish_effects.push(FishRegistrationEffect {
+            group: STATIC_FISH_EFFECT_BASE.saturating_add(fish_effects.len() as u64),
+            commands: HashSet::from([0_usize]),
             selectors: HashSet::new(),
-            path: FishPathEffect::Static(fish_static_path.unwrap_or(PathCompletion::Inherit)),
-        }]
-    } else {
-        Vec::new()
-    };
+            erased_selectors: HashMap::new(),
+            path: FishPathEffect::Static(path),
+            path_selector: None,
+        });
+    }
+    if output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+        return Err(VmError::Limit("Fish registration state"));
+    }
+    let mut fish_wrapper_edges = HashSet::<(usize, usize)>::new();
+    let mut fish_erase_work = 0_usize;
+    let mut fish_erased_selector_records = 0_usize;
     let mut fish_group = 0_u64;
     let mut fish_force_files = false;
     let mut fish_path_completion = match command {
         "cd" => PathCompletion::Directories,
         "." | "source" => PathCompletion::Files,
         _ => PathCompletion::Inherit,
-    }
-    .merge(fish_static_path.unwrap_or(PathCompletion::Inherit));
+    };
     let mut fish_provisional_yielded = false;
     let mut saw_fish_module = declarative_fish;
-    for (module_index, &(module, module_trust)) in modules.iter().enumerate() {
+    // Erasure provenance depends only on immutable Script IR. Compute it once
+    // per optimized pass instead of recursively rescanning every later module
+    // for every module that is evaluated. Full, non-provisional replay does
+    // not consume this metadata at all.
+    let module_may_erase = if allow_provisional_yield {
+        modules
+            .iter()
+            .map(|(module, _)| {
+                module.dialect == ScriptDialect::Fish
+                    && fish_statements_may_erase_completions(&module.statements)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![false; modules.len()]
+    };
+    let mut later_may_erase = vec![false; modules.len().saturating_add(1)];
+    for index in (0..modules.len()).rev() {
+        later_may_erase[index] = later_may_erase[index + 1] || module_may_erase[index];
+    }
+    let mut evaluated_modules = vec![false; modules.len()];
+    let mut module_cursor = 0_usize;
+    loop {
+        if module_cursor == modules.len() {
+            let newly_reachable = modules.iter().enumerate().any(|(index, (module, _))| {
+                !evaluated_modules[index]
+                    && module.registrations.iter().any(|registration| {
+                        effective_commands.iter().any(|effective| {
+                            registration_matches(module.dialect, &registration.command, effective)
+                        })
+                    })
+            });
+            if !newly_reachable {
+                break;
+            }
+            module_cursor = 0;
+            continue;
+        }
+        let module_index = module_cursor;
+        module_cursor += 1;
+        if evaluated_modules[module_index] {
+            continue;
+        }
+        let (module, module_trust) = modules[module_index];
         if !module.registrations.iter().any(|registration| {
-            let available = module.dialect != ScriptDialect::Fish
-                || registration.service.as_deref().is_none_or(|service| {
-                    fish_builtin_available(service)
-                        || fish_module_functions.contains(service)
-                        || context.command_available(service).unwrap_or(true)
-                });
-            available
-                && effective_commands.iter().any(|effective| {
-                    registration_matches(module.dialect, &registration.command, effective)
-                })
+            effective_commands.iter().any(|effective| {
+                registration_matches(module.dialect, &registration.command, effective)
+            })
         }) {
             continue;
         }
-        let later_fish_erase = modules[module_index + 1..].iter().any(|(later, _)| {
-            later.dialect == ScriptDialect::Fish
-                && fish_statements_may_erase_completions(&later.statements)
-        });
+        evaluated_modules[module_index] = true;
+        let later_fish_erase = later_may_erase[module_index + 1]
+            || module_may_erase
+                .iter()
+                .enumerate()
+                .any(|(index, may_erase)| !evaluated_modules[index] && *may_erase);
         let mut machine = Machine::new(
             module,
             command,
@@ -257,18 +629,23 @@ pub(crate) fn evaluate_module_groups(
             probe_results,
             completion_results,
             &effective_commands,
-            allow_provisional_yield && !later_fish_erase,
+            allow_provisional_yield && !later_fish_erase && !result.optimization_incomplete,
             runtime_optimizations,
+            stop_after_dependency,
+            skip_nonmatching_candidate_work,
+            module_may_erase[module_index],
         );
         if module.dialect == ScriptDialect::Fish {
             saw_fish_module = true;
             machine.candidates = std::mem::take(&mut fish_candidates);
-            machine.emitted_values = machine
-                .candidates
-                .iter()
-                .map(|candidate| candidate.emitted.candidate.value.clone())
-                .collect();
+            // Fish intentionally retains duplicate registration contributions
+            // until erase/dedup finalization, so an emitted-value HashSet is
+            // both semantically unused and an unbounded duplicate allocation.
+            machine.emitted_values.clear();
             machine.fish_registration_effects = std::mem::take(&mut fish_effects);
+            machine.fish_wrapper_edges = std::mem::take(&mut fish_wrapper_edges);
+            machine.fish_erase_work = fish_erase_work;
+            machine.fish_erased_selector_records = fish_erased_selector_records;
             machine.fish_group = fish_group;
             machine.fish_force_files = fish_force_files;
             machine.path_completion = fish_path_completion;
@@ -308,9 +685,24 @@ pub(crate) fn evaluate_module_groups(
             .denied_probe_count
             .saturating_add(machine.denied_probe_count);
         result.truncated |= machine.truncated;
+        // Enforce aggregate request caps before provisional/candidate-limit
+        // exits can return a partially accumulated result.
+        if result.probes.len() > MAX_PROBE_REQUESTS {
+            return Err(VmError::Limit("script probe requests"));
+        }
+        if result.completion_requests.len() > MAX_COMPLETION_REQUESTS {
+            return Err(VmError::Limit("nested completion requests"));
+        }
+        if result.filesystem_requests.len() > MAX_FILESYSTEM_REQUESTS {
+            return Err(VmError::Limit("filesystem requests"));
+        }
         if module.dialect == ScriptDialect::Fish {
+            effective_commands = machine.effective_commands;
             fish_candidates = machine.candidates;
             fish_effects = machine.fish_registration_effects;
+            fish_wrapper_edges = machine.fish_wrapper_edges;
+            fish_erase_work = machine.fish_erase_work;
+            fish_erased_selector_records = machine.fish_erased_selector_records;
             fish_group = machine.fish_group;
             fish_force_files = machine.fish_force_files;
             fish_path_completion = machine.path_completion;
@@ -349,16 +741,67 @@ pub(crate) fn evaluate_module_groups(
             result.candidates.truncate(candidate_limit);
             break;
         }
-        if result.probes.len() > MAX_PROBE_REQUESTS {
-            return Err(VmError::Limit("script probe requests"));
+    }
+    // Static registration metadata is an upper bound used to decide which
+    // modules may contribute. Runtime `complete --erase --wraps` can remove a
+    // transitive edge, so publish only groups reachable through the wrapper
+    // graph that actually survived execution.
+    let reachable_commands =
+        fish_reachable_commands(effective_commands.len(), &fish_wrapper_edges)?;
+    fish_candidates.retain(|candidate| {
+        fish_effects.iter().any(|effect| {
+            effect.group == candidate.fish_effect_group
+                && effect.commands.iter().any(|command| {
+                    reachable_commands.get(*command) == Some(&true)
+                        && candidate.fish_selector.as_ref().is_none_or(|selector| {
+                            effect.selectors.contains(selector)
+                                && !effect
+                                    .erased_selectors
+                                    .get(command)
+                                    .is_some_and(|erased| erased.contains(selector))
+                        })
+                })
+        })
+    });
+    fish_force_files = false;
+    // Registration-derived path policy is rebuilt from the final effective
+    // registration set. Preserve every other runtime path contribution that
+    // accumulated in `fish_path_completion` independently of erase/wrappers.
+    let fish_dynamic_path_completion = fish_path_completion;
+    fish_path_completion = PathCompletion::Inherit;
+    for effect in &fish_effects {
+        if !effect.commands.iter().any(|command| {
+            reachable_commands.get(*command) == Some(&true)
+                && effect.path_selector.as_ref().is_none_or(|selector| {
+                    !effect
+                        .erased_selectors
+                        .get(command)
+                        .is_some_and(|erased| erased.contains(selector))
+                })
+        }) {
+            continue;
         }
-        if result.completion_requests.len() > MAX_COMPLETION_REQUESTS {
-            return Err(VmError::Limit("nested completion requests"));
-        }
-        if result.filesystem_requests.len() > MAX_FILESYSTEM_REQUESTS {
-            return Err(VmError::Limit("filesystem requests"));
+        match effect.path {
+            FishPathEffect::None => {}
+            FishPathEffect::NoFiles => {
+                if !fish_force_files {
+                    fish_path_completion = PathCompletion::Suppress;
+                }
+            }
+            FishPathEffect::Suppress => {
+                fish_path_completion = fish_path_completion.merge(PathCompletion::Suppress);
+            }
+            FishPathEffect::ForceFiles => {
+                fish_force_files = true;
+                fish_path_completion = fish_path_completion.merge(PathCompletion::Files);
+            }
+            FishPathEffect::Static(path) => {
+                fish_path_completion = fish_path_completion.merge(path);
+            }
         }
     }
+    fish_path_completion = fish_path_completion.merge(fish_dynamic_path_completion);
+
     // Keep per-registration contributions reversible until every erase has
     // run, then select the newest surviving contribution for each value.
     let mut deduplicated = Vec::<CandidateRecord>::new();
@@ -423,6 +866,7 @@ pub(crate) fn evaluate_module_groups(
         result.provisional_yielded = true;
     } else if result.candidates.len() > candidate_limit {
         result.candidates.truncate(candidate_limit);
+        result.truncated = true;
     }
     Ok(())
 }
@@ -471,7 +915,7 @@ fn append_bounded_output(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum AvailabilityKind {
     Command,
     Function,
@@ -535,11 +979,13 @@ fn fish_complete_command_can_match(
                     if let Some(value) = argument.as_plain_literal() {
                         if value.bytes().filter(|byte| *byte == b'-').count() >= 2 {
                             arguments_match |=
-                                split_fish_completion_words(value).into_iter().any(|value| {
-                                    let value = value
-                                        .split_once('\t')
-                                        .map_or(value.as_str(), |(value, _)| value);
-                                    match_score(query, value).is_some()
+                                split_fish_completion_words(value).map_or(true, |values| {
+                                    values.into_iter().any(|value| {
+                                        let value = value
+                                            .split_once('\t')
+                                            .map_or(value.as_str(), |(value, _)| value);
+                                        match_score(query, value).is_some()
+                                    })
                                 });
                         }
                     } else {
@@ -670,7 +1116,9 @@ impl CommandResult {
 struct CandidateRecord {
     emitted: EmittedCandidate,
     fish_group: u64,
+    fish_effect_group: u64,
     fish_item: u64,
+    fish_selector: Option<Arc<str>>,
     provisional: bool,
 }
 
@@ -685,14 +1133,37 @@ enum FishPathEffect {
 
 struct FishRegistrationEffect {
     group: u64,
-    selectors: HashSet<String>,
+    commands: HashSet<usize>,
+    selectors: HashSet<Arc<str>>,
+    erased_selectors: HashMap<usize, HashSet<Arc<str>>>,
     path: FishPathEffect,
+    path_selector: Option<Arc<str>>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct DeferredConditionKey {
+    source_address: usize,
+    source_length: usize,
+    statements_address: usize,
+    statements_length: usize,
+}
+
+impl DeferredConditionKey {
+    fn new(source: &str, statements: &[ScriptStatement]) -> Self {
+        Self {
+            source_address: source.as_ptr() as usize,
+            source_length: source.len(),
+            statements_address: statements.as_ptr() as usize,
+            statements_length: statements.len(),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct FastFishCondition {
     result: bool,
     entry_status: i32,
+    exit_status: i32,
     state_generation: u64,
     steps: usize,
     loop_iterations: usize,
@@ -734,6 +1205,12 @@ struct DeferredCompletion<'a> {
     words: &'a [ScriptWord],
 }
 
+#[derive(Clone, Copy)]
+struct WordExpansionLimit {
+    values: usize,
+    bytes: usize,
+}
+
 struct Machine<'a> {
     module: &'a ScriptModule,
     command: &'a str,
@@ -743,6 +1220,8 @@ struct Machine<'a> {
     mode: EvaluationMode,
     allow_provisional_yield: bool,
     runtime_optimizations: bool,
+    stop_after_dependency: bool,
+    skip_nonmatching_candidate_work: bool,
     provisional_yielded: bool,
     candidate_limit: usize,
     variables: HashMap<String, Variable>,
@@ -759,10 +1238,16 @@ struct Machine<'a> {
     fish_group: u64,
     fish_item: u64,
     fish_force_files: bool,
-    fish_base_path_completion: PathCompletion,
     fish_registration_effects: Vec<FishRegistrationEffect>,
-    fast_fish_condition_cache: HashMap<String, FastFishCondition>,
-    fast_fish_condition_seen: HashSet<String>,
+    fish_wrapper_edges: HashSet<(usize, usize)>,
+    fish_erase_work: usize,
+    fish_erased_selector_records: usize,
+    deferred_fish_completions: Vec<(Vec<String>, bool)>,
+    deferred_fish_completion_bytes: usize,
+    replaying_deferred_fish_completions: bool,
+    fast_fish_condition_cache: HashMap<DeferredConditionKey, FastFishCondition>,
+    fast_fish_condition_seen: HashSet<DeferredConditionKey>,
+    fish_condition_aliases: Option<HashMap<DeferredConditionKey, DeferredConditionKey>>,
     fish_condition_depth: usize,
     condition_state_generation: u64,
     dependency_epoch: u64,
@@ -786,9 +1271,10 @@ struct Machine<'a> {
     stdin_cursor: usize,
     capture_stderr: bool,
     suppress_word_splitting: bool,
+    word_expansion_limit: Option<WordExpansionLimit>,
     probe_results: &'a HashMap<ProbeKey, ProbeResult>,
     completion_results: &'a HashMap<String, Vec<String>>,
-    deferred_completion_words: HashMap<&'a str, DeferredCompletion<'a>>,
+    deferred_completion_words: Option<HashMap<&'a str, DeferredCompletion<'a>>>,
     effective_commands: Vec<String>,
     runtime_bash_registrations: Vec<(String, ScriptEntry, AppendPolicy)>,
     active_tags: Vec<String>,
@@ -815,6 +1301,9 @@ impl<'a> Machine<'a> {
         effective_commands: &[String],
         allow_provisional_yield: bool,
         runtime_optimizations: bool,
+        stop_after_dependency: bool,
+        skip_nonmatching_candidate_work: bool,
+        fish_may_erase_completions: bool,
     ) -> Self {
         let mut variables = context
             .environment
@@ -894,14 +1383,6 @@ impl<'a> Machine<'a> {
             .into_iter()
             .map(|(name, function)| (name, RuntimeFunction::Borrowed(function)))
             .collect();
-        let mut deferred_completion_words = HashMap::new();
-        collect_deferred_completion_words(&module.statements, &mut deferred_completion_words);
-        for function in &module.functions {
-            for argument in &function.arguments {
-                collect_deferred_completion_word(argument, &mut deferred_completion_words);
-            }
-            collect_deferred_completion_words(&function.body, &mut deferred_completion_words);
-        }
         let fish_base_path_completion = if module.dialect == ScriptDialect::Fish {
             match command {
                 "cd" => PathCompletion::Directories,
@@ -920,6 +1401,8 @@ impl<'a> Machine<'a> {
             mode,
             allow_provisional_yield,
             runtime_optimizations,
+            stop_after_dependency,
+            skip_nonmatching_candidate_work,
             provisional_yielded: false,
             candidate_limit,
             variables,
@@ -936,14 +1419,20 @@ impl<'a> Machine<'a> {
             fish_group: 0,
             fish_item: 0,
             fish_force_files: false,
-            fish_base_path_completion,
             fish_registration_effects: Vec::new(),
+            fish_wrapper_edges: HashSet::new(),
+            fish_erase_work: 0,
+            fish_erased_selector_records: 0,
+            deferred_fish_completions: Vec::new(),
+            deferred_fish_completion_bytes: 0,
+            replaying_deferred_fish_completions: false,
             fast_fish_condition_cache: HashMap::new(),
             fast_fish_condition_seen: HashSet::new(),
+            fish_condition_aliases: None,
             fish_condition_depth: 0,
             condition_state_generation: 0,
             dependency_epoch: 0,
-            fish_may_erase_completions: fish_statements_may_erase_completions(&module.statements),
+            fish_may_erase_completions,
             skipped_candidate_work: false,
             probes: Vec::new(),
             completion_requests: Vec::new(),
@@ -963,9 +1452,10 @@ impl<'a> Machine<'a> {
             stdin_cursor: 0,
             capture_stderr: false,
             suppress_word_splitting: false,
+            word_expansion_limit: None,
             probe_results,
             completion_results,
-            deferred_completion_words,
+            deferred_completion_words: None,
             effective_commands: effective_commands.to_vec(),
             runtime_bash_registrations: Vec::new(),
             active_tags: Vec::new(),
@@ -1000,7 +1490,7 @@ impl<'a> Machine<'a> {
                 self.provisional_yielded = true;
                 break;
             }
-            if self.runtime_optimizations && self.dependency_epoch > 0 {
+            if self.stop_after_dependency && self.dependency_epoch > 0 {
                 stopped_for_dependency = true;
                 if self.allow_provisional_yield
                     && self.mode == EvaluationMode::ExplicitTab
@@ -1064,6 +1554,11 @@ impl<'a> Machine<'a> {
                     self.exec_fish_top_level()?;
                 } else {
                     self.exec_statements(&self.module.statements)?;
+                }
+                if !(self.provisional_yielded
+                    || self.stop_after_dependency && self.dependency_epoch > 0)
+                {
+                    self.replay_deferred_fish_completions()?;
                 }
             }
             ScriptDialect::Zsh => {
@@ -1239,6 +1734,35 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    fn charge_fish_condition_snapshot(&mut self) -> Result<(), VmError> {
+        let bytes = self
+            .variables
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, Variable)>().saturating_add(1))
+            .saturating_add(
+                self.variables
+                    .iter()
+                    .map(|(name, variable)| {
+                        name.capacity()
+                            .saturating_add(
+                                variable
+                                    .values
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<String>()),
+                            )
+                            .saturating_add(
+                                variable.values.iter().map(String::capacity).sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            );
+        self.output_work_bytes = self.output_work_bytes.saturating_add(bytes);
+        if self.output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+            return Err(VmError::Limit("Fish condition snapshot work"));
+        }
+        Ok(())
+    }
+
     fn check_machine_memory(&self) -> Result<(), VmError> {
         if let Some(error) = self.limit_error {
             return Err(VmError::Limit(error));
@@ -1248,12 +1772,25 @@ impl<'a> Machine<'a> {
         }
         let bytes = self
             .variables
-            .iter()
-            .fold(0_usize, |total, (name, variable)| {
-                total
-                    .saturating_add(name.len())
-                    .saturating_add(variable.values.iter().map(String::len).sum::<usize>())
-            });
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, Variable)>().saturating_add(1))
+            .saturating_add(
+                self.variables
+                    .iter()
+                    .fold(0_usize, |total, (name, variable)| {
+                        total
+                            .saturating_add(name.capacity())
+                            .saturating_add(
+                                variable
+                                    .values
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<String>()),
+                            )
+                            .saturating_add(
+                                variable.values.iter().map(String::capacity).sum::<usize>(),
+                            )
+                    }),
+            );
         if bytes > MAX_MACHINE_VALUE_BYTES {
             return Err(VmError::Limit("shell variable bytes"));
         }
@@ -1334,7 +1871,17 @@ impl<'a> Machine<'a> {
     fn record_status(&mut self, status: i32) {
         self.last_status = status;
         if self.module.dialect == ScriptDialect::Fish {
-            self.set_values("status", vec![status.to_string()], false);
+            let already_current = self.variables.get("status").is_some_and(|variable| {
+                variable.values.len() == 1
+                    && match status {
+                        0 => variable.values[0] == "0",
+                        1 => variable.values[0] == "1",
+                        _ => variable.values[0].parse::<i32>() == Ok(status),
+                    }
+            });
+            if !already_current {
+                self.set_values("status", vec![status.to_string()], false);
+            }
         }
     }
 
@@ -2574,7 +3121,8 @@ impl<'a> Machine<'a> {
             .and_then(|argument| self.resolve_index(argument, "COMP_WORDS"))
             .unwrap_or(self.context.word_index);
         if self.context.word_index <= offset {
-            self.set_values("COMPREPLY", self.command_names(), false);
+            let commands = self.command_names();
+            self.set_values("COMPREPLY", commands, false);
             if let Some(variable) = self.variables.get_mut("COMPREPLY") {
                 variable.array = true;
             }
@@ -2588,6 +3136,7 @@ impl<'a> Machine<'a> {
             .unwrap_or_default()
             .join(" ");
         if let Some(values) = self.completion_results.get(&line) {
+            self.check_values(values)?;
             let mut output = Vec::with_capacity(values.len());
             for value in values {
                 if let Some(path_completion) = nested_completion_path(value) {
@@ -2688,7 +3237,7 @@ impl<'a> Machine<'a> {
             self.tag_context_initialized,
             self.tag_label_iterations.clone(),
         );
-        let saved = save_positional(&self.variables);
+        let saved = self.save_positional();
         self.set_positional(arguments);
         if self.module.dialect == ScriptDialect::Zsh {
             self.mark_local("OPTIND");
@@ -2703,7 +3252,7 @@ impl<'a> Machine<'a> {
             }
         }
         let execution = self.exec_statements(&function.body);
-        restore_positional(&mut self.variables, saved);
+        self.restore_positional(saved);
         if let Some(scope) = self.scopes.pop() {
             for (name, original) in scope {
                 if let Some(variable) = original {
@@ -2861,7 +3410,80 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    fn validate_word_expansion(&self, values: &[String]) -> Result<usize, VmError> {
+        let limit = self.word_expansion_limit.unwrap_or(WordExpansionLimit {
+            values: MAX_VALUES,
+            bytes: usize::MAX,
+        });
+        if values.len() > limit.values {
+            return Err(VmError::Limit("expanded shell values"));
+        }
+        let bytes = values
+            .iter()
+            .map(String::len)
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or(VmError::Limit("expanded shell values"))?;
+        if bytes > limit.bytes || values.iter().any(|value| value.len() > MAX_VALUE_BYTES) {
+            return Err(VmError::Limit("expanded shell values"));
+        }
+        Ok(bytes)
+    }
+
+    fn append_word_expansion(
+        &self,
+        target: &mut Vec<String>,
+        target_bytes: &mut usize,
+        source: &mut Vec<String>,
+    ) -> Result<(), VmError> {
+        let source_bytes = self.validate_word_expansion(source)?;
+        let limit = self.word_expansion_limit.unwrap_or(WordExpansionLimit {
+            values: MAX_VALUES,
+            bytes: usize::MAX,
+        });
+        if target.len().saturating_add(source.len()) > limit.values
+            || target_bytes.saturating_add(source_bytes) > limit.bytes
+        {
+            return Err(VmError::Limit("expanded shell values"));
+        }
+        *target_bytes = target_bytes.saturating_add(source_bytes);
+        target.append(source);
+        Ok(())
+    }
+
+    fn expand_literal_braces(&self, value: &str) -> Result<Vec<String>, VmError> {
+        if let Some(limit) = self.word_expansion_limit {
+            expand_braces_bounded(value, limit.values, limit.bytes)
+        } else {
+            Ok(expand_braces(value))
+        }
+    }
+
+    fn expand_command_word_bounded(
+        &mut self,
+        word: &ScriptWord,
+        values: usize,
+        bytes: usize,
+    ) -> Result<Vec<String>, VmError> {
+        let saved = self.word_expansion_limit;
+        self.word_expansion_limit = Some(WordExpansionLimit { values, bytes });
+        let result = self.expand_command_word(word);
+        self.word_expansion_limit = saved;
+        result
+    }
+
     fn expand_word(&mut self, word: &ScriptWord) -> Result<Vec<String>, VmError> {
+        if let [ScriptWordPart::Literal { value, quoted }] = word.parts.as_slice() {
+            if value.len() > MAX_VALUE_BYTES {
+                return Err(VmError::Limit("expanded shell value"));
+            }
+            let expanded = if *quoted || self.suppress_word_splitting {
+                vec![value.clone()]
+            } else {
+                self.expand_literal_braces(value)?
+            };
+            self.validate_word_expansion(&expanded)?;
+            return Ok(expanded);
+        }
         let mut values = vec![String::new()];
         let mut part_index = 0;
         while part_index < word.parts.len() {
@@ -2872,7 +3494,7 @@ impl<'a> Machine<'a> {
                     if *quoted || self.suppress_word_splitting {
                         vec![value.clone()]
                     } else {
-                        expand_braces(value)
+                        self.expand_literal_braces(value)?
                     }
                 }
                 ScriptWordPart::Parameter { expression, quoted } => {
@@ -2934,20 +3556,25 @@ impl<'a> Machine<'a> {
                 }
                 ScriptWordPart::BraceExpansion { alternatives, .. } => {
                     let mut output = Vec::new();
+                    let mut output_bytes = 0_usize;
                     for alternative in alternatives {
-                        output.extend(self.expand_word(alternative)?);
+                        let mut expanded = self.expand_word(alternative)?;
+                        self.append_word_expansion(&mut output, &mut output_bytes, &mut expanded)?;
                     }
                     output
                 }
                 ScriptWordPart::Array { elements } => {
                     let mut output = Vec::new();
+                    let mut output_bytes = 0_usize;
                     for element in elements {
-                        output.extend(self.expand_word(element)?);
+                        let mut expanded = self.expand_word(element)?;
+                        self.append_word_expansion(&mut output, &mut output_bytes, &mut expanded)?;
                     }
                     output
                 }
                 ScriptWordPart::DeferredScript { source, .. } => vec![source.clone()],
             };
+            self.validate_word_expansion(&additions)?;
             if additions.is_empty() {
                 let zsh_rc_expand = self.module.dialect == ScriptDialect::Zsh
                     && matches!(
@@ -2963,23 +3590,45 @@ impl<'a> Machine<'a> {
                 }
                 additions.push(String::new());
             }
-            let mut combined = Vec::new();
-            for prefix in &values {
-                for addition in &additions {
-                    let mut value = prefix.clone();
-                    value.push_str(addition);
-                    if value.len() > MAX_VALUE_BYTES {
-                        return Err(VmError::Limit("expanded shell value"));
-                    }
-                    combined.push(value);
-                    if combined.len() > MAX_VALUES {
-                        return Err(VmError::Limit("expanded shell values"));
+            if values.len() == 1 && values[0].is_empty() {
+                values = additions;
+            } else if additions.len() != 1 || !additions[0].is_empty() {
+                let capacity = values.len().saturating_mul(additions.len());
+                let limit = self.word_expansion_limit.unwrap_or(WordExpansionLimit {
+                    values: MAX_VALUES,
+                    bytes: usize::MAX,
+                });
+                let values_bytes = self.validate_word_expansion(&values)?;
+                let addition_bytes = self.validate_word_expansion(&additions)?;
+                let combined_bytes = values_bytes
+                    .checked_mul(additions.len())
+                    .and_then(|bytes| {
+                        addition_bytes
+                            .checked_mul(values.len())
+                            .and_then(|addition| bytes.checked_add(addition))
+                    })
+                    .ok_or(VmError::Limit("expanded shell values"))?;
+                if capacity > limit.values || combined_bytes > limit.bytes {
+                    return Err(VmError::Limit("expanded shell values"));
+                }
+                let mut combined = Vec::with_capacity(capacity);
+                for prefix in &values {
+                    for addition in &additions {
+                        let length = prefix.len().saturating_add(addition.len());
+                        if length > MAX_VALUE_BYTES {
+                            return Err(VmError::Limit("expanded shell value"));
+                        }
+                        let mut value = String::with_capacity(length);
+                        value.push_str(prefix);
+                        value.push_str(addition);
+                        combined.push(value);
                     }
                 }
+                values = combined;
             }
-            values = combined;
             part_index += consumed_parts;
         }
+        self.validate_word_expansion(&values)?;
         Ok(values)
     }
 
@@ -3033,15 +3682,19 @@ impl<'a> Machine<'a> {
     fn expand_command_word(&mut self, word: &ScriptWord) -> Result<Vec<String>, VmError> {
         if let [ScriptWordPart::Array { elements }] = word.parts.as_slice() {
             let mut output = Vec::new();
+            let mut output_bytes = 0_usize;
             for element in elements {
-                output.extend(self.expand_command_word(element)?);
+                let mut expanded = self.expand_command_word(element)?;
+                self.append_word_expansion(&mut output, &mut output_bytes, &mut expanded)?;
             }
             return Ok(output);
         }
         if let [ScriptWordPart::BraceExpansion { alternatives, .. }] = word.parts.as_slice() {
             let mut output = Vec::new();
+            let mut output_bytes = 0_usize;
             for alternative in alternatives {
-                output.extend(self.expand_command_word(alternative)?);
+                let mut expanded = self.expand_command_word(alternative)?;
+                self.append_word_expansion(&mut output, &mut output_bytes, &mut expanded)?;
             }
             return Ok(output);
         }
@@ -3050,25 +3703,29 @@ impl<'a> Machine<'a> {
             return Ok(values);
         }
         let mut output = Vec::new();
+        let mut output_bytes = 0_usize;
         for value in values {
             let zsh_completion_specification = self.module.dialect == ScriptDialect::Zsh
                 && zsh_spec_description(&value).is_some()
                 && !zsh_spec_options(&value).is_empty()
                 && !word_has_unquoted_path_glob(word, self.module.dialect);
             if zsh_completion_specification || !has_shell_glob(self.module.dialect, &value) {
-                output.push(value);
+                let mut value = vec![value];
+                self.append_word_expansion(&mut output, &mut output_bytes, &mut value)?;
                 continue;
             }
             let Some(matches) = self.filesystem_values(FilesystemRequestKind::Glob, &value, None)
             else {
                 continue;
             };
-            if matches.is_empty() && self.module.dialect == ScriptDialect::Bash {
-                output.push(value);
+            let mut expanded = if matches.is_empty() && self.module.dialect == ScriptDialect::Bash {
+                vec![value]
             } else {
-                output.extend(matches);
-            }
+                matches
+            };
+            self.append_word_expansion(&mut output, &mut output_bytes, &mut expanded)?;
         }
+        self.validate_word_expansion(&output)?;
         Ok(output)
     }
 
@@ -3972,7 +4629,7 @@ impl<'a> Machine<'a> {
             .iter()
             .filter(|(name, _)| {
                 matches!(name.as_str(), "@" | "*" | "argv")
-                    || (name.as_str() != "0" && name.bytes().all(|byte| byte.is_ascii_digit()))
+                    || name.bytes().all(|byte| byte.is_ascii_digit())
             })
             .map(|(name, variable)| (name.clone(), variable.clone()))
             .collect()
@@ -3981,7 +4638,7 @@ impl<'a> Machine<'a> {
     fn restore_positional(&mut self, saved: Vec<(String, Variable)>) {
         self.variables.retain(|name, _| {
             !matches!(name.as_str(), "@" | "*" | "argv")
-                && (name == "0" || !name.bytes().all(|byte| byte.is_ascii_digit()))
+                && !name.bytes().all(|byte| byte.is_ascii_digit())
         });
         self.variables.extend(saved);
     }
@@ -4013,9 +4670,11 @@ impl<'a> Machine<'a> {
     }
 
     fn check_values(&self, values: &[String]) -> Result<(), VmError> {
-        if values.len() > MAX_VALUES
-            || values.iter().map(String::len).sum::<usize>() > MAX_VALUE_BYTES
-        {
+        let bytes = values
+            .iter()
+            .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+            .ok_or(VmError::Limit("shell values"))?;
+        if values.len() > MAX_VALUES || bytes > MAX_VALUE_BYTES {
             return Err(VmError::Limit("shell values"));
         }
         Ok(())
@@ -4657,6 +5316,10 @@ impl<'a> Machine<'a> {
                 let name = &reference[..open];
                 let expression = &reference[open + 1..reference.len() - 1];
                 let index = usize::try_from(self.eval_arithmetic(expression)).unwrap_or(0);
+                if index >= MAX_VALUES {
+                    self.limit_error = Some("shell variable values");
+                    return;
+                }
                 let variable = self.variables.entry(name.to_owned()).or_default();
                 if variable.values.len() <= index {
                     variable.values.resize(index + 1, String::new());
@@ -5657,24 +6320,38 @@ impl<'a> Machine<'a> {
         self.check_machine_memory()
     }
 
+    fn deferred_completion_words(&mut self) -> &HashMap<&'a str, DeferredCompletion<'a>> {
+        self.deferred_completion_words.get_or_insert_with(|| {
+            let mut deferred = HashMap::new();
+            collect_deferred_completion_words(&self.module.statements, &mut deferred);
+            for function in &self.module.functions {
+                for argument in &function.arguments {
+                    collect_deferred_completion_word(argument, &mut deferred);
+                }
+                collect_deferred_completion_words(&function.body, &mut deferred);
+            }
+            deferred
+        })
+    }
+
     fn evaluate_cached_fish_condition(
         &mut self,
         source: &str,
         statements: &[ScriptStatement],
     ) -> Result<bool, VmError> {
-        if !self.runtime_optimizations
-            || !self.trust.permits_dynamic_probes()
-            || !self
-                .deferred_completion_words
-                .get(source)
-                .is_some_and(|deferred| deferred.statements == statements)
-        {
+        if !self.runtime_optimizations || !self.trust.permits_dynamic_probes() {
             return Ok(self.exec_statements(statements)?.status == 0);
         }
+        let identity = DeferredConditionKey::new(source, statements);
+        let key = *self
+            .fish_condition_aliases
+            .get_or_insert_with(|| collect_fish_condition_aliases(self.module))
+            .get(&identity)
+            .unwrap_or(&identity);
         let entry_status = self.last_status;
         if let Some(cached) = self
             .fast_fish_condition_cache
-            .get(source)
+            .get(&key)
             .filter(|cached| {
                 cached.entry_status == entry_status
                     && cached.state_generation == self.condition_state_generation
@@ -5687,12 +6364,21 @@ impl<'a> Machine<'a> {
                 cached.output_work_bytes,
                 cached.dependency_accesses,
             )?;
+            self.record_status(cached.exit_status);
             return Ok(cached.result);
         }
 
-        let seen_before = self.fast_fish_condition_seen.contains(source);
-        let variables_before = (seen_before || !self.fast_fish_condition_cache.is_empty())
-            .then(|| self.variables.clone());
+        let seen_before = self.fast_fish_condition_seen.contains(&key);
+        let variables_before = if seen_before || !self.fast_fish_condition_cache.is_empty() {
+            // Comparing a condition's complete variable state is itself bounded
+            // work. Stateful conditions never become memoizable, so without
+            // this charge each invocation could clone the full 8 MiB machine
+            // state while consuming only a handful of VM steps.
+            self.charge_fish_condition_snapshot()?;
+            Some(self.variables.clone())
+        } else {
+            None
+        };
         let registration_effects_before = self.fish_registration_effects.len();
         let state_before = (
             self.function_generation,
@@ -5715,7 +6401,8 @@ impl<'a> Machine<'a> {
         self.fish_condition_depth = self.fish_condition_depth.saturating_add(1);
         let evaluated = self.exec_statements(statements);
         self.fish_condition_depth = self.fish_condition_depth.saturating_sub(1);
-        let result = evaluated?.status == 0;
+        let exit_status = evaluated?.status;
+        let result = exit_status == 0;
         let state_unchanged = variables_before
             .as_ref()
             .is_none_or(|variables| variables == &self.variables)
@@ -5741,17 +6428,17 @@ impl<'a> Machine<'a> {
             && self.fast_fish_condition_cache.len() < MAX_FISH_MEMOIZED_CONDITIONS
             && self
                 .fast_fish_condition_cache
-                .keys()
-                .map(String::len)
-                .sum::<usize>()
-                .saturating_add(source.len())
+                .len()
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<DeferredConditionKey>())
                 <= MAX_FISH_MEMOIZED_CONDITION_BYTES
         {
             self.fast_fish_condition_cache.insert(
-                source.to_owned(),
+                key,
                 FastFishCondition {
                     result,
                     entry_status,
+                    exit_status,
                     state_generation: self.condition_state_generation,
                     steps: self.steps.saturating_sub(steps),
                     loop_iterations: self.loop_iterations.saturating_sub(loop_iterations),
@@ -5760,34 +6447,46 @@ impl<'a> Machine<'a> {
                 },
             );
         }
-        if !self.fast_fish_condition_seen.contains(source)
+        if !self.fast_fish_condition_seen.contains(&key)
             && self.fast_fish_condition_seen.len() < MAX_FISH_MEMOIZED_CONDITIONS
             && self
                 .fast_fish_condition_seen
-                .iter()
-                .map(String::len)
-                .sum::<usize>()
-                .saturating_add(source.len())
+                .len()
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<DeferredConditionKey>())
                 <= MAX_FISH_MEMOIZED_CONDITION_BYTES
         {
-            self.fast_fish_condition_seen.insert(source.to_owned());
+            self.fast_fish_condition_seen.insert(key);
         }
         Ok(result)
     }
 
+    fn replay_deferred_fish_completions(&mut self) -> Result<(), VmError> {
+        if self.deferred_fish_completions.is_empty() {
+            return Ok(());
+        }
+        let deferred = std::mem::take(&mut self.deferred_fish_completions);
+        self.replaying_deferred_fish_completions = true;
+        for (arguments, emit_candidates) in deferred {
+            self.complete_builtin_normalized(&arguments, true, emit_candidates)?;
+        }
+        self.replaying_deferred_fish_completions = false;
+        self.deferred_fish_completion_bytes = 0;
+        Ok(())
+    }
+
     fn complete_command(&mut self, command: &ScriptCommand) -> Result<CommandResult, VmError> {
-        let emit_candidates =
-            !self.runtime_optimizations || fish_complete_command_can_match(command, self.context);
-        let mut arguments = Vec::new();
+        let emit_candidates = !self.skip_nonmatching_candidate_work
+            || fish_complete_command_can_match(command, self.context);
+        let mut arguments = Vec::with_capacity(command.words.len().saturating_sub(1));
+        let mut argument_bytes = 0_usize;
         let mut index = 1;
         while index < command.words.len() {
-            let option = command.words[index]
-                .as_plain_literal()
-                .unwrap_or("")
-                .to_owned();
-            arguments.extend(self.expand_word(&command.words[index])?);
+            let option = command.words[index].as_plain_literal().unwrap_or("");
+            let mut expanded = self.expand_word(&command.words[index])?;
+            append_bounded_output(&mut arguments, &mut argument_bytes, &mut expanded)?;
             if index + 1 < command.words.len()
-                && matches!(option.as_str(), "-n" | "--condition" | "-a" | "--arguments")
+                && matches!(option, "-n" | "--condition" | "-a" | "--arguments")
             {
                 if let [
                     ScriptWordPart::DeferredScript {
@@ -5797,39 +6496,72 @@ impl<'a> Machine<'a> {
                     },
                 ] = command.words[index + 1].parts.as_slice()
                 {
-                    if matches!(option.as_str(), "-n" | "--condition") {
+                    if matches!(option, "-n" | "--condition") {
                         if !self.evaluate_cached_fish_condition(source, statements)? {
                             return Ok(CommandResult::status(1));
                         }
-                        arguments.push(":".into());
+                        let mut value = vec![":".into()];
+                        append_bounded_output(&mut arguments, &mut argument_bytes, &mut value)?;
                     } else if emit_candidates {
                         let mut output = Vec::new();
+                        let mut output_bytes = 0_usize;
                         for word in words {
-                            output.extend(self.expand_command_word(word)?);
+                            let remaining_values = MAX_VALUES.saturating_sub(output.len());
+                            let remaining_bytes = MAX_VALUE_BYTES
+                                .saturating_sub(argument_bytes)
+                                .saturating_sub(output_bytes);
+                            let mut expanded = self.expand_command_word_bounded(
+                                word,
+                                remaining_values,
+                                remaining_bytes,
+                            )?;
+                            append_bounded_output(&mut output, &mut output_bytes, &mut expanded)?;
                         }
-                        if output.is_empty() {
-                            arguments.push(String::new());
+                        let joined_bytes =
+                            output_bytes.saturating_add(output.len().saturating_sub(1));
+                        if arguments.len().saturating_add(1) > MAX_VALUES
+                            || argument_bytes.saturating_add(joined_bytes) > MAX_VALUE_BYTES
+                        {
+                            return Err(VmError::Limit("Fish completion values"));
+                        }
+                        let joined = if output.is_empty() {
+                            String::new()
                         } else {
-                            arguments.push(output.join("\0"));
-                        }
+                            output.join("\0")
+                        };
+                        let mut joined = vec![joined];
+                        append_bounded_output(&mut arguments, &mut argument_bytes, &mut joined)?;
                     } else {
                         self.skipped_candidate_work = true;
-                        arguments.push(String::new());
+                        let mut value = vec![String::new()];
+                        append_bounded_output(&mut arguments, &mut argument_bytes, &mut value)?;
                     }
                     let _ = source;
-                } else if emit_candidates || matches!(option.as_str(), "-n" | "--condition") {
-                    arguments.extend(self.expand_command_word(&command.words[index + 1])?);
+                } else if emit_candidates || matches!(option, "-n" | "--condition") {
+                    let remaining_values = MAX_VALUES.saturating_sub(arguments.len());
+                    let remaining_bytes = MAX_VALUE_BYTES.saturating_sub(argument_bytes);
+                    let mut expanded = self.expand_command_word_bounded(
+                        &command.words[index + 1],
+                        remaining_values,
+                        remaining_bytes,
+                    )?;
+                    append_bounded_output(&mut arguments, &mut argument_bytes, &mut expanded)?;
                 } else {
                     self.skipped_candidate_work = true;
-                    arguments.push(String::new());
+                    let mut value = vec![String::new()];
+                    append_bounded_output(&mut arguments, &mut argument_bytes, &mut value)?;
                 }
                 index += 2;
             } else {
                 index += 1;
             }
         }
-        let arguments = normalize_fish_complete_arguments(&arguments);
-        self.complete_builtin_normalized(&arguments, true, emit_candidates)
+        if fish_complete_arguments_are_normalized(&arguments) {
+            self.complete_builtin_normalized(&arguments, true, emit_candidates)
+        } else {
+            let normalized = normalize_fish_complete_arguments(&arguments);
+            self.complete_builtin_normalized(&normalized, true, emit_candidates)
+        }
     }
 
     fn complete_builtin(&mut self, arguments: &[String]) -> Result<CommandResult, VmError> {
@@ -6003,17 +6735,15 @@ impl<'a> Machine<'a> {
     }
 
     fn rebuild_fish_registration_state(&mut self) {
-        self.emitted_values = self
-            .candidates
-            .iter()
-            .map(|candidate| candidate.emitted.candidate.value.clone())
-            .collect();
+        debug_assert!(self.module.dialect == ScriptDialect::Fish);
+        self.emitted_values.clear();
         self.candidate_bytes =
             self.candidates
                 .iter()
                 .fold(self.initial_candidate_bytes, |bytes, candidate| {
                     bytes
-                        .saturating_add(candidate.emitted.candidate.value.len().saturating_mul(2))
+                        .saturating_add(candidate.emitted.candidate.value.len())
+                        .saturating_add(candidate.emitted.candidate.display.len())
                         .saturating_add(
                             candidate
                                 .emitted
@@ -6023,46 +6753,156 @@ impl<'a> Machine<'a> {
                                 .map_or(0, String::len),
                         )
                 });
-        self.fish_force_files = false;
-        self.path_completion = self.fish_base_path_completion;
-        for effect in &self.fish_registration_effects {
-            match effect.path {
-                FishPathEffect::None => {}
-                FishPathEffect::NoFiles => {
-                    if !self.fish_force_files {
-                        self.path_completion = PathCompletion::Suppress;
+        // Runtime path effects outside `complete` remain accumulated in
+        // `path_completion`. Erase changes only registration-derived state;
+        // the final whole-program pass rebuilds that path policy precisely.
+        self.fish_force_files = self
+            .fish_registration_effects
+            .iter()
+            .any(|effect| matches!(effect.path, FishPathEffect::ForceFiles));
+    }
+
+    fn erase_fish_registrations(
+        &mut self,
+        commands: &HashSet<usize>,
+        selectors: &HashSet<Arc<str>>,
+    ) -> Result<(), VmError> {
+        let work =
+            self.fish_registration_effects
+                .iter()
+                .fold(self.candidates.len(), |total, effect| {
+                    let matching_commands = effect
+                        .commands
+                        .iter()
+                        .filter(|command| commands.contains(command))
+                        .count();
+                    let matching_selectors = effect
+                        .selectors
+                        .iter()
+                        .filter(|selector| selectors.contains(*selector))
+                        .count();
+                    total
+                        .saturating_add(1)
+                        .saturating_add(effect.commands.len())
+                        .saturating_add(effect.selectors.len())
+                        .saturating_add(matching_commands.saturating_mul(matching_selectors))
+                });
+        self.fish_erase_work = self.fish_erase_work.saturating_add(work);
+        if self.fish_erase_work > MAX_FISH_ERASE_WORK {
+            return Err(VmError::Limit("Fish erase work"));
+        }
+
+        if !selectors.is_empty() {
+            let additions = self
+                .fish_registration_effects
+                .iter()
+                .map(|effect| {
+                    let matching_selectors = effect
+                        .selectors
+                        .iter()
+                        .filter(|selector| selectors.contains(*selector))
+                        .collect::<Vec<_>>();
+                    effect
+                        .commands
+                        .iter()
+                        .filter(|command| commands.contains(command))
+                        .map(|command| {
+                            let erased = effect.erased_selectors.get(command);
+                            matching_selectors
+                                .iter()
+                                .filter(|selector| {
+                                    !erased.is_some_and(|erased| erased.contains(**selector))
+                                })
+                                .count()
+                        })
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+            if self.fish_erased_selector_records.saturating_add(additions)
+                > MAX_FISH_ERASE_SELECTOR_RECORDS
+            {
+                return Err(VmError::Limit("Fish erased selectors"));
+            }
+            self.output_work_bytes =
+                self.output_work_bytes
+                    .saturating_add(additions.saturating_mul(
+                        2 * std::mem::size_of::<Arc<str>>() + std::mem::size_of::<usize>(),
+                    ));
+            if self.output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+                return Err(VmError::Limit("Fish registration state"));
+            }
+        }
+
+        for effect in &mut self.fish_registration_effects {
+            let matching_commands = effect
+                .commands
+                .iter()
+                .filter(|command| commands.contains(command))
+                .copied()
+                .collect::<Vec<_>>();
+            if selectors.is_empty() {
+                for command in matching_commands {
+                    effect.commands.remove(&command);
+                    if let Some(erased) = effect.erased_selectors.remove(&command) {
+                        self.fish_erased_selector_records = self
+                            .fish_erased_selector_records
+                            .saturating_sub(erased.len());
                     }
                 }
-                FishPathEffect::Suppress => {
-                    self.path_completion = self.path_completion.merge(PathCompletion::Suppress);
+                continue;
+            }
+            let matching_selectors = effect
+                .selectors
+                .iter()
+                .filter(|selector| selectors.contains(*selector))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching_selectors.is_empty() {
+                continue;
+            }
+            for command in matching_commands {
+                let erased = effect.erased_selectors.entry(command).or_default();
+                for selector in &matching_selectors {
+                    if erased.insert(Arc::clone(selector)) {
+                        self.fish_erased_selector_records =
+                            self.fish_erased_selector_records.saturating_add(1);
+                    }
                 }
-                FishPathEffect::ForceFiles => {
-                    self.fish_force_files = true;
-                    self.path_completion = self.path_completion.merge(PathCompletion::Files);
-                }
-                FishPathEffect::Static(path) => {
-                    self.path_completion = self.path_completion.merge(path);
+                if effect
+                    .selectors
+                    .iter()
+                    .all(|selector| erased.contains(selector))
+                {
+                    effect.commands.remove(&command);
+                    let erased = effect
+                        .erased_selectors
+                        .remove(&command)
+                        .expect("erased selector record exists");
+                    self.fish_erased_selector_records = self
+                        .fish_erased_selector_records
+                        .saturating_sub(erased.len());
                 }
             }
         }
-    }
-
-    fn erase_fish_registrations(&mut self, selectors: &HashSet<String>) {
-        let mut erased_groups = HashSet::new();
-        self.fish_registration_effects.retain(|effect| {
-            let erase = selectors.is_empty()
-                || effect
-                    .selectors
-                    .iter()
-                    .any(|selector| selectors.contains(selector));
-            if erase {
-                erased_groups.insert(effect.group);
-            }
-            !erase
+        self.fish_registration_effects
+            .retain(|effect| !effect.commands.is_empty());
+        let effects = &self.fish_registration_effects;
+        self.candidates.retain(|candidate| {
+            effects.iter().any(|effect| {
+                effect.group == candidate.fish_effect_group
+                    && effect.commands.iter().any(|command| {
+                        candidate.fish_selector.as_ref().is_none_or(|selector| {
+                            effect.selectors.contains(selector)
+                                && !effect
+                                    .erased_selectors
+                                    .get(command)
+                                    .is_some_and(|erased| erased.contains(selector))
+                        })
+                    })
+            })
         });
-        self.candidates
-            .retain(|candidate| !erased_groups.contains(&candidate.fish_group));
         self.rebuild_fish_registration_state();
+        Ok(())
     }
 
     fn complete_builtin_normalized(
@@ -6082,6 +6922,7 @@ impl<'a> Machine<'a> {
         }
         if let Some(line) = fish_complete_request_line(arguments, self.context.words) {
             if let Some(values) = self.completion_results.get(&line) {
+                self.check_values(values)?;
                 let mut output = Vec::with_capacity(values.len());
                 for value in values {
                     if let Some(path_completion) = nested_completion_path(value) {
@@ -6115,9 +6956,11 @@ impl<'a> Machine<'a> {
         let mut long = Vec::new();
         let mut old = Vec::new();
         let mut values = Vec::new();
+        let mut value_bytes = 0_usize;
         let mut has_argument_expression = false;
         let mut description = None;
         let mut conditions = Vec::new();
+        let mut wraps = Vec::new();
         let mut no_files = false;
         let mut force_files = false;
         let mut erase = false;
@@ -6166,11 +7009,23 @@ impl<'a> Machine<'a> {
                     has_argument_expression = true;
                     if let Some(value) = next(index) {
                         if value.contains('\0') {
-                            values.extend(value.split('\0').map(str::to_owned));
+                            extend_bounded_fish_values(
+                                &mut values,
+                                &mut value_bytes,
+                                value.split('\0').map(str::to_owned),
+                            )?;
                         } else if value.contains('\t') {
-                            values.extend(value.lines().map(str::to_owned));
+                            extend_bounded_fish_values(
+                                &mut values,
+                                &mut value_bytes,
+                                value.lines().map(str::to_owned),
+                            )?;
                         } else {
-                            values.extend(split_fish_completion_words(&value));
+                            extend_bounded_fish_values(
+                                &mut values,
+                                &mut value_bytes,
+                                split_fish_completion_words(&value)?,
+                            )?;
                         }
                     }
                     index += 2;
@@ -6183,6 +7038,12 @@ impl<'a> Machine<'a> {
                 "-n" | "--condition" => {
                     if let Some(value) = next(index) {
                         conditions.push(value);
+                    }
+                    index += 2;
+                }
+                "-w" | "--wraps" => {
+                    if let Some(value) = next(index).filter(|value| !value.is_empty()) {
+                        wraps.push(value);
                     }
                     index += 2;
                 }
@@ -6227,11 +7088,52 @@ impl<'a> Machine<'a> {
                 _ => index += 1,
             }
         }
-        if !commands.iter().any(|command| {
-            self.effective_commands
+        for wrapped in &wraps {
+            if self
+                .effective_commands
                 .iter()
-                .any(|effective| registration_matches(ScriptDialect::Fish, command, effective))
-        }) {
+                .any(|command| command == wrapped)
+            {
+                continue;
+            }
+            if self.effective_commands.len() >= MAX_FISH_EFFECTIVE_COMMANDS {
+                return Err(VmError::Limit("Fish wrapper closure"));
+            }
+            self.effective_commands.push(wrapped.clone());
+        }
+        let matching_commands = commands
+            .iter()
+            .flat_map(|command| {
+                self.effective_commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, effective)| {
+                        registration_matches(ScriptDialect::Fish, command, effective)
+                            .then_some(index)
+                    })
+            })
+            .collect::<HashSet<_>>();
+        if matching_commands.is_empty() {
+            if !self.replaying_deferred_fish_completions {
+                if self.deferred_fish_completions.len() >= MAX_FISH_REGISTRATION_EFFECTS {
+                    return Err(VmError::Limit("Fish deferred registrations"));
+                }
+                let bytes = std::mem::size_of::<(Vec<String>, bool)>()
+                    .saturating_add(
+                        arguments
+                            .len()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                    )
+                    .saturating_add(arguments.iter().map(String::len).sum::<usize>());
+                self.deferred_fish_completion_bytes =
+                    self.deferred_fish_completion_bytes.saturating_add(bytes);
+                self.output_work_bytes = self.output_work_bytes.saturating_add(bytes);
+                if self.output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+                    return Err(VmError::Limit("Fish deferred registrations"));
+                }
+                self.deferred_fish_completions
+                    .push((arguments.to_vec(), emit_candidates));
+            }
             return Ok(CommandResult::success());
         }
         if !conditions
@@ -6242,13 +7144,51 @@ impl<'a> Machine<'a> {
         }
         let selectors = short
             .iter()
-            .map(|value| format!("-{value}"))
-            .chain(long.iter().map(|value| format!("--{value}")))
-            .chain(old.iter().map(|value| format!("-{value}")))
+            .map(|value| Arc::<str>::from(format!("-{value}")))
+            .chain(
+                long.iter()
+                    .map(|value| Arc::<str>::from(format!("--{value}"))),
+            )
+            .chain(
+                old.iter()
+                    .map(|value| Arc::<str>::from(format!("-{value}"))),
+            )
+            .collect::<HashSet<_>>();
+        let wrapped_commands = wraps
+            .iter()
+            .flat_map(|wrapped| {
+                self.effective_commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, effective)| (effective == wrapped).then_some(index))
+            })
             .collect::<HashSet<_>>();
         if erase {
-            self.erase_fish_registrations(&selectors);
+            if wraps.is_empty() {
+                if selectors.is_empty() {
+                    self.fish_wrapper_edges
+                        .retain(|(source, _)| !matching_commands.contains(source));
+                }
+                self.erase_fish_registrations(&matching_commands, &selectors)?;
+            } else {
+                self.fish_wrapper_edges.retain(|(source, target)| {
+                    !matching_commands.contains(source) || !wrapped_commands.contains(target)
+                });
+                if !selectors.is_empty() {
+                    self.erase_fish_registrations(&matching_commands, &selectors)?;
+                }
+            }
             return Ok(CommandResult::success());
+        }
+        for &source in &matching_commands {
+            for &target in &wrapped_commands {
+                if !self.fish_wrapper_edges.contains(&(source, target))
+                    && self.fish_wrapper_edges.len() >= MAX_FISH_WRAPPER_EDGES
+                {
+                    return Err(VmError::Limit("Fish wrapper closure"));
+                }
+                self.fish_wrapper_edges.insert((source, target));
+            }
         }
         self.fish_group = self.fish_group.wrapping_add(1);
         self.fish_item = 0;
@@ -6260,40 +7200,74 @@ impl<'a> Machine<'a> {
             .map(String::as_str)
             .unwrap_or("");
         let has_options = !short.is_empty() || !long.is_empty() || !old.is_empty();
-        let previous_is_option = short.iter().any(|option| previous == format!("-{option}"))
-            || long.iter().any(|option| previous == format!("--{option}"))
-            || old.iter().any(|option| previous == format!("-{option}"));
-        let attached_long_prefix = long.iter().find_map(|option| {
-            let prefix = format!("--{option}=");
+        let previous_option_selector = short
+            .iter()
+            .map(|option| format!("-{option}"))
+            .chain(long.iter().map(|option| format!("--{option}")))
+            .chain(old.iter().map(|option| format!("-{option}")))
+            .find(|selector| selector == previous)
+            .map(Arc::<str>::from);
+        let attached_long = long.iter().find_map(|option| {
+            let selector = format!("--{option}");
+            let prefix = format!("{selector}=");
             self.context
                 .current_word
                 .starts_with(&prefix)
-                .then_some(prefix)
+                .then(|| (prefix, Arc::<str>::from(selector)))
         });
-        let option_parameter_applies =
-            requires_parameter && previous_is_option || attached_long_prefix.is_some();
+        let attached_long_prefix = attached_long.as_ref().map(|(prefix, _)| prefix.clone());
+        let active_option_selector = attached_long
+            .as_ref()
+            .map(|(_, selector)| Arc::clone(selector))
+            .or(previous_option_selector);
+        let option_parameter_applies = requires_parameter && active_option_selector.is_some()
+            || attached_long_prefix.is_some();
         let exclusive_applies = !has_options || option_parameter_applies;
         let path_effect = if no_files && exclusive_applies {
-            if !self.fish_force_files {
-                self.path_completion = PathCompletion::Suppress;
-            }
             FishPathEffect::NoFiles
         } else if exclusive && exclusive_applies
             || attached_long_prefix.is_some() && has_argument_expression
         {
-            self.path_completion = self.path_completion.merge(PathCompletion::Suppress);
             FishPathEffect::Suppress
         } else if force_files && exclusive_applies {
             self.fish_force_files = true;
-            self.path_completion = self.path_completion.merge(PathCompletion::Files);
             FishPathEffect::ForceFiles
         } else {
             FishPathEffect::None
         };
+        if self.fish_registration_effects.len() >= MAX_FISH_REGISTRATION_EFFECTS {
+            return Err(VmError::Limit("Fish registration state"));
+        }
+        let registration_bytes = std::mem::size_of::<FishRegistrationEffect>()
+            .saturating_add(
+                matching_commands
+                    .capacity()
+                    .saturating_mul(2 * std::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                selectors
+                    .capacity()
+                    .saturating_mul(2 * std::mem::size_of::<Arc<str>>()),
+            )
+            .saturating_add(
+                selectors
+                    .iter()
+                    .map(|selector| selector.len())
+                    .sum::<usize>(),
+            );
+        self.output_work_bytes = self.output_work_bytes.saturating_add(registration_bytes);
+        if self.output_work_bytes > MAX_COMMAND_OUTPUT_WORK_BYTES {
+            return Err(VmError::Limit("Fish registration state"));
+        }
         self.fish_registration_effects.push(FishRegistrationEffect {
             group: self.fish_group,
+            commands: matching_commands,
             selectors,
+            erased_selectors: HashMap::new(),
             path: path_effect,
+            path_selector: (!matches!(path_effect, FishPathEffect::None))
+                .then(|| active_option_selector.clone())
+                .flatten(),
         });
         if !emit_candidates {
             return Ok(CommandResult::success());
@@ -6308,12 +7282,14 @@ impl<'a> Machine<'a> {
                 } else {
                     option_append
                 };
-                self.emit_with_order(
+                let selector = Arc::<str>::from(insertion.as_str());
+                self.emit_with_selector(
                     insertion,
                     description.clone(),
                     RuleCandidateKind::Option,
                     append,
                     false,
+                    Some(selector),
                 );
             }
             for value in long {
@@ -6325,20 +7301,23 @@ impl<'a> Machine<'a> {
                     } else {
                         option_append
                     };
-                    self.emit_with_order(
+                    let selector = Arc::<str>::from(insertion.as_str());
+                    self.emit_with_selector(
                         insertion,
                         description.clone(),
                         RuleCandidateKind::Option,
                         append,
                         false,
+                        Some(Arc::clone(&selector)),
                     );
                     if has_argument_expression && !requires_parameter && !value.ends_with('=') {
-                        self.emit_with_order(
+                        self.emit_with_selector(
                             value_prefix,
                             description.clone(),
                             RuleCandidateKind::Option,
                             AppendPolicy::NoSpace,
                             false,
+                            Some(selector),
                         );
                     }
                 }
@@ -6350,12 +7329,14 @@ impl<'a> Machine<'a> {
                 } else {
                     option_append
                 };
-                self.emit_with_order(
+                let selector = Arc::<str>::from(insertion.as_str());
+                self.emit_with_selector(
                     insertion,
                     description.clone(),
                     RuleCandidateKind::Option,
                     append,
                     false,
+                    Some(selector),
                 );
             }
         }
@@ -6382,12 +7363,13 @@ impl<'a> Machine<'a> {
                 } else {
                     AppendPolicy::Space
                 };
-                self.emit_with_order(
+                self.emit_with_selector(
                     insertion,
                     item_description.or_else(|| description.clone()),
                     kind,
                     append,
                     keep_order,
+                    active_option_selector.clone(),
                 );
             }
         }
@@ -6402,8 +7384,11 @@ impl<'a> Machine<'a> {
             let mut expanded = Vec::new();
             let mut changed = false;
             for value in values {
-                let Some(deferred) = self.deferred_completion_words.get(value.as_str()).cloned()
-                else {
+                let deferred = self
+                    .deferred_completion_words()
+                    .get(value.as_str())
+                    .copied();
+                let Some(deferred) = deferred else {
                     expanded.push(value);
                     continue;
                 };
@@ -6873,8 +7858,8 @@ impl<'a> Machine<'a> {
             self.set_values("context", vec![description.to_owned()], false);
             return Ok(CommandResult::status(1));
         }
-        if let Some(deferred) = self
-            .deferred_completion_words
+        let deferred_statements = self
+            .deferred_completion_words()
             .iter()
             .filter(|(source, deferred)| {
                 !deferred.statements.is_empty() && deferred_source_matches(source, action)
@@ -6882,8 +7867,8 @@ impl<'a> Machine<'a> {
             .min_by(|(left, _), (right, _)| {
                 left.len().cmp(&right.len()).then_with(|| left.cmp(right))
             })
-            .map(|(_, deferred)| *deferred)
-        {
+            .map(|(_, deferred)| *deferred);
+        if let Some(deferred) = deferred_statements {
             return self.exec_statements(deferred.statements);
         }
         if action.starts_with('(') && action.ends_with(')') {
@@ -6892,7 +7877,7 @@ impl<'a> Machine<'a> {
                 body = &body[1..body.len() - 1];
             }
             let deferred_words = self
-                .deferred_completion_words
+                .deferred_completion_words()
                 .iter()
                 .filter(|(source, deferred)| {
                     !deferred.words.is_empty() && deferred_source_matches(source, action)
@@ -7751,12 +8736,12 @@ impl<'a> Machine<'a> {
                     continue;
                 }
                 for setup in first_action.setups {
-                    if let Some(deferred) = self
-                        .deferred_completion_words
+                    let deferred = self
+                        .deferred_completion_words()
                         .get(setup.as_str())
                         .filter(|deferred| !deferred.statements.is_empty())
-                        .cloned()
-                    {
+                        .copied();
+                    if let Some(deferred) = deferred {
                         self.exec_statements(deferred.statements)?;
                     }
                 }
@@ -7786,7 +8771,7 @@ impl<'a> Machine<'a> {
                         .is_some_and(|pattern| matches!(pattern.as_str(), "/[]/" | "//"))
                 {
                     let mut deferred = self
-                        .deferred_completion_words
+                        .deferred_completion_words()
                         .iter()
                         .filter_map(|(source, deferred)| {
                             (!deferred.statements.is_empty())
@@ -8646,19 +9631,34 @@ impl<'a> Machine<'a> {
         if forbidden_executable(name) || self.probes.len() >= MAX_PROBE_REQUESTS {
             return Ok(CommandResult::status(126));
         }
-        let mut environment = self
+        let argument_bytes = arguments
+            .iter()
+            .map(String::len)
+            .fold(0_usize, usize::saturating_add);
+        if arguments.len() > MAX_PROBE_ARGUMENTS || argument_bytes > MAX_PROBE_ARGUMENT_BYTES {
+            return Ok(CommandResult::status(126));
+        }
+        let mut environment = Vec::new();
+        let mut environment_bytes = 0_usize;
+        for (name, variable) in self
             .variables
             .iter()
             .filter(|(_, variable)| variable.exported)
-            .filter_map(|(name, variable)| {
-                variable
-                    .values
-                    .first()
-                    .map(|value| (name.clone(), value.clone()))
-            })
-            .collect::<Vec<_>>();
+        {
+            let Some(value) = variable.values.first() else {
+                continue;
+            };
+            environment_bytes = environment_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
+            if environment.len() >= MAX_PROBE_ENVIRONMENT
+                || environment_bytes > MAX_PROBE_ENVIRONMENT_BYTES
+            {
+                return Ok(CommandResult::status(126));
+            }
+            environment.push((name.clone(), value.clone()));
+        }
         environment.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        environment.truncate(256);
         let key = ProbeKey {
             executable: name.to_owned(),
             arguments: arguments.to_vec(),
@@ -8746,6 +9746,18 @@ impl<'a> Machine<'a> {
         append: AppendPolicy,
         preserve_order: bool,
     ) {
+        self.emit_with_selector(value, description, kind, append, preserve_order, None);
+    }
+
+    fn emit_with_selector(
+        &mut self,
+        value: String,
+        description: Option<String>,
+        kind: RuleCandidateKind,
+        append: AppendPolicy,
+        preserve_order: bool,
+        fish_selector: Option<Arc<str>>,
+    ) {
         if self.initializing
             || value.is_empty()
             || value.chars().any(char::is_control)
@@ -8820,7 +9832,15 @@ impl<'a> Machine<'a> {
             }
             return;
         }
-        if self.candidates.len() >= self.candidate_limit {
+        let retention_limit = if self.module.dialect == ScriptDialect::Fish {
+            // Fish erases registration contributions after they are added.
+            // Retain all contributions under the absolute VM bound and apply
+            // the caller's presentation limit only after erasure/deduplication.
+            MAX_EMITTED_CANDIDATES
+        } else {
+            self.candidate_limit
+        };
+        if self.candidates.len() >= retention_limit {
             if deduplicate {
                 self.emitted_values.remove(&value);
             }
@@ -8840,7 +9860,9 @@ impl<'a> Machine<'a> {
                 source: self.source,
             },
             fish_group: self.fish_group,
+            fish_effect_group: self.fish_group,
             fish_item,
+            fish_selector,
             provisional,
         });
     }
@@ -9045,11 +10067,48 @@ fn fish_word_may_erase_completions(word: &ScriptWord) -> bool {
 }
 
 fn fish_complete_command_may_erase(command: &ScriptCommand) -> bool {
-    if command.words.first().and_then(ScriptWord::as_plain_literal) != Some("complete") {
+    fish_complete_words_may_erase(&command.words)
+}
+
+fn fish_complete_words_may_erase(words: &[ScriptWord]) -> bool {
+    let Some(dispatch) = words.first() else {
         return false;
-    }
+    };
+    let Some(dispatch) = dispatch.as_plain_literal() else {
+        // Runtime command-name expansion can resolve to `complete`.
+        return true;
+    };
+    let arguments = match dispatch {
+        "complete" => &words[1..],
+        "not" | "!" | "and" | "or" => return fish_complete_words_may_erase(&words[1..]),
+        "builtin" => {
+            let mut dispatch_index = 1;
+            while let Some(word) = words.get(dispatch_index) {
+                let Some(argument) = word.as_plain_literal() else {
+                    // A dynamic builtin option or target can expand to
+                    // `complete`; provenance must remain conservative.
+                    return true;
+                };
+                if !argument.starts_with('-') {
+                    break;
+                }
+                dispatch_index = dispatch_index.saturating_add(1);
+            }
+            let Some(dispatch) = words
+                .get(dispatch_index)
+                .and_then(ScriptWord::as_plain_literal)
+            else {
+                return false;
+            };
+            if dispatch != "complete" {
+                return false;
+            }
+            &words[dispatch_index + 1..]
+        }
+        _ => return false,
+    };
     let mut consumes_next = false;
-    for word in command.words.iter().skip(1) {
+    for word in arguments {
         if consumes_next {
             consumes_next = false;
             continue;
@@ -9204,6 +10263,187 @@ fn collect_statement_functions<'a>(
     }
 }
 
+fn collect_fish_condition_aliases(
+    module: &ScriptModule,
+) -> HashMap<DeferredConditionKey, DeferredConditionKey> {
+    let mut conditions = Vec::new();
+    collect_fish_conditions(&module.statements, &mut conditions);
+    for function in &module.functions {
+        collect_fish_conditions(&function.body, &mut conditions);
+        if conditions.len() >= MAX_FISH_CONDITION_ALIASES {
+            break;
+        }
+    }
+
+    let mut aliases = HashMap::with_capacity(conditions.len());
+    let mut canonical = HashMap::<&str, Vec<(&[ScriptStatement], DeferredConditionKey)>>::new();
+    let mut comparisons = 0_usize;
+    for (source, statements) in conditions {
+        let identity = DeferredConditionKey::new(source, statements);
+        let entries = canonical.entry(source).or_default();
+        let equivalent = if comparisons < MAX_FISH_CONDITION_ALIAS_COMPARISONS {
+            entries.iter().find_map(|(known, key)| {
+                comparisons = comparisons.saturating_add(1);
+                (known == &statements).then_some(*key)
+            })
+        } else {
+            None
+        };
+        let key = equivalent.unwrap_or_else(|| {
+            entries.push((statements, identity));
+            identity
+        });
+        aliases.insert(identity, key);
+    }
+    aliases
+}
+
+fn collect_fish_conditions<'a>(
+    statements: &'a [ScriptStatement],
+    conditions: &mut Vec<(&'a str, &'a [ScriptStatement])>,
+) {
+    if conditions.len() >= MAX_FISH_CONDITION_ALIASES {
+        return;
+    }
+    for statement in statements {
+        if conditions.len() >= MAX_FISH_CONDITION_ALIASES {
+            return;
+        }
+        match statement {
+            ScriptStatement::Command { command } => {
+                for index in 1..command.words.len().saturating_sub(1) {
+                    if !matches!(
+                        command.words[index].as_plain_literal(),
+                        Some("-n" | "--condition")
+                    ) {
+                        continue;
+                    }
+                    if let [
+                        ScriptWordPart::DeferredScript {
+                            source, statements, ..
+                        },
+                    ] = command.words[index + 1].parts.as_slice()
+                    {
+                        conditions.push((source, statements));
+                        if conditions.len() >= MAX_FISH_CONDITION_ALIASES {
+                            return;
+                        }
+                    }
+                }
+                for assignment in &command.assignments {
+                    if let Some(index) = &assignment.index {
+                        collect_fish_condition_word(index, conditions);
+                    }
+                    collect_fish_condition_word(&assignment.value, conditions);
+                }
+                for word in &command.words {
+                    collect_fish_condition_word(word, conditions);
+                }
+                for redirection in &command.redirections {
+                    collect_fish_condition_word(&redirection.target, conditions);
+                }
+            }
+            ScriptStatement::Pipeline { commands, .. } => {
+                collect_fish_conditions(commands, conditions);
+            }
+            ScriptStatement::AndOr { first, rest } => {
+                collect_fish_conditions(std::slice::from_ref(first), conditions);
+                for arm in rest {
+                    collect_fish_conditions(std::slice::from_ref(&arm.statement), conditions);
+                }
+            }
+            ScriptStatement::If {
+                branches,
+                otherwise,
+            } => {
+                for branch in branches {
+                    collect_fish_conditions(&branch.condition, conditions);
+                    collect_fish_conditions(&branch.body, conditions);
+                }
+                collect_fish_conditions(otherwise, conditions);
+            }
+            ScriptStatement::While {
+                condition, body, ..
+            } => {
+                collect_fish_conditions(condition, conditions);
+                collect_fish_conditions(body, conditions);
+            }
+            ScriptStatement::For { words, body, .. } => {
+                for word in words {
+                    collect_fish_condition_word(word, conditions);
+                }
+                collect_fish_conditions(body, conditions);
+            }
+            ScriptStatement::Case { word, arms } => {
+                collect_fish_condition_word(word, conditions);
+                for arm in arms {
+                    for pattern in &arm.patterns {
+                        collect_fish_condition_word(pattern, conditions);
+                    }
+                    collect_fish_conditions(&arm.body, conditions);
+                }
+            }
+            ScriptStatement::Function { function } => {
+                for argument in &function.arguments {
+                    collect_fish_condition_word(argument, conditions);
+                }
+                collect_fish_conditions(&function.body, conditions);
+            }
+            ScriptStatement::Group { body, .. } => collect_fish_conditions(body, conditions),
+            ScriptStatement::Return { status } => {
+                if let Some(status) = status {
+                    collect_fish_condition_word(status, conditions);
+                }
+            }
+            ScriptStatement::Redirected {
+                statement,
+                redirections,
+            } => {
+                collect_fish_conditions(std::slice::from_ref(statement), conditions);
+                for redirection in redirections {
+                    collect_fish_condition_word(&redirection.target, conditions);
+                }
+            }
+            ScriptStatement::Break | ScriptStatement::Continue | ScriptStatement::Noop => {}
+        }
+    }
+}
+
+fn collect_fish_condition_word<'a>(
+    word: &'a ScriptWord,
+    conditions: &mut Vec<(&'a str, &'a [ScriptStatement])>,
+) {
+    if conditions.len() >= MAX_FISH_CONDITION_ALIASES {
+        return;
+    }
+    for part in &word.parts {
+        match part {
+            ScriptWordPart::DeferredScript {
+                statements, words, ..
+            } => {
+                collect_fish_conditions(statements, conditions);
+                for word in words {
+                    collect_fish_condition_word(word, conditions);
+                }
+            }
+            ScriptWordPart::CommandSubstitution { statements, .. } => {
+                collect_fish_conditions(statements, conditions);
+            }
+            ScriptWordPart::BraceExpansion { alternatives, .. }
+            | ScriptWordPart::Array {
+                elements: alternatives,
+            } => {
+                for word in alternatives {
+                    collect_fish_condition_word(word, conditions);
+                }
+            }
+            ScriptWordPart::Literal { .. }
+            | ScriptWordPart::Parameter { .. }
+            | ScriptWordPart::Arithmetic { .. } => {}
+        }
+    }
+}
+
 fn collect_deferred_completion_words<'a>(
     statements: &'a [ScriptStatement],
     deferred: &mut HashMap<&'a str, DeferredCompletion<'a>>,
@@ -9352,25 +10592,6 @@ fn fish_function_argument_names(arguments: &[ScriptWord]) -> Vec<String> {
         }
     }
     names
-}
-
-fn save_positional(variables: &HashMap<String, Variable>) -> HashMap<String, Variable> {
-    variables
-        .iter()
-        .filter(|(name, _)| {
-            matches!(name.as_str(), "@" | "*" | "argv")
-                || name.bytes().all(|byte| byte.is_ascii_digit())
-        })
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
-
-fn restore_positional(variables: &mut HashMap<String, Variable>, saved: HashMap<String, Variable>) {
-    variables.retain(|name, _| {
-        !matches!(name.as_str(), "@" | "*" | "argv")
-            && !name.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    variables.extend(saved);
 }
 
 fn split_variable_subscript(reference: &str) -> (&str, Option<&str>) {
@@ -10284,6 +11505,55 @@ fn fish_complete_request_line(arguments: &[String], context_words: &[String]) ->
     None
 }
 
+fn fish_complete_long_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--arguments"
+            | "--command"
+            | "--path"
+            | "--short-option"
+            | "--long-option"
+            | "--old-option"
+            | "--description"
+            | "--condition"
+            | "--wraps"
+            | "--color"
+    )
+}
+
+fn fish_complete_arguments_are_normalized(arguments: &[String]) -> bool {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if !argument.starts_with('-') || argument == "-" {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with("--") {
+            if argument
+                .split_once('=')
+                .is_some_and(|(option, _)| fish_complete_long_option_takes_value(option))
+            {
+                return false;
+            }
+            let takes_next = fish_complete_long_option_takes_value(argument);
+            index += 1 + usize::from(takes_next && index + 1 < arguments.len());
+            continue;
+        }
+        if argument.len() != 2 {
+            return false;
+        }
+        let takes_next = argument.chars().nth(1).is_some_and(|character| {
+            matches!(
+                character,
+                'c' | 'p' | 's' | 'l' | 'o' | 'a' | 'd' | 'n' | 'w'
+            )
+        });
+        index += 1 + usize::from(takes_next && index + 1 < arguments.len());
+    }
+    true
+}
+
 fn normalize_fish_complete_arguments(arguments: &[String]) -> Vec<String> {
     let mut normalized = Vec::with_capacity(arguments.len());
     let mut index = 0;
@@ -10295,21 +11565,17 @@ fn normalize_fish_complete_arguments(arguments: &[String]) -> Vec<String> {
             continue;
         }
         if argument.starts_with("--") {
+            if let Some((option, value)) = argument
+                .split_once('=')
+                .filter(|(option, _)| fish_complete_long_option_takes_value(option))
+            {
+                normalized.push(option.to_owned());
+                normalized.push(value.to_owned());
+                index += 1;
+                continue;
+            }
             normalized.push(argument.clone());
-            let takes_next = !argument.contains('=')
-                && matches!(
-                    argument.as_str(),
-                    "--arguments"
-                        | "--command"
-                        | "--path"
-                        | "--short-option"
-                        | "--long-option"
-                        | "--old-option"
-                        | "--description"
-                        | "--condition"
-                        | "--wraps"
-                        | "--color"
-                );
+            let takes_next = fish_complete_long_option_takes_value(argument);
             if takes_next {
                 if let Some(value) = arguments.get(index + 1) {
                     normalized.push(value.clone());
@@ -10423,9 +11689,9 @@ fn word_allows_pathname_expansion(word: &ScriptWord, dialect: ScriptDialect) -> 
 }
 
 fn has_shell_glob(dialect: ScriptDialect, value: &str) -> bool {
-    let characters = value.char_indices().collect::<Vec<_>>();
+    let mut characters = value.chars();
     let mut escaped = false;
-    for (position, (_, character)) in characters.iter().copied().enumerate() {
+    while let Some(character) = characters.next() {
         if escaped {
             escaped = false;
         } else if character == '\\' {
@@ -10433,17 +11699,18 @@ fn has_shell_glob(dialect: ScriptDialect, value: &str) -> bool {
         } else if character == '*' || dialect != ScriptDialect::Fish && character == '?' {
             return true;
         } else if dialect != ScriptDialect::Fish && character == '[' {
+            let mut remainder = characters.clone();
             let mut class_escaped = false;
-            if characters[position + 1..].iter().any(|(_, candidate)| {
+            if remainder.any(|candidate| {
                 if class_escaped {
                     class_escaped = false;
                     return false;
                 }
-                if *candidate == '\\' {
+                if candidate == '\\' {
                     class_escaped = true;
                     return false;
                 }
-                *candidate == ']'
+                candidate == ']'
             }) {
                 return true;
             }
@@ -10468,6 +11735,68 @@ fn fish_completion_has_glob(value: &str) -> bool {
 
 fn fish_file_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+
+    if left.is_ascii() && right.is_ascii() {
+        let (left_bytes, right_bytes) = (left.as_bytes(), right.as_bytes());
+        let (mut left_index, mut right_index) = (0, 0);
+        while left_index < left_bytes.len() && right_index < right_bytes.len() {
+            let (left_byte, right_byte) = (left_bytes[left_index], right_bytes[right_index]);
+            if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+                let left_end = left_index
+                    + left_bytes[left_index..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_digit())
+                        .count();
+                let right_end = right_index
+                    + right_bytes[right_index..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_digit())
+                        .count();
+                let left_digits = &left_bytes[left_index..left_end];
+                let right_digits = &right_bytes[right_index..right_end];
+                let left_significant = left_digits
+                    .iter()
+                    .position(|byte| *byte != b'0')
+                    .unwrap_or(left_digits.len());
+                let right_significant = right_digits
+                    .iter()
+                    .position(|byte| *byte != b'0')
+                    .unwrap_or(right_digits.len());
+                let ordering = left_digits[left_significant..]
+                    .len()
+                    .cmp(&right_digits[right_significant..].len())
+                    .then_with(|| {
+                        left_digits[left_significant..].cmp(&right_digits[right_significant..])
+                    });
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+                left_index = left_end;
+                right_index = right_end;
+                continue;
+            }
+            if left_byte == right_byte {
+                left_index += 1;
+                right_index += 1;
+                continue;
+            }
+            let transform = |byte: u8| match byte {
+                b'-' => b'[',
+                b'/' => 0,
+                other => other.to_ascii_uppercase(),
+            };
+            let ordering = transform(left_byte).cmp(&transform(right_byte));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            left_index += 1;
+            right_index += 1;
+        }
+        return left_bytes
+            .len()
+            .cmp(&right_bytes.len())
+            .then_with(|| left.cmp(right));
+    }
 
     let left_chars = left.chars().collect::<Vec<_>>();
     let right_chars = right.chars().collect::<Vec<_>>();
@@ -10584,14 +11913,94 @@ fn word_has_unquoted_path_glob(word: &ScriptWord, dialect: ScriptDialect) -> boo
     })
 }
 
-fn split_fish_completion_words(value: &str) -> Vec<String> {
+fn extend_bounded_fish_values(
+    values: &mut Vec<String>,
+    value_bytes: &mut usize,
+    additions: impl IntoIterator<Item = String>,
+) -> Result<(), VmError> {
+    for value in additions {
+        let next_bytes = value_bytes.saturating_add(value.len());
+        if values.len() >= MAX_VALUES || next_bytes > MAX_VALUE_BYTES {
+            return Err(VmError::Limit("Fish completion values"));
+        }
+        *value_bytes = next_bytes;
+        values.push(value);
+    }
+    Ok(())
+}
+
+fn split_shell_fields_bounded(value: &str, separators: &str) -> Result<Vec<String>, VmError> {
+    let mut words = Vec::new();
+    let mut bytes = 0_usize;
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    let push = |words: &mut Vec<String>, bytes: &mut usize, word: String| {
+        let next_bytes = bytes.saturating_add(word.len());
+        if words.len() >= MAX_VALUES || next_bytes > MAX_VALUE_BYTES {
+            return Err(VmError::Limit("Fish completion values"));
+        }
+        *bytes = next_bytes;
+        words.push(word);
+        Ok(())
+    };
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            started = true;
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            started = true;
+        } else if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            started = true;
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            started = true;
+        } else if separators.contains(character) {
+            if started {
+                push(&mut words, &mut bytes, std::mem::take(&mut current))?;
+                started = false;
+            }
+        } else {
+            current.push(character);
+            started = true;
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if started || !current.is_empty() {
+        push(&mut words, &mut bytes, current)?;
+    }
+    Ok(words)
+}
+
+fn split_fish_completion_words(value: &str) -> Result<Vec<String>, VmError> {
     const DESCRIPTION_SEPARATOR: char = '\u{1f}';
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(VmError::Limit("Fish completion values"));
+    }
     let encoded = value.replace("\\t", &DESCRIPTION_SEPARATOR.to_string());
-    split_shell_words(&encoded)
-        .into_iter()
-        .flat_map(|word| expand_braces(&word))
-        .map(|word| word.replace(DESCRIPTION_SEPARATOR, "\t"))
-        .collect()
+    let words = split_shell_fields_bounded(&encoded, " \t\n")?;
+    let mut output = Vec::new();
+    let mut output_bytes = 0_usize;
+    for word in words {
+        extend_bounded_fish_values(
+            &mut output,
+            &mut output_bytes,
+            expand_braces(&word)
+                .into_iter()
+                .map(|word| word.replace(DESCRIPTION_SEPARATOR, "\t")),
+        )?;
+    }
+    Ok(output)
 }
 
 fn split_shell_fields(value: &str, separators: &str) -> Vec<String> {
@@ -11355,6 +12764,208 @@ fn expand_braces(value: &str) -> Vec<String> {
     expand_braces_at_depth(value, 0)
 }
 
+fn expand_braces_bounded(
+    value: &str,
+    max_values: usize,
+    max_bytes: usize,
+) -> Result<Vec<String>, VmError> {
+    let mut output = Vec::new();
+    let mut output_bytes = 0_usize;
+    expand_braces_bounded_at_depth(
+        value,
+        0,
+        max_values,
+        max_bytes,
+        &mut output,
+        &mut output_bytes,
+    )?;
+    Ok(output)
+}
+
+fn push_bounded_brace_value(
+    value: &str,
+    max_values: usize,
+    max_bytes: usize,
+    output: &mut Vec<String>,
+    output_bytes: &mut usize,
+) -> Result<(), VmError> {
+    if output.len() >= max_values
+        || output_bytes
+            .checked_add(value.len())
+            .is_none_or(|bytes| bytes > max_bytes)
+    {
+        return Err(VmError::Limit("expanded shell values"));
+    }
+    *output_bytes += value.len();
+    output.push(value.to_owned());
+    Ok(())
+}
+
+fn has_top_level_delimiter(value: &str, delimiter: char) -> bool {
+    let mut depth = 0_i32;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if character == delimiter && depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_bounded_brace_branch(
+    value: &str,
+    open: usize,
+    close: usize,
+    alternative: &str,
+    depth: usize,
+    max_values: usize,
+    max_bytes: usize,
+    output: &mut Vec<String>,
+    output_bytes: &mut usize,
+) -> Result<(), VmError> {
+    let length = value[..open]
+        .len()
+        .checked_add(alternative.len())
+        .and_then(|length| length.checked_add(value[close + 1..].len()))
+        .ok_or(VmError::Limit("expanded shell value"))?;
+    if length > MAX_VALUE_BYTES {
+        return Err(VmError::Limit("expanded shell value"));
+    }
+    let mut branch = String::with_capacity(length);
+    branch.push_str(&value[..open]);
+    branch.push_str(alternative);
+    branch.push_str(&value[close + 1..]);
+    expand_braces_bounded_at_depth(
+        &branch,
+        depth + 1,
+        max_values,
+        max_bytes,
+        output,
+        output_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_braces_bounded_at_depth(
+    value: &str,
+    depth: usize,
+    max_values: usize,
+    max_bytes: usize,
+    output: &mut Vec<String>,
+    output_bytes: &mut usize,
+) -> Result<(), VmError> {
+    if depth >= MAX_PATTERN_RECURSION || value.len() > MAX_VALUE_BYTES {
+        return Ok(());
+    }
+    let Some(open) = value.find('{') else {
+        return push_bounded_brace_value(value, max_values, max_bytes, output, output_bytes);
+    };
+    let Some(relative_close) = matching_ascii(&value[open..], '{', '}') else {
+        return push_bounded_brace_value(value, max_values, max_bytes, output, output_bytes);
+    };
+    let close = open + relative_close;
+    let body = &value[open + 1..close];
+    if let Some((start, end)) = body.split_once("..") {
+        if let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) {
+            if start.abs_diff(end) <= 4096 {
+                if start == end {
+                    return push_bounded_brace_value(
+                        value,
+                        max_values,
+                        max_bytes,
+                        output,
+                        output_bytes,
+                    );
+                }
+                if start <= end {
+                    for alternative in start..=end {
+                        let alternative = alternative.to_string();
+                        expand_bounded_brace_branch(
+                            value,
+                            open,
+                            close,
+                            &alternative,
+                            depth,
+                            max_values,
+                            max_bytes,
+                            output,
+                            output_bytes,
+                        )?;
+                    }
+                } else {
+                    for alternative in (end..=start).rev() {
+                        let alternative = alternative.to_string();
+                        expand_bounded_brace_branch(
+                            value,
+                            open,
+                            close,
+                            &alternative,
+                            depth,
+                            max_values,
+                            max_bytes,
+                            output,
+                            output_bytes,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    if !has_top_level_delimiter(body, ',') {
+        return push_bounded_brace_value(value, max_values, max_bytes, output, output_bytes);
+    }
+    let mut nested = 0_i32;
+    let mut escaped = false;
+    let mut start = 0_usize;
+    for (index, character) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '(' | '[' | '{' => nested += 1,
+            ')' | ']' | '}' => nested = nested.saturating_sub(1),
+            ',' if nested == 0 => {
+                expand_bounded_brace_branch(
+                    value,
+                    open,
+                    close,
+                    &body[start..index],
+                    depth,
+                    max_values,
+                    max_bytes,
+                    output,
+                    output_bytes,
+                )?;
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    expand_bounded_brace_branch(
+        value,
+        open,
+        close,
+        &body[start..],
+        depth,
+        max_values,
+        max_bytes,
+        output,
+        output_bytes,
+    )
+}
+
 fn expand_braces_at_depth(value: &str, depth: usize) -> Vec<String> {
     if depth >= MAX_PATTERN_RECURSION || value.len() > MAX_VALUE_BYTES {
         return Vec::new();
@@ -11369,7 +12980,7 @@ fn expand_braces_at_depth(value: &str, depth: usize) -> Vec<String> {
     let body = &value[open + 1..close];
     let alternatives = if let Some((start, end)) = body.split_once("..") {
         match (start.parse::<i64>(), end.parse::<i64>()) {
-            (Ok(start), Ok(end)) if (start - end).unsigned_abs() <= 4096 => {
+            (Ok(start), Ok(end)) if start.abs_diff(end) <= 4096 => {
                 if start <= end {
                     (start..=end)
                         .map(|value| value.to_string())
@@ -11811,7 +13422,29 @@ fn shell_pattern(pattern: &str, value: &str) -> bool {
     if !regex_input_is_bounded(value) || pattern.len() > MAX_VALUE_BYTES {
         return false;
     }
-    let pattern = pattern.trim_matches(|character| matches!(character, '\'' | '"'));
+    // The overwhelmingly common shell-pattern operation is exact comparison
+    // (for example, testing a command line against many declarative Fish
+    // registrations). Do not construct a regex automaton for a literal.
+    let has_pattern_syntax = pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'*' | b'?' | b'[' | b'|'))
+        || pattern
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, [b'+' | b'@' | b'!', b'(']));
+    if !has_pattern_syntax {
+        return pattern == value;
+    }
+    let has_extended_syntax = pattern.contains('|')
+        || pattern.contains("[[:")
+        || pattern.contains("]#")
+        || pattern
+            .as_bytes()
+            .windows(2)
+            .any(|pair| matches!(pair, [b'?' | b'*' | b'+' | b'@' | b'!', b'(']));
+    if !has_extended_syntax && pattern.is_ascii() && value.is_ascii() {
+        return wildcard_match(pattern.as_bytes(), value.as_bytes());
+    }
     if let Some(expression) = shell_pattern_regex(pattern) {
         if let Some(expression) = bounded_regex(&format!("^(?:{expression})$"), false) {
             return expression.is_match(value);
@@ -12345,8 +13978,9 @@ fn zsh_compadd_option_taking_next(value: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arithmetic, bounded_fish_regex, bounded_regex, expand_braces, shell_pattern_dialect,
-        shell_vm_primitive, zsh_hash_scan_indices, zsh_regex_first_actions,
+        Arithmetic, MAX_VALUES, bounded_fish_regex, bounded_regex, expand_braces,
+        shell_pattern_dialect, shell_vm_primitive, split_fish_completion_words,
+        zsh_hash_scan_indices, zsh_regex_first_actions,
     };
     use crate::rules::script::ScriptDialect;
     use std::collections::HashMap;
@@ -12370,6 +14004,25 @@ mod tests {
             ScriptDialect::Zsh,
             "alpha|beta|gamma",
             "delta",
+        ));
+    }
+
+    #[test]
+    fn runtime_patterns_preserve_literal_quote_characters() {
+        assert!(shell_pattern_dialect(
+            ScriptDialect::Fish,
+            "\"quoted\"",
+            "\"quoted\"",
+        ));
+        assert!(!shell_pattern_dialect(
+            ScriptDialect::Fish,
+            "\"quoted\"",
+            "quoted",
+        ));
+        assert!(shell_pattern_dialect(
+            ScriptDialect::Bash,
+            "'quoted'",
+            "'quoted'",
         ));
     }
 
@@ -12423,6 +14076,20 @@ mod tests {
             zsh_hash_scan_indices(survivors, 7, 28),
             "a removed function must not shrink away native resize history"
         );
+    }
+
+    #[test]
+    fn extreme_numeric_brace_ranges_do_not_overflow() {
+        assert_eq!(
+            expand_braces("{-9223372036854775808..9223372036854775807}"),
+            ["{-9223372036854775808..9223372036854775807}"]
+        );
+    }
+
+    #[test]
+    fn fish_completion_word_splitting_is_bounded_before_collection() {
+        let value = "x ".repeat(MAX_VALUES + 1);
+        assert!(split_fish_completion_words(&value).is_err());
     }
 
     #[test]

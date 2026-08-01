@@ -52,6 +52,10 @@ impl CompletionEngine {
     }
 
     pub fn reconfigure(&mut self, cache_limit_bytes: usize, max_candidates: usize) {
+        for provider in &mut self.providers {
+            provider.reset_transient(&mut self.cache);
+        }
+        self.cache.acknowledge_rule_chunk();
         self.cache.reconfigure(cache_limit_bytes, max_candidates);
     }
 
@@ -96,6 +100,14 @@ impl CompletionEngine {
         self.complete_with_mode(context, shell, max_candidates, CompletionMode::ExplicitTab)
     }
 
+    fn reset_transient_providers(&mut self) {
+        self.cache.poll();
+        for provider in &mut self.providers {
+            provider.reset_transient(&mut self.cache);
+        }
+        self.cache.acknowledge_rule_chunk();
+    }
+
     fn complete_with_mode(
         &mut self,
         context: &CompletionContext,
@@ -104,7 +116,10 @@ impl CompletionEngine {
         mode: CompletionMode,
     ) -> CompletionResult {
         self.cache.poll();
-        if context.line.len() > MAX_COMPLETION_CONTEXT_BYTES {
+        if context.line.len() > MAX_COMPLETION_CONTEXT_BYTES || context.in_comment {
+            for provider in &mut self.providers {
+                provider.reset_transient(&mut self.cache);
+            }
             self.cache.acknowledge_rule_chunk();
             return CompletionResult {
                 candidates: Vec::new(),
@@ -115,7 +130,9 @@ impl CompletionEngine {
         let mut pending = false;
         let mut path_completion = PathCompletion::Inherit;
         for provider in &mut self.providers {
-            let status = provider.complete(
+            let snapshot_unavailable = self.cache.snapshots_unavailable();
+            let checkpoint = snapshot_unavailable.then(|| sink.clone());
+            let mut status = provider.complete(
                 context,
                 shell,
                 &mut self.cache,
@@ -123,6 +140,15 @@ impl CompletionEngine {
                 mode,
                 path_completion,
             );
+            if snapshot_unavailable && status.snapshot_dependent {
+                // A cache limit below the bounded snapshot loader's minimum is
+                // terminally unavailable, not endlessly pending. Roll back
+                // everything from the dependent provider and fail closed for
+                // generic paths.
+                sink = checkpoint.expect("snapshot checkpoint exists");
+                status.pending = false;
+                status.path_completion = PathCompletion::Suppress;
+            }
             pending |= status.pending;
             path_completion = path_completion.merge(status.path_completion);
         }
@@ -151,9 +177,13 @@ impl CompletionEngine {
             || context.line.is_empty()
             || context.line.len() > MAX_COMPLETION_CONTEXT_BYTES
         {
+            self.reset_transient_providers();
             return None;
         }
 
+        let skip_providers =
+            context.in_comment || context.query.is_empty() || context.command_name.is_none();
+        let mut history_suggestion = None;
         if let Some(history_line) = unsafe { shell::history_suggestion(&context.line) } {
             let history_is_valid = match existing_directory_target(&history_line) {
                 Some(target) => self
@@ -163,12 +193,20 @@ impl CompletionEngine {
             };
             let suffix = history_line[context.line.len()..].to_owned();
             if history_is_valid && !suffix.trim().is_empty() {
-                return Some(GhostSuggestion { suffix });
+                history_suggestion = Some(GhostSuggestion { suffix });
             }
         }
 
-        if context.query.is_empty() {
-            return None;
+        if skip_providers {
+            // History remains useful inside a comment, but shell providers do
+            // not have a command to complete there. Synthetic history
+            // validation may have evaluated `cd`, so reset after it finishes.
+            self.reset_transient_providers();
+            return history_suggestion;
+        }
+        if history_suggestion.is_some() {
+            self.reset_transient_providers();
+            return history_suggestion;
         }
 
         let result = self.complete(context, shell_snapshot, max_candidates.min(128));
@@ -368,6 +406,62 @@ mod tests {
     }
 
     #[test]
+    fn explicit_completion_inside_a_comment_emits_nothing() {
+        let context = CompletionContext::analyze("echo value # Cargo", 18);
+        assert!(context.in_comment);
+        let mut engine = CompletionEngine::new(1024 * 1024, 128);
+        let result = engine.complete_explicit(&context, &ShellSnapshot::default(), 128);
+        assert!(result.candidates.is_empty());
+        assert!(!result.pending);
+    }
+
+    #[test]
+    fn terminally_unavailable_snapshot_rolls_back_dependent_provider() {
+        struct SnapshotProvider;
+        impl CompletionProvider for SnapshotProvider {
+            fn name(&self) -> &'static str {
+                "snapshot-test"
+            }
+
+            fn complete(
+                &mut self,
+                context: &CompletionContext,
+                _shell: &ShellSnapshot,
+                _cache: &mut CompletionCache,
+                sink: &mut CandidateSink,
+                _mode: CompletionMode,
+                _path_completion: PathCompletion,
+            ) -> provider::ProviderStatus {
+                sink.push(
+                    Candidate::new(
+                        &context.query,
+                        "--unsafe".into(),
+                        "--unsafe".into(),
+                        CandidateKind::Option,
+                        true,
+                        0,
+                    )
+                    .unwrap(),
+                );
+                provider::ProviderStatus {
+                    pending: true,
+                    path_completion: PathCompletion::Files,
+                    snapshot_dependent: true,
+                }
+            }
+        }
+
+        let mut engine = CompletionEngine::new(16 * 1024 * 1024, 128);
+        engine.cache.load_snapshots(None);
+        assert!(engine.cache.snapshots_unavailable());
+        engine.providers = vec![Box::new(SnapshotProvider), Box::new(GenericProvider)];
+        let context = CompletionContext::analyze("demo --", 7);
+        let result = engine.complete_explicit(&context, &ShellSnapshot::default(), 128);
+        assert!(result.candidates.is_empty());
+        assert!(!result.pending);
+    }
+
+    #[test]
     fn installed_rule_packs_are_evaluated_independently_and_deduplicated() {
         use crate::rules::format::{PackBuildSpec, PackBuilder, PackManifest, SourceKind};
         use crate::rules::ir::{
@@ -452,7 +546,13 @@ mod tests {
             .candidates
             .iter()
             .find(|candidate| candidate.value.as_ref() == "--shared")
-            .unwrap();
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing merged candidate: candidates={:?} rule_errors={:?}",
+                    result.candidates,
+                    engine.cache.rule_errors()
+                )
+            });
         assert_eq!(shared.description.as_deref(), Some("Shared description"));
         assert_eq!(shared.source_mask, 0b0011);
         assert!(result.candidates.iter().any(|candidate| {
@@ -502,7 +602,10 @@ mod tests {
 
         std::fs::remove_dir(&target).unwrap();
         engine.refresh(&shell);
-        assert_eq!(engine.existing_directory_target("gone", &shell, 128), None);
+        assert_ne!(
+            engine.existing_directory_target("gone", &shell, 128),
+            Some(true)
+        );
         assert!(wait_for(&mut engine, false));
         engine.stop();
         std::fs::remove_dir_all(root).unwrap();

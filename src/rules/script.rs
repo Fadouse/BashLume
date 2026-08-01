@@ -5,14 +5,18 @@
 //! The three source frontends compile shell syntax into this data model at
 //! pack-build time. The runtime never parses or sources upstream shell text.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 
 pub const MAX_SCRIPT_NODES: usize = 1_000_000;
 pub const MAX_SCRIPT_DEPTH: usize = 32;
 pub const MAX_SCRIPT_WORDS: usize = 4_000_000;
 pub const MAX_SCRIPT_STRING_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_SCRIPT_TAG_DEFERRED_FIELDS: usize = 512 * 1024;
+pub(crate) const MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCRIPT_INDIVIDUAL_STRING_BYTES: usize = 1024 * 1024;
 const MAX_REDIRECTION_DESCRIPTOR: u16 = 9;
 const MAX_REGISTRATION_BYTES: usize = 4096;
@@ -312,7 +316,7 @@ pub struct ScriptRegistration {
     pub source_order: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ScriptEntry {
     Function { name: String },
@@ -320,7 +324,7 @@ pub enum ScriptEntry {
     Module,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum ScriptStatement {
     Command {
@@ -373,6 +377,465 @@ pub enum ScriptStatement {
         statement: Box<ScriptStatement>,
         redirections: Vec<ScriptRedirection>,
     },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ScriptEntryKind {
+    Function,
+    FishComplete,
+    Module,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ScriptStatementOp {
+    Command,
+    AndOr,
+    Pipeline,
+    If,
+    While,
+    For,
+    Case,
+    Function,
+    Group,
+    Return,
+    Break,
+    Continue,
+    Noop,
+    Redirected,
+}
+
+#[derive(Default)]
+struct ScriptStatementFields {
+    command: Option<ScriptCommand>,
+    first: Option<Box<ScriptStatement>>,
+    rest: Option<Vec<ScriptAndOrArm>>,
+    commands: Option<Vec<ScriptStatement>>,
+    negated: Option<bool>,
+    branches: Option<Vec<ScriptConditionalBranch>>,
+    otherwise: Option<Vec<ScriptStatement>>,
+    condition: Option<Vec<ScriptStatement>>,
+    body: Option<Vec<ScriptStatement>>,
+    until: Option<bool>,
+    variables: Option<Vec<String>>,
+    words: Option<Vec<ScriptWord>>,
+    word: Option<ScriptWord>,
+    arms: Option<Vec<ScriptCaseArm>>,
+    function: Option<ScriptFunction>,
+    subshell: Option<bool>,
+    status: Option<Option<ScriptWord>>,
+    statement: Option<Box<ScriptStatement>>,
+    redirections: Option<Vec<ScriptRedirection>>,
+}
+
+struct ScriptFieldName<'de>(Cow<'de, str>);
+
+struct ScriptFieldNameVisitor;
+
+impl<'de> Visitor<'de> for ScriptFieldNameVisitor {
+    type Value = ScriptFieldName<'de>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a script IR field name")
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(ScriptFieldName(Cow::Borrowed(value)))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(ScriptFieldName(Cow::Owned(value.to_owned())))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(ScriptFieldName(Cow::Owned(value)))
+    }
+}
+
+impl<'de> Deserialize<'de> for ScriptFieldName<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_identifier(ScriptFieldNameVisitor)
+    }
+}
+
+fn set_deserialized_field<T, E: serde::de::Error>(
+    slot: &mut Option<T>,
+    value: T,
+    name: &'static str,
+) -> Result<(), E> {
+    if slot.is_some() {
+        return Err(E::duplicate_field(name));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn json_field<T: DeserializeOwned, E: serde::de::Error>(value: &RawValue) -> Result<T, E> {
+    serde_json::from_str(value.get()).map_err(E::custom)
+}
+
+#[derive(Default)]
+struct ScriptEntryFields {
+    name: Option<String>,
+    statement_index: Option<u32>,
+}
+
+impl ScriptEntryFields {
+    fn read_map<'de, A: MapAccess<'de>>(
+        &mut self,
+        kind: ScriptEntryKind,
+        name: &str,
+        map: &mut A,
+    ) -> Result<(), A::Error> {
+        match (kind, name) {
+            (ScriptEntryKind::Function, "name") => {
+                set_deserialized_field(&mut self.name, map.next_value()?, "name")
+            }
+            (ScriptEntryKind::FishComplete, "statement_index") => set_deserialized_field(
+                &mut self.statement_index,
+                map.next_value()?,
+                "statement_index",
+            ),
+            _ => map.next_value::<IgnoredAny>().map(|_| ()),
+        }
+    }
+
+    fn read_json<E: serde::de::Error>(
+        &mut self,
+        kind: ScriptEntryKind,
+        name: &str,
+        value: &RawValue,
+    ) -> Result<(), E> {
+        match (kind, name) {
+            (ScriptEntryKind::Function, "name") => {
+                set_deserialized_field(&mut self.name, json_field(value)?, "name")
+            }
+            (ScriptEntryKind::FishComplete, "statement_index") => set_deserialized_field(
+                &mut self.statement_index,
+                json_field(value)?,
+                "statement_index",
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn finish<E: serde::de::Error>(self, kind: ScriptEntryKind) -> Result<ScriptEntry, E> {
+        match kind {
+            ScriptEntryKind::Function => Ok(ScriptEntry::Function {
+                name: self.name.ok_or_else(|| E::missing_field("name"))?,
+            }),
+            ScriptEntryKind::FishComplete => Ok(ScriptEntry::FishComplete {
+                statement_index: self
+                    .statement_index
+                    .ok_or_else(|| E::missing_field("statement_index"))?,
+            }),
+            ScriptEntryKind::Module => Ok(ScriptEntry::Module),
+        }
+    }
+}
+
+struct ScriptEntryVisitor;
+
+impl<'de> Visitor<'de> for ScriptEntryVisitor {
+    type Value = ScriptEntry;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a tagged script entry")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut kind = None;
+        let mut fields = ScriptEntryFields::default();
+        let mut deferred = Vec::<(Cow<'de, str>, &'de RawValue)>::new();
+        let mut deferred_name_bytes = 0_usize;
+        while let Some(ScriptFieldName(name)) = map.next_key()? {
+            if name == "kind" {
+                if kind.is_some() {
+                    return Err(serde::de::Error::duplicate_field("kind"));
+                }
+                let parsed_kind = map.next_value()?;
+                kind = Some(parsed_kind);
+                for (name, value) in deferred.drain(..) {
+                    fields.read_json::<A::Error>(parsed_kind, &name, value)?;
+                }
+            } else if let Some(kind) = kind {
+                fields.read_map(kind, &name, &mut map)?;
+            } else {
+                deferred_name_bytes = deferred_name_bytes.saturating_add(name.len());
+                if deferred.len() >= MAX_SCRIPT_TAG_DEFERRED_FIELDS
+                    || deferred_name_bytes > MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES
+                {
+                    return Err(serde::de::Error::custom(
+                        "script tag appears after the bounded field limit",
+                    ));
+                }
+                deferred.push((name, map.next_value()?));
+            }
+        }
+        let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        for (name, value) in deferred {
+            fields.read_json::<A::Error>(kind, &name, value)?;
+        }
+        fields.finish(kind)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScriptEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(ScriptEntryVisitor)
+    }
+}
+
+impl ScriptStatementFields {
+    fn read_map<'de, A: MapAccess<'de>>(
+        &mut self,
+        op: ScriptStatementOp,
+        name: &str,
+        map: &mut A,
+    ) -> Result<(), A::Error> {
+        match (op, name) {
+            (ScriptStatementOp::Command, "command") => {
+                set_deserialized_field(&mut self.command, map.next_value()?, "command")
+            }
+            (ScriptStatementOp::AndOr, "first") => {
+                set_deserialized_field(&mut self.first, map.next_value()?, "first")
+            }
+            (ScriptStatementOp::AndOr, "rest") => {
+                set_deserialized_field(&mut self.rest, map.next_value()?, "rest")
+            }
+            (ScriptStatementOp::Pipeline, "commands") => {
+                set_deserialized_field(&mut self.commands, map.next_value()?, "commands")
+            }
+            (ScriptStatementOp::Pipeline, "negated") => {
+                set_deserialized_field(&mut self.negated, map.next_value()?, "negated")
+            }
+            (ScriptStatementOp::If, "branches") => {
+                set_deserialized_field(&mut self.branches, map.next_value()?, "branches")
+            }
+            (ScriptStatementOp::If, "otherwise") => {
+                set_deserialized_field(&mut self.otherwise, map.next_value()?, "otherwise")
+            }
+            (ScriptStatementOp::While, "condition") => {
+                set_deserialized_field(&mut self.condition, map.next_value()?, "condition")
+            }
+            (
+                ScriptStatementOp::While | ScriptStatementOp::For | ScriptStatementOp::Group,
+                "body",
+            ) => set_deserialized_field(&mut self.body, map.next_value()?, "body"),
+            (ScriptStatementOp::While, "until") => {
+                set_deserialized_field(&mut self.until, map.next_value()?, "until")
+            }
+            (ScriptStatementOp::For, "variables") => {
+                set_deserialized_field(&mut self.variables, map.next_value()?, "variables")
+            }
+            (ScriptStatementOp::For, "words") => {
+                set_deserialized_field(&mut self.words, map.next_value()?, "words")
+            }
+            (ScriptStatementOp::Case, "word") => {
+                set_deserialized_field(&mut self.word, map.next_value()?, "word")
+            }
+            (ScriptStatementOp::Case, "arms") => {
+                set_deserialized_field(&mut self.arms, map.next_value()?, "arms")
+            }
+            (ScriptStatementOp::Function, "function") => {
+                set_deserialized_field(&mut self.function, map.next_value()?, "function")
+            }
+            (ScriptStatementOp::Group, "subshell") => {
+                set_deserialized_field(&mut self.subshell, map.next_value()?, "subshell")
+            }
+            (ScriptStatementOp::Return, "status") => {
+                set_deserialized_field(&mut self.status, map.next_value()?, "status")
+            }
+            (ScriptStatementOp::Redirected, "statement") => {
+                set_deserialized_field(&mut self.statement, map.next_value()?, "statement")
+            }
+            (ScriptStatementOp::Redirected, "redirections") => {
+                set_deserialized_field(&mut self.redirections, map.next_value()?, "redirections")
+            }
+            _ => map.next_value::<IgnoredAny>().map(|_| ()),
+        }
+    }
+
+    fn read_json<E: serde::de::Error>(
+        &mut self,
+        op: ScriptStatementOp,
+        name: &str,
+        value: &RawValue,
+    ) -> Result<(), E> {
+        match (op, name) {
+            (ScriptStatementOp::Command, "command") => {
+                set_deserialized_field(&mut self.command, json_field(value)?, "command")
+            }
+            (ScriptStatementOp::AndOr, "first") => {
+                set_deserialized_field(&mut self.first, json_field(value)?, "first")
+            }
+            (ScriptStatementOp::AndOr, "rest") => {
+                set_deserialized_field(&mut self.rest, json_field(value)?, "rest")
+            }
+            (ScriptStatementOp::Pipeline, "commands") => {
+                set_deserialized_field(&mut self.commands, json_field(value)?, "commands")
+            }
+            (ScriptStatementOp::Pipeline, "negated") => {
+                set_deserialized_field(&mut self.negated, json_field(value)?, "negated")
+            }
+            (ScriptStatementOp::If, "branches") => {
+                set_deserialized_field(&mut self.branches, json_field(value)?, "branches")
+            }
+            (ScriptStatementOp::If, "otherwise") => {
+                set_deserialized_field(&mut self.otherwise, json_field(value)?, "otherwise")
+            }
+            (ScriptStatementOp::While, "condition") => {
+                set_deserialized_field(&mut self.condition, json_field(value)?, "condition")
+            }
+            (
+                ScriptStatementOp::While | ScriptStatementOp::For | ScriptStatementOp::Group,
+                "body",
+            ) => set_deserialized_field(&mut self.body, json_field(value)?, "body"),
+            (ScriptStatementOp::While, "until") => {
+                set_deserialized_field(&mut self.until, json_field(value)?, "until")
+            }
+            (ScriptStatementOp::For, "variables") => {
+                set_deserialized_field(&mut self.variables, json_field(value)?, "variables")
+            }
+            (ScriptStatementOp::For, "words") => {
+                set_deserialized_field(&mut self.words, json_field(value)?, "words")
+            }
+            (ScriptStatementOp::Case, "word") => {
+                set_deserialized_field(&mut self.word, json_field(value)?, "word")
+            }
+            (ScriptStatementOp::Case, "arms") => {
+                set_deserialized_field(&mut self.arms, json_field(value)?, "arms")
+            }
+            (ScriptStatementOp::Function, "function") => {
+                set_deserialized_field(&mut self.function, json_field(value)?, "function")
+            }
+            (ScriptStatementOp::Group, "subshell") => {
+                set_deserialized_field(&mut self.subshell, json_field(value)?, "subshell")
+            }
+            (ScriptStatementOp::Return, "status") => {
+                set_deserialized_field(&mut self.status, json_field(value)?, "status")
+            }
+            (ScriptStatementOp::Redirected, "statement") => {
+                set_deserialized_field(&mut self.statement, json_field(value)?, "statement")
+            }
+            (ScriptStatementOp::Redirected, "redirections") => {
+                set_deserialized_field(&mut self.redirections, json_field(value)?, "redirections")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn finish<E: serde::de::Error>(self, op: ScriptStatementOp) -> Result<ScriptStatement, E> {
+        let missing = |name| E::missing_field(name);
+        Ok(match op {
+            ScriptStatementOp::Command => ScriptStatement::Command {
+                command: self.command.ok_or_else(|| missing("command"))?,
+            },
+            ScriptStatementOp::AndOr => ScriptStatement::AndOr {
+                first: self.first.ok_or_else(|| missing("first"))?,
+                rest: compact_vec(self.rest.ok_or_else(|| missing("rest"))?),
+            },
+            ScriptStatementOp::Pipeline => ScriptStatement::Pipeline {
+                commands: compact_vec(self.commands.ok_or_else(|| missing("commands"))?),
+                negated: self.negated.unwrap_or(false),
+            },
+            ScriptStatementOp::If => ScriptStatement::If {
+                branches: compact_vec(self.branches.ok_or_else(|| missing("branches"))?),
+                otherwise: compact_vec(self.otherwise.unwrap_or_default()),
+            },
+            ScriptStatementOp::While => ScriptStatement::While {
+                condition: compact_vec(self.condition.ok_or_else(|| missing("condition"))?),
+                body: compact_vec(self.body.ok_or_else(|| missing("body"))?),
+                until: self.until.unwrap_or(false),
+            },
+            ScriptStatementOp::For => ScriptStatement::For {
+                variables: compact_vec(self.variables.ok_or_else(|| missing("variables"))?),
+                words: compact_vec(self.words.ok_or_else(|| missing("words"))?),
+                body: compact_vec(self.body.ok_or_else(|| missing("body"))?),
+            },
+            ScriptStatementOp::Case => ScriptStatement::Case {
+                word: self.word.ok_or_else(|| missing("word"))?,
+                arms: compact_vec(self.arms.ok_or_else(|| missing("arms"))?),
+            },
+            ScriptStatementOp::Function => ScriptStatement::Function {
+                function: self.function.ok_or_else(|| missing("function"))?,
+            },
+            ScriptStatementOp::Group => ScriptStatement::Group {
+                body: compact_vec(self.body.ok_or_else(|| missing("body"))?),
+                subshell: self.subshell.unwrap_or(false),
+            },
+            ScriptStatementOp::Return => ScriptStatement::Return {
+                status: self.status.unwrap_or(None),
+            },
+            ScriptStatementOp::Break => ScriptStatement::Break,
+            ScriptStatementOp::Continue => ScriptStatement::Continue,
+            ScriptStatementOp::Noop => ScriptStatement::Noop,
+            ScriptStatementOp::Redirected => ScriptStatement::Redirected {
+                statement: self.statement.ok_or_else(|| missing("statement"))?,
+                redirections: compact_vec(
+                    self.redirections.ok_or_else(|| missing("redirections"))?,
+                ),
+            },
+        })
+    }
+}
+
+struct ScriptStatementVisitor;
+
+impl<'de> Visitor<'de> for ScriptStatementVisitor {
+    type Value = ScriptStatement;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a tagged script statement")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut op = None;
+        let mut fields = ScriptStatementFields::default();
+        let mut deferred = Vec::<(Cow<'de, str>, &'de RawValue)>::new();
+        let mut deferred_name_bytes = 0_usize;
+        while let Some(ScriptFieldName(name)) = map.next_key()? {
+            if name == "op" {
+                if op.is_some() {
+                    return Err(serde::de::Error::duplicate_field("op"));
+                }
+                let parsed_op = map.next_value()?;
+                op = Some(parsed_op);
+                for (name, value) in deferred.drain(..) {
+                    fields.read_json::<A::Error>(parsed_op, &name, value)?;
+                }
+            } else if let Some(op) = op {
+                fields.read_map(op, &name, &mut map)?;
+            } else {
+                deferred_name_bytes = deferred_name_bytes.saturating_add(name.len());
+                if deferred.len() >= MAX_SCRIPT_TAG_DEFERRED_FIELDS
+                    || deferred_name_bytes > MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES
+                {
+                    return Err(serde::de::Error::custom(
+                        "script tag appears after the bounded field limit",
+                    ));
+                }
+                deferred.push((name, map.next_value()?));
+            }
+        }
+        let op = op.ok_or_else(|| serde::de::Error::missing_field("op"))?;
+        for (name, value) in deferred {
+            fields.read_json::<A::Error>(op, &name, value)?;
+        }
+        fields.finish(op)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScriptStatement {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(ScriptStatementVisitor)
+    }
+}
+
+fn compact_vec<T>(mut values: Vec<T>) -> Vec<T> {
+    values.shrink_to_fit();
+    values
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -478,7 +941,7 @@ impl ScriptWord {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ScriptWordPart {
     Literal {
@@ -516,6 +979,202 @@ pub enum ScriptWordPart {
         #[serde(default)]
         words: Vec<ScriptWord>,
     },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ScriptWordPartKind {
+    Literal,
+    Parameter,
+    CommandSubstitution,
+    Arithmetic,
+    BraceExpansion,
+    Array,
+    DeferredScript,
+}
+
+#[derive(Default)]
+struct ScriptWordPartFields {
+    value: Option<String>,
+    quoted: Option<bool>,
+    expression: Option<String>,
+    statements: Option<Vec<ScriptStatement>>,
+    alternatives: Option<Vec<ScriptWord>>,
+    elements: Option<Vec<ScriptWord>>,
+    source: Option<String>,
+    words: Option<Vec<ScriptWord>>,
+}
+
+impl ScriptWordPartFields {
+    fn read_map<'de, A: MapAccess<'de>>(
+        &mut self,
+        kind: ScriptWordPartKind,
+        name: &str,
+        map: &mut A,
+    ) -> Result<(), A::Error> {
+        match (kind, name) {
+            (ScriptWordPartKind::Literal, "value") => {
+                set_deserialized_field(&mut self.value, map.next_value()?, "value")
+            }
+            (
+                ScriptWordPartKind::Literal
+                | ScriptWordPartKind::Parameter
+                | ScriptWordPartKind::CommandSubstitution
+                | ScriptWordPartKind::Arithmetic
+                | ScriptWordPartKind::BraceExpansion,
+                "quoted",
+            ) => set_deserialized_field(&mut self.quoted, map.next_value()?, "quoted"),
+            (ScriptWordPartKind::Parameter | ScriptWordPartKind::Arithmetic, "expression") => {
+                set_deserialized_field(&mut self.expression, map.next_value()?, "expression")
+            }
+            (ScriptWordPartKind::CommandSubstitution, "statements")
+            | (ScriptWordPartKind::DeferredScript, "statements") => {
+                set_deserialized_field(&mut self.statements, map.next_value()?, "statements")
+            }
+            (ScriptWordPartKind::BraceExpansion, "alternatives") => {
+                set_deserialized_field(&mut self.alternatives, map.next_value()?, "alternatives")
+            }
+            (ScriptWordPartKind::Array, "elements") => {
+                set_deserialized_field(&mut self.elements, map.next_value()?, "elements")
+            }
+            (ScriptWordPartKind::DeferredScript, "source") => {
+                set_deserialized_field(&mut self.source, map.next_value()?, "source")
+            }
+            (ScriptWordPartKind::DeferredScript, "words") => {
+                set_deserialized_field(&mut self.words, map.next_value()?, "words")
+            }
+            _ => map.next_value::<IgnoredAny>().map(|_| ()),
+        }
+    }
+
+    fn read_json<E: serde::de::Error>(
+        &mut self,
+        kind: ScriptWordPartKind,
+        name: &str,
+        value: &RawValue,
+    ) -> Result<(), E> {
+        match (kind, name) {
+            (ScriptWordPartKind::Literal, "value") => {
+                set_deserialized_field(&mut self.value, json_field(value)?, "value")
+            }
+            (
+                ScriptWordPartKind::Literal
+                | ScriptWordPartKind::Parameter
+                | ScriptWordPartKind::CommandSubstitution
+                | ScriptWordPartKind::Arithmetic
+                | ScriptWordPartKind::BraceExpansion,
+                "quoted",
+            ) => set_deserialized_field(&mut self.quoted, json_field(value)?, "quoted"),
+            (ScriptWordPartKind::Parameter | ScriptWordPartKind::Arithmetic, "expression") => {
+                set_deserialized_field(&mut self.expression, json_field(value)?, "expression")
+            }
+            (ScriptWordPartKind::CommandSubstitution, "statements")
+            | (ScriptWordPartKind::DeferredScript, "statements") => {
+                set_deserialized_field(&mut self.statements, json_field(value)?, "statements")
+            }
+            (ScriptWordPartKind::BraceExpansion, "alternatives") => {
+                set_deserialized_field(&mut self.alternatives, json_field(value)?, "alternatives")
+            }
+            (ScriptWordPartKind::Array, "elements") => {
+                set_deserialized_field(&mut self.elements, json_field(value)?, "elements")
+            }
+            (ScriptWordPartKind::DeferredScript, "source") => {
+                set_deserialized_field(&mut self.source, json_field(value)?, "source")
+            }
+            (ScriptWordPartKind::DeferredScript, "words") => {
+                set_deserialized_field(&mut self.words, json_field(value)?, "words")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn finish<E: serde::de::Error>(self, kind: ScriptWordPartKind) -> Result<ScriptWordPart, E> {
+        let missing = |name| E::missing_field(name);
+        Ok(match kind {
+            ScriptWordPartKind::Literal => ScriptWordPart::Literal {
+                value: self.value.ok_or_else(|| missing("value"))?,
+                quoted: self.quoted.unwrap_or(false),
+            },
+            ScriptWordPartKind::Parameter => ScriptWordPart::Parameter {
+                expression: self.expression.ok_or_else(|| missing("expression"))?,
+                quoted: self.quoted.unwrap_or(false),
+            },
+            ScriptWordPartKind::CommandSubstitution => ScriptWordPart::CommandSubstitution {
+                statements: compact_vec(self.statements.ok_or_else(|| missing("statements"))?),
+                quoted: self.quoted.unwrap_or(false),
+            },
+            ScriptWordPartKind::Arithmetic => ScriptWordPart::Arithmetic {
+                expression: self.expression.ok_or_else(|| missing("expression"))?,
+                quoted: self.quoted.unwrap_or(false),
+            },
+            ScriptWordPartKind::BraceExpansion => ScriptWordPart::BraceExpansion {
+                alternatives: compact_vec(
+                    self.alternatives.ok_or_else(|| missing("alternatives"))?,
+                ),
+                quoted: self.quoted.unwrap_or(false),
+            },
+            ScriptWordPartKind::Array => ScriptWordPart::Array {
+                elements: compact_vec(self.elements.ok_or_else(|| missing("elements"))?),
+            },
+            ScriptWordPartKind::DeferredScript => ScriptWordPart::DeferredScript {
+                source: self.source.ok_or_else(|| missing("source"))?,
+                statements: compact_vec(self.statements.unwrap_or_default()),
+                words: compact_vec(self.words.unwrap_or_default()),
+            },
+        })
+    }
+}
+
+struct ScriptWordPartVisitor;
+
+impl<'de> Visitor<'de> for ScriptWordPartVisitor {
+    type Value = ScriptWordPart;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a tagged script word part")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut kind = None;
+        let mut fields = ScriptWordPartFields::default();
+        let mut deferred = Vec::<(Cow<'de, str>, &'de RawValue)>::new();
+        let mut deferred_name_bytes = 0_usize;
+        while let Some(ScriptFieldName(name)) = map.next_key()? {
+            if name == "kind" {
+                if kind.is_some() {
+                    return Err(serde::de::Error::duplicate_field("kind"));
+                }
+                let parsed_kind = map.next_value()?;
+                kind = Some(parsed_kind);
+                for (name, value) in deferred.drain(..) {
+                    fields.read_json::<A::Error>(parsed_kind, &name, value)?;
+                }
+            } else if let Some(kind) = kind {
+                fields.read_map(kind, &name, &mut map)?;
+            } else {
+                deferred_name_bytes = deferred_name_bytes.saturating_add(name.len());
+                if deferred.len() >= MAX_SCRIPT_TAG_DEFERRED_FIELDS
+                    || deferred_name_bytes > MAX_SCRIPT_TAG_DEFERRED_NAME_BYTES
+                {
+                    return Err(serde::de::Error::custom(
+                        "script tag appears after the bounded field limit",
+                    ));
+                }
+                deferred.push((name, map.next_value()?));
+            }
+        }
+        let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        for (name, value) in deferred {
+            fields.read_json::<A::Error>(kind, &name, value)?;
+        }
+        fields.finish(kind)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScriptWordPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(ScriptWordPartVisitor)
+    }
 }
 
 fn statements_require_block_v4(statements: &[ScriptStatement]) -> bool {
@@ -624,6 +1283,93 @@ impl std::error::Error for ScriptValidationError {}
 #[cfg(test)]
 mod registration_tests {
     use super::*;
+
+    #[test]
+    fn tagged_ir_deserializes_without_requiring_tag_first() {
+        let statement: ScriptStatement = serde_json::from_str(
+            r#"{"command":{"assignments":[],"words":[],"redirections":[]},"op":"command"}"#,
+        )
+        .unwrap();
+        assert!(matches!(statement, ScriptStatement::Command { .. }));
+
+        let part: ScriptWordPart =
+            serde_json::from_str(r#"{"value":"item","quoted":false,"kind":"literal"}"#).unwrap();
+        assert!(matches!(part, ScriptWordPart::Literal { value, .. } if value == "item"));
+
+        let entry: ScriptEntry =
+            serde_json::from_str(r#"{"name":"_demo","kind":"function"}"#).unwrap();
+        assert!(matches!(entry, ScriptEntry::Function { name } if name == "_demo"));
+
+        assert!(serde_json::from_str::<ScriptStatement>(r#"{"op":"noop","body":0}"#).is_ok());
+        assert!(serde_json::from_str::<ScriptEntry>(r#"{"kind":"module","name":0}"#).is_ok());
+        assert!(
+            serde_json::from_str::<ScriptWordPart>(
+                r#"{"kind":"literal","value":"item","statements":0}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<ScriptStatement>(
+                r#"{"op":"pipeline","commands":[],"negated":null}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ScriptWordPart>(
+                r#"{"kind":"literal","value":"item","quoted":null}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<ScriptStatement>(
+            r#"{"command":{"assignments":[],"assignments":[],"words":[],"redirections":[]},"op":"command"}"#
+        )
+        .is_err());
+
+        let mut late = String::from("{");
+        for index in 0..5000 {
+            if index != 0 {
+                late.push(',');
+            }
+            late.push_str(&format!(r#""unknown-{index}":null"#));
+        }
+        late.push_str(r#", "op":"noop"}"#);
+        assert_eq!(
+            serde_json::from_str::<ScriptStatement>(&late).unwrap(),
+            ScriptStatement::Noop
+        );
+        assert_eq!(
+            serde_json::from_str::<ScriptStatement>(r#"{"body":0,"\u006fp":"noop"}"#).unwrap(),
+            ScriptStatement::Noop
+        );
+        assert_eq!(
+            serde_json::from_str::<ScriptStatement>(
+                r#"{"kind":null,"irrelevant":false,"op":"noop"}"#
+            )
+            .unwrap(),
+            ScriptStatement::Noop
+        );
+        assert!(matches!(
+            serde_json::from_str::<ScriptWordPart>(
+                r#"{"op":null,"irrelevant":false,"kind":"literal","value":"item"}"#
+            )
+            .unwrap(),
+            ScriptWordPart::Literal { value, .. } if value == "item"
+        ));
+    }
+
+    #[test]
+    fn validation_accounts_the_retained_script_tree_in_one_pass() {
+        let module = crate::rules::script_parser::parse_script(
+            ScriptDialect::Fish,
+            "accounting.fish",
+            "if true; complete -c demo -l value; end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            module.validate_and_approximate_bytes().unwrap(),
+            module.approximate_bytes()
+        );
+    }
 
     #[test]
     fn quoted_literal_marks_captured_runtime_arguments_as_data() {
@@ -1023,6 +1769,10 @@ impl ScriptModule {
     }
 
     pub fn validate(&self) -> Result<(), ScriptValidationError> {
+        self.validate_and_approximate_bytes().map(|_| ())
+    }
+
+    pub(crate) fn validate_and_approximate_bytes(&self) -> Result<usize, ScriptValidationError> {
         let has_zsh_function_snapshot =
             self.zsh_function_snapshot || !self.zsh_function_names.is_empty();
         if has_zsh_function_snapshot {
@@ -1038,11 +1788,19 @@ impl ScriptModule {
             {
                 return Err(ScriptValidationError::Invalid("Zsh function names"));
             }
-            let mut seen = HashSet::with_capacity(self.zsh_function_names.len());
-            for name in &self.zsh_function_names {
-                if name.is_empty() || name.contains(['/', '\0']) || !seen.insert(name.as_str()) {
-                    return Err(ScriptValidationError::Invalid("Zsh function names"));
-                }
+            // The exact-capacity borrowed view is covered by the preflight's
+            // doubled String-slot charge. Sorting in place avoids a HashSet
+            // whose bucket/control allocation jumps at load-factor boundaries
+            // and is difficult to account before allocation.
+            let mut sorted_names = Vec::with_capacity(self.zsh_function_names.len());
+            sorted_names.extend(self.zsh_function_names.iter().map(String::as_str));
+            sorted_names.sort_unstable();
+            if sorted_names
+                .iter()
+                .any(|name| name.is_empty() || name.contains(['/', '\0']))
+                || sorted_names.windows(2).any(|names| names[0] == names[1])
+            {
+                return Err(ScriptValidationError::Invalid("Zsh function names"));
             }
             let mut expected_size = 7_u32;
             while self.zsh_function_names.len() >= expected_size as usize * 2 {
@@ -1067,7 +1825,35 @@ impl ScriptModule {
                 return Err(ScriptValidationError::Invalid("Zsh function table size"));
             }
         }
-        let mut state = ValidationState::default();
+        let mut state = ValidationState {
+            heap_bytes: std::mem::size_of::<Self>()
+                .saturating_add(
+                    self.statements
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                )
+                .saturating_add(
+                    self.functions
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptFunction>()),
+                )
+                .saturating_add(
+                    self.registrations
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptRegistration>()),
+                )
+                .saturating_add(
+                    self.probe_capabilities
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    self.zsh_function_names
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                ),
+            ..ValidationState::default()
+        };
         state.string(&self.source_path)?;
         state.statements(&self.statements, 0)?;
         for function in &self.functions {
@@ -1104,7 +1890,7 @@ impl ScriptModule {
                 state.string(name)?;
             }
         }
-        Ok(())
+        Ok(state.heap_bytes)
     }
 }
 
@@ -1113,6 +1899,7 @@ struct ValidationState {
     nodes: usize,
     words: usize,
     string_bytes: usize,
+    heap_bytes: usize,
 }
 
 impl ValidationState {
@@ -1127,7 +1914,7 @@ impl ValidationState {
         Ok(())
     }
 
-    fn string(&mut self, value: &str) -> Result<(), ScriptValidationError> {
+    fn string(&mut self, value: &String) -> Result<(), ScriptValidationError> {
         if value.len() > MAX_SCRIPT_INDIVIDUAL_STRING_BYTES {
             return Err(ScriptValidationError::Limit("individual string"));
         }
@@ -1135,6 +1922,7 @@ impl ValidationState {
             return Err(ScriptValidationError::Invalid("NUL in string"));
         }
         self.string_bytes = self.string_bytes.saturating_add(value.len());
+        self.heap_bytes = self.heap_bytes.saturating_add(value.capacity());
         if self.string_bytes > MAX_SCRIPT_STRING_BYTES {
             return Err(ScriptValidationError::Limit("string bytes"));
         }
@@ -1147,6 +1935,20 @@ impl ValidationState {
         depth: usize,
     ) -> Result<(), ScriptValidationError> {
         self.node(depth)?;
+        self.heap_bytes = self
+            .heap_bytes
+            .saturating_add(
+                function
+                    .arguments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptWord>()),
+            )
+            .saturating_add(
+                function
+                    .body
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+            );
         self.string(&function.name)?;
         for argument in &function.arguments {
             self.word(argument, depth + 1)?;
@@ -1174,12 +1976,28 @@ impl ValidationState {
         match statement {
             ScriptStatement::Command { command } => self.command(command, depth + 1),
             ScriptStatement::Pipeline { commands, .. } => {
+                self.heap_bytes = self.heap_bytes.saturating_add(
+                    commands
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                );
                 for command in commands {
                     self.statement(command, depth + 1)?;
                 }
                 Ok(())
             }
             ScriptStatement::AndOr { first, rest } => {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(std::mem::size_of::<ScriptStatement>())
+                    .saturating_add(
+                        rest.capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptAndOrArm>()),
+                    )
+                    .saturating_add(
+                        rest.len()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    );
                 self.statement(first, depth + 1)?;
                 for arm in rest {
                     self.statement(&arm.statement, depth + 1)?;
@@ -1190,7 +2008,33 @@ impl ValidationState {
                 branches,
                 otherwise,
             } => {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(
+                        branches
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptConditionalBranch>()),
+                    )
+                    .saturating_add(
+                        otherwise
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    );
                 for branch in branches {
+                    self.heap_bytes = self
+                        .heap_bytes
+                        .saturating_add(
+                            branch
+                                .condition
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                        )
+                        .saturating_add(
+                            branch
+                                .body
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                        );
                     self.statements(&branch.condition, depth + 1)?;
                     self.statements(&branch.body, depth + 1)?;
                 }
@@ -1199,6 +2043,17 @@ impl ValidationState {
             ScriptStatement::While {
                 condition, body, ..
             } => {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(
+                        condition
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    )
+                    .saturating_add(
+                        body.capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    );
                 self.statements(condition, depth + 1)?;
                 self.statements(body, depth + 1)
             }
@@ -1207,6 +2062,22 @@ impl ValidationState {
                 words,
                 body,
             } => {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(
+                        variables
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                    )
+                    .saturating_add(
+                        words
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptWord>()),
+                    )
+                    .saturating_add(
+                        body.capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    );
                 for variable in variables {
                     self.string(variable)?;
                 }
@@ -1216,8 +2087,24 @@ impl ValidationState {
                 self.statements(body, depth + 1)
             }
             ScriptStatement::Case { word, arms } => {
+                self.heap_bytes = self.heap_bytes.saturating_add(
+                    arms.capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptCaseArm>()),
+                );
                 self.word(word, depth + 1)?;
                 for arm in arms {
+                    self.heap_bytes = self
+                        .heap_bytes
+                        .saturating_add(
+                            arm.patterns
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptWord>()),
+                        )
+                        .saturating_add(
+                            arm.body
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                        );
                     for pattern in &arm.patterns {
                         self.word(pattern, depth + 1)?;
                     }
@@ -1226,7 +2113,13 @@ impl ValidationState {
                 Ok(())
             }
             ScriptStatement::Function { function } => self.function(function, depth + 1),
-            ScriptStatement::Group { body, .. } => self.statements(body, depth + 1),
+            ScriptStatement::Group { body, .. } => {
+                self.heap_bytes = self.heap_bytes.saturating_add(
+                    body.capacity()
+                        .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                );
+                self.statements(body, depth + 1)
+            }
             ScriptStatement::Return { status } => {
                 if let Some(status) = status {
                     self.word(status, depth + 1)?;
@@ -1237,6 +2130,14 @@ impl ValidationState {
                 statement,
                 redirections,
             } => {
+                self.heap_bytes = self
+                    .heap_bytes
+                    .saturating_add(std::mem::size_of::<ScriptStatement>())
+                    .saturating_add(
+                        redirections
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptRedirection>()),
+                    );
                 self.statement(statement, depth + 1)?;
                 for redirection in redirections {
                     self.redirection(redirection, depth + 1)?;
@@ -1253,6 +2154,26 @@ impl ValidationState {
         depth: usize,
     ) -> Result<(), ScriptValidationError> {
         self.node(depth)?;
+        self.heap_bytes = self
+            .heap_bytes
+            .saturating_add(
+                command
+                    .assignments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptAssignment>()),
+            )
+            .saturating_add(
+                command
+                    .words
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptWord>()),
+            )
+            .saturating_add(
+                command
+                    .redirections
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptRedirection>()),
+            );
         for assignment in &command.assignments {
             self.string(&assignment.name)?;
             if let Some(index) = &assignment.index {
@@ -1304,6 +2225,14 @@ impl ValidationState {
 
     fn word(&mut self, word: &ScriptWord, depth: usize) -> Result<(), ScriptValidationError> {
         self.node(depth)?;
+        self.heap_bytes = self
+            .heap_bytes
+            .saturating_add(
+                word.parts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ScriptWordPart>()),
+            )
+            .saturating_add(word.raw.as_ref().map_or(0, String::capacity));
         self.words = self.words.saturating_add(1);
         if self.words > MAX_SCRIPT_WORDS {
             return Err(ScriptValidationError::Limit("words"));
@@ -1319,14 +2248,29 @@ impl ValidationState {
                     expression: value, ..
                 } => self.string(value)?,
                 ScriptWordPart::CommandSubstitution { statements, .. } => {
+                    self.heap_bytes = self.heap_bytes.saturating_add(
+                        statements
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                    );
                     self.statements(statements, depth + 2)?;
                 }
                 ScriptWordPart::BraceExpansion { alternatives, .. } => {
+                    self.heap_bytes = self.heap_bytes.saturating_add(
+                        alternatives
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptWord>()),
+                    );
                     for alternative in alternatives {
                         self.word(alternative, depth + 2)?;
                     }
                 }
                 ScriptWordPart::Array { elements } => {
+                    self.heap_bytes = self.heap_bytes.saturating_add(
+                        elements
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ScriptWord>()),
+                    );
                     for element in elements {
                         self.word(element, depth + 2)?;
                     }
@@ -1336,6 +2280,18 @@ impl ValidationState {
                     statements,
                     words,
                 } => {
+                    self.heap_bytes = self
+                        .heap_bytes
+                        .saturating_add(
+                            statements
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptStatement>()),
+                        )
+                        .saturating_add(
+                            words
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ScriptWord>()),
+                        );
                     self.string(source)?;
                     self.statements(statements, depth + 2)?;
                     for word in words {
